@@ -253,8 +253,9 @@ ha_stat_cbk (call_frame_t *frame,
 
 int32_t
 ha_stat (call_frame_t *frame,
-	 xlator_t *this,
-	 loc_t *loc)
+         xlator_t *this,
+         loc_t *loc,
+         dict_t *xdata)
 {
 	ha_local_t *local = NULL;
 	int op_errno = ENOTCONN;
@@ -265,14 +266,14 @@ ha_stat (call_frame_t *frame,
 		goto err;
 	}
 	local = frame->local;
-	local->stub = fop_stat_stub (frame, ha_stat, loc);
+	local->stub = fop_stat_stub (frame, ha_stat, loc, xdata);
 
 	STACK_WIND_COOKIE (frame,
 			   ha_stat_cbk,
 			   (void *)(long)local->active,
 			   HA_ACTIVE_CHILD(this, local),
 			   HA_ACTIVE_CHILD(this, local)->fops->stat,
-			   loc);
+               loc, xdata);
 	return 0;
 err:
 	STACK_UNWIND (frame, -1, op_errno, NULL);
@@ -297,7 +298,7 @@ ha_setattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
 int32_t
 ha_setattr (call_frame_t *frame, xlator_t *this, loc_t *loc, struct iatt *stbuf,
-            int32_t valid)
+            int32_t valid, dict_t *xdata)
 {
 	ha_local_t *local = NULL;
 	int op_errno = 0;
@@ -308,14 +309,14 @@ ha_setattr (call_frame_t *frame, xlator_t *this, loc_t *loc, struct iatt *stbuf,
 		goto err;
 	}
 	local = frame->local;
-	local->stub = fop_setattr_stub (frame, ha_setattr, loc, stbuf, valid);
+	local->stub = fop_setattr_stub (frame, ha_setattr, loc, stbuf, valid, xdata);
 
 	STACK_WIND_COOKIE (frame,
 			   ha_setattr_cbk,
 			   (void *)(long)local->active,
 			   HA_ACTIVE_CHILD(this, local),
 			   HA_ACTIVE_CHILD(this, local)->fops->setattr,
-			   loc, stbuf, valid);
+               loc, stbuf, valid, xdata);
 	return 0;
 err:
 	STACK_UNWIND (frame, -1, op_errno, NULL, NULL);
@@ -325,7 +326,7 @@ err:
 
 int32_t
 ha_fsetattr (call_frame_t *frame, xlator_t *this, fd_t *fd, struct iatt *stbuf,
-             int32_t valid)
+             int32_t valid, dict_t *xdata)
 {
 	ha_local_t *local = NULL;
 	int op_errno = 0;
@@ -336,14 +337,14 @@ ha_fsetattr (call_frame_t *frame, xlator_t *this, fd_t *fd, struct iatt *stbuf,
 		goto err;
 	}
 	local = frame->local;
-	local->stub = fop_fsetattr_stub (frame, ha_fsetattr, fd, stbuf, valid);
+	local->stub = fop_fsetattr_stub (frame, ha_fsetattr, fd, stbuf, valid, xdata);
 
 	STACK_WIND_COOKIE (frame,	      
 			   ha_setattr_cbk,
 			   (void *)(long)local->active,
 			   HA_ACTIVE_CHILD(this, local),
 			   HA_ACTIVE_CHILD(this, local)->fops->fsetattr,
-			   fd, stbuf, valid);
+               fd, stbuf, valid, xdata);
 	return 0;
 err:
 	STACK_UNWIND (frame, -1, op_errno, NULL, NULL);
@@ -377,7 +378,7 @@ int32_t
 ha_truncate (call_frame_t *frame,
 	     xlator_t *this,
 	     loc_t *loc,
-	     off_t offset)
+	     off_t offset, dict_t *xdata)
 {
 	ha_local_t *local = NULL;
 	int op_errno = 0;
@@ -388,7 +389,7 @@ ha_truncate (call_frame_t *frame,
 		goto err;
 	}
 	local = frame->local;
-	local->stub = fop_truncate_stub (frame, ha_truncate, loc, offset);
+	local->stub = fop_truncate_stub (frame, ha_truncate, loc, offset, xdata);
         if (!local->stub) {
                 op_errno = ENOMEM;
                 gf_log (this->name, GF_LOG_ERROR, "out of memory");
@@ -401,7 +402,7 @@ ha_truncate (call_frame_t *frame,
 			   HA_ACTIVE_CHILD(this, local),
 			   HA_ACTIVE_CHILD(this, local)->fops->truncate,
 			   loc,
-			   offset);
+               offset, xdata);
 	return 0;
 err:
 	STACK_UNWIND (frame, -1, op_errno, NULL, NULL);
@@ -434,7 +435,7 @@ int32_t
 ha_ftruncate (call_frame_t *frame,
 	      xlator_t *this,
 	      fd_t *fd,
-	      off_t offset)
+	      off_t offset, dict_t *xdata)
 {
 	ha_local_t *local = NULL;
 	int op_errno = 0;
@@ -445,7 +446,7 @@ ha_ftruncate (call_frame_t *frame,
 		goto err;
 	}
 	local = frame->local;
-	local->stub = fop_ftruncate_stub (frame, ha_ftruncate, fd, offset);
+	local->stub = fop_ftruncate_stub (frame, ha_ftruncate, fd, offset, xdata);
         if (!local->stub) {
                 op_errno = ENOMEM;
                 gf_log (this->name, GF_LOG_ERROR, "out of memory");
@@ -458,7 +459,7 @@ ha_ftruncate (call_frame_t *frame,
 			   HA_ACTIVE_CHILD(this, local),
 			   HA_ACTIVE_CHILD(this, local)->fops->ftruncate,
 			   fd,
-			   offset);
+               offset, xdata);
 	return 0;
 err:
         local = frame->local;
@@ -493,7 +494,7 @@ int32_t
 ha_access (call_frame_t *frame,
 	   xlator_t *this,
 	   loc_t *loc,
-	   int32_t mask)
+	   int32_t mask, dict_t *xdata)
 {
 	ha_local_t *local = NULL;
 	int op_errno = 0;
@@ -504,7 +505,7 @@ ha_access (call_frame_t *frame,
 		goto err;
 	}
 	local = frame->local;
-	local->stub = fop_access_stub (frame, ha_access, loc, mask);
+	local->stub = fop_access_stub (frame, ha_access, loc, mask, xdata);
         if (!local->stub) {
                 op_errno = ENOMEM;
                 gf_log (this->name, GF_LOG_ERROR, "out of memory");
@@ -517,7 +518,7 @@ ha_access (call_frame_t *frame,
 			   HA_ACTIVE_CHILD(this, local),
 			   HA_ACTIVE_CHILD(this, local)->fops->access,
 			   loc,
-			   mask);
+               mask, xdata);
 	return 0;
 err:
         local = frame->local;
@@ -557,7 +558,7 @@ int32_t
 ha_readlink (call_frame_t *frame,
 	     xlator_t *this,
 	     loc_t *loc,
-	     size_t size)
+	     size_t size, dict_t *xdata)
 {
 	ha_local_t *local = frame->local;
 	int op_errno = 0;
@@ -568,7 +569,7 @@ ha_readlink (call_frame_t *frame,
 		goto err;
 	}
 	local = frame->local;
-	local->stub = fop_readlink_stub (frame, ha_readlink, loc, size);
+	local->stub = fop_readlink_stub (frame, ha_readlink, loc, size, xdata);
 
 	STACK_WIND_COOKIE (frame,
 			   ha_readlink_cbk,
@@ -576,7 +577,7 @@ ha_readlink (call_frame_t *frame,
 			   HA_ACTIVE_CHILD(this, local),
 			   HA_ACTIVE_CHILD(this, local)->fops->readlink,
 			   loc,
-			   size);
+               size, xdata);
 	return 0;
 err:
 	STACK_UNWIND (frame, -1, op_errno, NULL, NULL);
@@ -615,9 +616,9 @@ ha_mknod_lookup_cbk (call_frame_t *frame,
 	if (op_ret == -1) {
 		gf_log (this->name, GF_LOG_ERROR, 
 			"(path=%s) (op_ret=%d op_errno=%d)", 
-			local->stub->args.mknod.loc.path, op_ret, op_errno);
+			local->stub->args.loc.path, op_ret, op_errno);
 	}
-	ret = inode_ctx_get (local->stub->args.mknod.loc.inode, 
+	ret = inode_ctx_get (local->stub->args.loc.inode, 
 			     this, &tmp_stateino);
 	stateino = (char *)(long)tmp_stateino;
 	if (ret != 0) {
@@ -640,9 +641,9 @@ ha_mknod_lookup_cbk (call_frame_t *frame,
 		STACK_UNWIND (frame,
 			      local->op_ret,
 			      local->op_errno,
-			      local->stub->args.mknod.loc.inode,
+			      local->stub->args.loc.inode,
 			      &local->buf, &local->preparent,
-                              &local->postparent);
+                  &local->postparent);
 		call_stub_destroy (stub);
 	}
 	return 0;
@@ -655,9 +656,9 @@ ha_mknod_cbk (call_frame_t *frame,
 	      int32_t op_ret,
 	      int32_t op_errno,
 	      inode_t *inode,
-              struct iatt *buf,
-              struct iatt *preparent,
-              struct iatt *postparent)
+          struct iatt *buf,
+          struct iatt *preparent,
+          struct iatt *postparent, dict_t *xdata)
 {
 	ha_local_t *local = NULL;
 	ha_private_t *pvt = NULL;
@@ -679,10 +680,10 @@ ha_mknod_cbk (call_frame_t *frame,
 
 	if (op_ret == -1) {
 		local->op_errno = op_errno;
-		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.mknod.loc.path, op_ret, op_errno);
+		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.loc.path, op_ret, op_errno);
 	}
 
-	ret = inode_ctx_get (local->stub->args.mknod.loc.inode, 
+	ret = inode_ctx_get (local->stub->args.loc.inode, 
 			     this, &tmp_stateino);
 	stateino = (char *)(long)tmp_stateino;
 
@@ -695,8 +696,8 @@ ha_mknod_cbk (call_frame_t *frame,
 		local->op_ret = 0;
 		local->first_success = 1;
 		local->buf = *buf;
-                local->preparent = *preparent;
-                local->postparent = *postparent;
+        local->preparent = *preparent;
+        local->postparent = *postparent;
 	}
 	cnt = --local->call_count;
 	for (i = local->active + 1; i < child_count; i++) {
@@ -709,8 +710,8 @@ ha_mknod_cbk (call_frame_t *frame,
 		GF_FREE (local->state);
 		stub = local->stub;
 		STACK_UNWIND (frame, local->op_ret, local->op_errno,
-                              local->stub->args.mknod.loc.inode, &local->buf,
-                              &local->preparent, &local->postparent);
+                      local->stub->args.loc.inode, &local->buf,
+                      &local->preparent, &local->postparent, xdata);
 		call_stub_destroy (stub);
 		return 0;
 	}
@@ -722,9 +723,9 @@ ha_mknod_cbk (call_frame_t *frame,
 			    ha_mknod_cbk,
 			    children[i],
 			    children[i]->fops->mknod,
-			    &local->stub->args.mknod.loc,
-			    local->stub->args.mknod.mode,
-			    local->stub->args.mknod.rdev);
+			    &local->stub->args.loc,
+			    local->stub->args.mode,
+                local->stub->args.rdev, xdata);
 		return 0;
 	}
 	cnt = local->call_count;
@@ -735,7 +736,7 @@ ha_mknod_cbk (call_frame_t *frame,
 				    ha_mknod_lookup_cbk,
 				    children[i],
 				    children[i]->fops->lookup,
-				    &local->stub->args.mknod.loc,
+				    &local->stub->args.loc,
 				    0);
 			if (--cnt == 0)
 				break;
@@ -749,7 +750,7 @@ ha_mknod (call_frame_t *frame,
 	  xlator_t *this,
 	  loc_t *loc,
 	  mode_t mode,
-	  dev_t rdev)
+      dev_t rdev, dict_t *xdata)
 {
 	ha_local_t *local = NULL;
 	ha_private_t *pvt = NULL;
@@ -769,7 +770,7 @@ ha_mknod (call_frame_t *frame,
                 goto err;
         }
 
-	local->stub = fop_mknod_stub (frame, ha_mknod, loc, mode, rdev);
+        local->stub = fop_mknod_stub (frame, ha_mknod, loc, mode, rdev, xdata);
         if (!local->stub) {
                 gf_log (this->name, GF_LOG_ERROR, "out of memory");
                 op_errno = ENOMEM;
@@ -809,7 +810,7 @@ ha_mknod (call_frame_t *frame,
 		    ha_mknod_cbk,
 		    HA_ACTIVE_CHILD(this, local),
 		    HA_ACTIVE_CHILD(this, local)->fops->mknod,
-		    loc, mode, rdev);
+            loc, mode, rdev, xdata);
 	return 0;
 
 err:
@@ -830,8 +831,8 @@ ha_mkdir_lookup_cbk (call_frame_t *frame,
 		     int32_t op_errno,
 		     inode_t *inode,
 		     struct iatt *buf,
-                     dict_t *dict,
-                     struct iatt *postparent)
+             dict_t *dict,
+             struct iatt *postparent)
 {
 	ha_local_t *local = NULL;
 	ha_private_t *pvt = NULL;
@@ -852,9 +853,9 @@ ha_mkdir_lookup_cbk (call_frame_t *frame,
 			break;
 
 	if (op_ret == -1) {
-		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.mkdir.loc.path, op_ret, op_errno);
+		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.loc.path, op_ret, op_errno);
 	}
-	inode_ctx_get (local->stub->args.mkdir.loc.inode, 
+	inode_ctx_get (local->stub->args.loc.inode, 
 		       this, &tmp_stateino);  
 	stateino = (char *)(long)tmp_stateino;
 
@@ -871,7 +872,7 @@ ha_mkdir_lookup_cbk (call_frame_t *frame,
 		STACK_UNWIND (frame,
 			      local->op_ret,
 			      local->op_errno,
-			      local->stub->args.mkdir.loc.inode, &local->buf,
+			      local->stub->args.loc.inode, &local->buf,
 			      &local->preparent, &local->postparent);
 		call_stub_destroy (stub);
 	}
@@ -909,10 +910,10 @@ ha_mkdir_cbk (call_frame_t *frame,
 
 	if (op_ret == -1) {
 		local->op_errno = op_errno;
-		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.mkdir.loc.path, op_ret, op_errno);
+		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.loc.path, op_ret, op_errno);
 	}
 
-	inode_ctx_get (local->stub->args.mkdir.loc.inode, 
+	inode_ctx_get (local->stub->args.loc.inode, 
 		       this, &tmp_stateino);
 	stateino = (char *)(long)tmp_stateino;
 
@@ -935,7 +936,7 @@ ha_mkdir_cbk (call_frame_t *frame,
 		GF_FREE (local->state);
 		stub = local->stub;
 		STACK_UNWIND (frame, local->op_ret, local->op_errno,
-                              local->stub->args.mkdir.loc.inode, &local->buf,
+                              local->stub->args.loc.inode, &local->buf,
                               &local->preparent, &local->postparent);
 		call_stub_destroy (stub);
 		return 0;
@@ -948,8 +949,8 @@ ha_mkdir_cbk (call_frame_t *frame,
 			    ha_mkdir_cbk,
 			    children[i],
 			    children[i]->fops->mkdir,
-			    &local->stub->args.mkdir.loc,
-			    local->stub->args.mkdir.mode);
+			    &local->stub->args.loc,
+			    local->stub->args.mode);
 		return 0;
 	}
 	cnt = local->call_count;
@@ -960,7 +961,7 @@ ha_mkdir_cbk (call_frame_t *frame,
 				    ha_mkdir_lookup_cbk,
 				    children[i],
 				    children[i]->fops->lookup,
-				    &local->stub->args.mkdir.loc,
+				    &local->stub->args.loc,
 				    0);
 			if (--cnt == 0)
 				break;
@@ -1182,9 +1183,9 @@ ha_symlink_lookup_cbk (call_frame_t *frame,
 			break;
 
 	if (op_ret == -1) {
-		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.symlink.loc.path, op_ret, op_errno);
+		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.loc.path, op_ret, op_errno);
 	}
-	inode_ctx_get (local->stub->args.symlink.loc.inode,
+	inode_ctx_get (local->stub->args.loc.inode,
 		       this, &tmp_stateino);  
 	stateino = (char *)(long)tmp_stateino;
 
@@ -1201,7 +1202,7 @@ ha_symlink_lookup_cbk (call_frame_t *frame,
 		STACK_UNWIND (frame,
 			      local->op_ret,
 			      local->op_errno,
-			      local->stub->args.symlink.loc.inode, &local->buf,
+			      local->stub->args.loc.inode, &local->buf,
                               &local->preparent, &local->postparent);
 		call_stub_destroy (stub);
 	}
@@ -1239,9 +1240,9 @@ ha_symlink_cbk (call_frame_t *frame,
 
 	if (op_ret == -1) {
 		local->op_errno = op_errno;
-		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.symlink.loc.path, op_ret, op_errno);
+		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.loc.path, op_ret, op_errno);
 	}
-	inode_ctx_get (local->stub->args.symlink.loc.inode, 
+	inode_ctx_get (local->stub->args.loc.inode, 
 		       this, &tmp_stateino);
 	stateino = (char *)(long)tmp_stateino;
 
@@ -1264,7 +1265,7 @@ ha_symlink_cbk (call_frame_t *frame,
 		GF_FREE (local->state);
 		stub = local->stub;
 		STACK_UNWIND (frame, local->op_ret, local->op_errno, 
-			      local->stub->args.symlink.loc.inode, &local->buf,
+			      local->stub->args.loc.inode, &local->buf,
                               &local->preparent, &local->postparent);
 		call_stub_destroy (stub);
 		return 0;
@@ -1277,8 +1278,8 @@ ha_symlink_cbk (call_frame_t *frame,
 			    ha_symlink_cbk,
 			    children[i],
 			    children[i]->fops->symlink,
-			    local->stub->args.symlink.linkname,
-			    &local->stub->args.symlink.loc);
+			    local->stub->args.linkname,
+			    &local->stub->args.loc);
 		return 0;
 	}
 	cnt = local->call_count;
@@ -1289,7 +1290,7 @@ ha_symlink_cbk (call_frame_t *frame,
 				    ha_symlink_lookup_cbk,
 				    children[i],
 				    children[i]->fops->lookup,
-				    &local->stub->args.symlink.loc,
+				    &local->stub->args.loc,
 				    0);
 			if (--cnt == 0)
 				break;
@@ -1460,9 +1461,9 @@ ha_link_lookup_cbk (call_frame_t *frame,
 			break;
 
 	if (op_ret == -1) {
-		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.link.newloc.path, op_ret, op_errno);
+		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.newloc.path, op_ret, op_errno);
 	}
-	inode_ctx_get (local->stub->args.link.newloc.inode, 
+	inode_ctx_get (local->stub->args.newloc.inode, 
 		       this, &tmp_stateino);  
 	stateino = (char *)(long)tmp_stateino;
 
@@ -1479,7 +1480,7 @@ ha_link_lookup_cbk (call_frame_t *frame,
 		STACK_UNWIND (frame,
 			      local->op_ret,
 			      local->op_errno,
-			      local->stub->args.link.oldloc.inode, &local->buf,
+			      local->stub->args.oldloc.inode, &local->buf,
                               &local->preparent, &local->postparent);
 		call_stub_destroy (stub);
 	}
@@ -1517,9 +1518,9 @@ ha_link_cbk (call_frame_t *frame,
 
 	if (op_ret == -1) {
 		local->op_errno = op_errno;
-		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.link.newloc.path, op_ret, op_errno);
+		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.newloc.path, op_ret, op_errno);
 	}
-	inode_ctx_get (local->stub->args.link.newloc.inode, 
+	inode_ctx_get (local->stub->args.newloc.inode, 
 		       this, &tmp_stateino);
 	stateino = (char *)(long)tmp_stateino;
 
@@ -1542,7 +1543,7 @@ ha_link_cbk (call_frame_t *frame,
 		GF_FREE (local->state);
 		stub = local->stub;
 		STACK_UNWIND (frame, local->op_ret, local->op_errno,
-                              local->stub->args.link.oldloc.inode, &local->buf,
+                              local->stub->args.oldloc.inode, &local->buf,
                               &local->preparent, &local->postparent);
 		call_stub_destroy (stub);
 		return 0;
@@ -1555,8 +1556,8 @@ ha_link_cbk (call_frame_t *frame,
 			    ha_link_cbk,
 			    children[i],
 			    children[i]->fops->link,
-			    &local->stub->args.link.oldloc,
-			    &local->stub->args.link.newloc);
+			    &local->stub->args.oldloc,
+			    &local->stub->args.newloc);
 		return 0;
 	}
 	cnt = local->call_count;
@@ -1567,7 +1568,7 @@ ha_link_cbk (call_frame_t *frame,
 				    ha_link_lookup_cbk,
 				    children[i],
 				    children[i]->fops->lookup,
-				    &local->stub->args.link.newloc,
+				    &local->stub->args.newloc,
 				    0);
 			if (--cnt == 0)
 				break;
@@ -1684,7 +1685,7 @@ ha_create_cbk (call_frame_t *frame,
 	prev_frame = cookie;
 	children = pvt->children;
 
-	ret = inode_ctx_get (local->stub->args.create.loc.inode, 
+	ret = inode_ctx_get (local->stub->args.loc.inode, 
 			     this, &tmp_stateino);
 	stateino = (char *)(long)tmp_stateino;
 
@@ -1692,7 +1693,7 @@ ha_create_cbk (call_frame_t *frame,
 		gf_log (this->name, GF_LOG_ERROR, "dict_to_ptr() error");
 		/* FIXME: handle */
 	}
-	ret = fd_ctx_get (local->stub->args.create.fd, this, &tmp_hafdp);
+	ret = fd_ctx_get (local->stub->args.fd, this, &tmp_hafdp);
 	if (ret != 0) {
 		gf_log (this->name, GF_LOG_ERROR, "dict_to_ptr() error");
 		/* FIXME: handle */
@@ -1706,7 +1707,7 @@ ha_create_cbk (call_frame_t *frame,
 
 	if (op_ret == -1) {
 		local->op_errno = op_errno;
-		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.create.loc.path, op_ret, op_errno);
+		gf_log (this->name, GF_LOG_ERROR, "(path=%s) (op_ret=%d op_errno=%d)", local->stub->args.loc.path, op_ret, op_errno);
 	}
 	if (op_ret != -1) {
 		stateino[i] = 1;
@@ -1718,7 +1719,7 @@ ha_create_cbk (call_frame_t *frame,
                         local->postparent = *postparent;
 			local->first_success = 1;
 		}
-		local->stub->args.create.flags &= (~O_EXCL);
+		local->stub->args.flags &= (~O_EXCL);
 	}
 	LOCK (&frame->lock);
 	cnt = --local->call_count;
@@ -1733,8 +1734,8 @@ ha_create_cbk (call_frame_t *frame,
 		char *state = local->state;
 		call_stub_t *stub = local->stub;
 		STACK_UNWIND (frame, local->op_ret, local->op_errno,
-			      stub->args.create.fd,
-			      stub->args.create.loc.inode, &local->buf,
+			      stub->args.fd,
+			      stub->args.loc.inode, &local->buf,
                               &local->preparent, &local->postparent);
 		GF_FREE (state);
 		call_stub_destroy (stub);
@@ -1748,10 +1749,10 @@ ha_create_cbk (call_frame_t *frame,
 				    ha_create_cbk,
 				    children[i],
 				    children[i]->fops->create,
-				    &local->stub->args.create.loc,
-				    local->stub->args.create.flags,
-				    local->stub->args.create.mode,
-				    local->stub->args.create.fd);
+				    &local->stub->args.loc,
+				    local->stub->args.flags,
+				    local->stub->args.mode,
+				    local->stub->args.fd);
 			if ((local->first_success == 0) || (cnt == 0))
 				break;
 		}
