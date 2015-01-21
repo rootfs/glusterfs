@@ -101,11 +101,20 @@ names_conflict (const char *n1, const char *n2)
 static inline int
 __same_entrylk_owner (pl_entry_lock_t *l1, pl_entry_lock_t *l2)
 {
-
         return (is_same_lkowner (&l1->owner, &l2->owner) &&
                 (l1->client  == l2->client));
 }
 
+/* Just as in inodelk, allow conflicting name locks from same (lk_owner, conn)*/
+static inline int
+__conflicting_entrylks (pl_entry_lock_t *l1, pl_entry_lock_t *l2)
+{
+        if (names_conflict (l1->basename, l2->basename)
+            && !__same_entrylk_owner (l1, l2))
+                return 1;
+
+        return 0;
+}
 
 /**
  * entrylk_grantable - is this lock grantable?
@@ -122,7 +131,7 @@ __entrylk_grantable (pl_dom_list_t *dom, pl_entry_lock_t *lock)
                 return NULL;
 
         list_for_each_entry (tmp, &dom->entrylk_list, domain_list) {
-                if (names_conflict (tmp->basename, lock->basename))
+                if (__conflicting_entrylks (tmp, lock))
                         return tmp;
         }
 
@@ -318,6 +327,20 @@ __find_most_matching_lock (pl_dom_list_t *dom, const char *basename)
         return (exact ? exact : all);
 }
 
+static pl_entry_lock_t*
+__find_matching_lock (pl_dom_list_t *dom, pl_entry_lock_t *lock)
+{
+        pl_entry_lock_t *tmp = NULL;
+
+        list_for_each_entry (tmp, &dom->entrylk_list, domain_list) {
+                if (names_equal (lock->basename, tmp->basename)
+                    && __same_entrylk_owner (lock, tmp)
+                    && (lock->type == tmp->type))
+                        return tmp;
+        }
+        return NULL;
+}
+
 /**
  * __lock_entrylk - lock a name in a directory
  * @inode: inode for the directory in which to lock
@@ -352,6 +375,17 @@ __lock_entrylk (xlator_t *this, pl_inode_t *pinode, pl_entry_lock_t *lock,
                 goto out;
         }
 
+        /* To prevent blocked locks starvation, check if there are any blocked
+         * locks thay may conflict with this lock. If there is then don't grant
+         * the lock. BUT grant the lock if the owner already has lock to allow
+         * nested locks.
+         * Example: SHD from Machine1 takes (gfid, basename=257-length-name)
+         * and is granted.
+         * SHD from machine2 takes (gfid, basename=NULL) and is blocked.
+         * When SHD from Machine1 takes (gfid, basename=NULL) it needs to be
+         * granted, without which self-heal can't progress.
+         * TODO: Find why 'owner_has_lock' is checked even for blocked locks.
+         */
         if (__blocked_entrylk_conflict (dom, lock) && !(__owner_has_lock (dom, lock))) {
                 ret = -EAGAIN;
                 if (nonblock)
@@ -388,31 +422,18 @@ out:
 pl_entry_lock_t *
 __unlock_entrylk (pl_dom_list_t *dom, pl_entry_lock_t *lock)
 {
-        pl_entry_lock_t *tmp = NULL;
         pl_entry_lock_t *ret_lock = NULL;
 
-        tmp = __find_most_matching_lock (dom, lock->basename);
+        ret_lock = __find_matching_lock (dom, lock);
 
-        if (!tmp) {
-                gf_log ("locks", GF_LOG_ERROR,
-                        "unlock on %s (type=ENTRYLK_WRLCK) attempted but no matching lock found",
-                        lock->basename);
-                goto out;
-        }
-
-        if (names_equal (tmp->basename, lock->basename)
-            && tmp->type == lock->type) {
-
-		list_del_init (&tmp->domain_list);
-		ret_lock = tmp;
-
+        if (ret_lock) {
+                list_del_init (&ret_lock->domain_list);
         } else {
-                gf_log ("locks", GF_LOG_ERROR,
-                        "Unlock on %s for a non-existing lock!", lock->basename);
-                goto out;
+                gf_log ("locks", GF_LOG_ERROR, "unlock on %s "
+                        "(type=ENTRYLK_WRLCK) attempted but no matching lock "
+                        "found", lock->basename);
         }
 
-out:
         return ret_lock;
 }
 
@@ -517,18 +538,19 @@ pl_common_entrylk (call_frame_t *frame, xlator_t *this,
                    dict_t *xdata)
 
 {
-        int32_t          op_ret   = -1;
-        int32_t          op_errno = 0;
-        int              ret      = -1;
-        char             unwind   = 1;
-        GF_UNUSED int    dict_ret = -1;
-        pl_inode_t      *pinode   = NULL;
-        pl_entry_lock_t *reqlock  = NULL;
-        pl_entry_lock_t *unlocked = NULL;
-        pl_dom_list_t   *dom      = NULL;
-        char            *conn_id  = NULL;
-        pl_ctx_t        *ctx      = NULL;
-	int              nonblock = 0;
+        int32_t          op_ret           = -1;
+        int32_t          op_errno         =  0;
+        int              ret              = -1;
+        char             unwind           =  1;
+        GF_UNUSED int    dict_ret         = -1;
+        pl_inode_t      *pinode           =  NULL;
+        pl_entry_lock_t *reqlock          =  NULL;
+        pl_entry_lock_t *unlocked         =  NULL;
+        pl_dom_list_t   *dom              =  NULL;
+        char            *conn_id          =  NULL;
+        pl_ctx_t        *ctx              =  NULL;
+	int              nonblock         =  0;
+        gf_boolean_t     need_inode_unref =  _gf_false;
 
         if (xdata)
                 dict_ret = dict_get_str (xdata, "connection-id", &conn_id);
@@ -564,6 +586,25 @@ pl_common_entrylk (call_frame_t *frame, xlator_t *this,
                 goto unwind;
         }
 
+        /* Ideally, AFTER a successful lock (both blocking and non-blocking) or
+         * an unsuccessful blocking lock operation, the inode needs to be ref'd.
+         *
+         * But doing so might give room to a race where the lock-requesting
+         * client could send a DISCONNECT just before this thread refs the inode
+         * after the locking is done, and the epoll thread could unref the inode
+         * in cleanup which means the inode's refcount would come down to 0, and
+         * the call to pl_forget() at this point destroys @pinode. Now when
+         * the io-thread executing this function tries to access pinode,
+         * it could crash on account of illegal memory access.
+         *
+         * To get around this problem, the inode is ref'd once even before
+         * adding the lock into client_list as a precautionary measure.
+         * This way even if there are DISCONNECTs, there will always be 1 extra
+         * ref on the inode, so @pinode is still alive until after the
+         * current stack unwinds.
+         */
+        pinode->inode = inode_ref (inode);
+
         switch (cmd) {
         case ENTRYLK_LOCK_NB:
 		nonblock = 1;
@@ -593,6 +634,13 @@ pl_common_entrylk (call_frame_t *frame, xlator_t *this,
 			} else {
 				__pl_entrylk_unref (reqlock);
 			}
+
+                        /* For all but the case where a non-blocking lock
+                         * attempt fails, the extra ref taken before the switch
+                         * block must be negated.
+                         */
+                        if ((ret == -EAGAIN) && (nonblock))
+                                need_inode_unref = _gf_true;
                 }
                 pthread_mutex_unlock (&pinode->mutex);
 		if (ctx)
@@ -604,6 +652,12 @@ pl_common_entrylk (call_frame_t *frame, xlator_t *this,
 			pthread_mutex_lock (&ctx->lock);
                 pthread_mutex_lock (&pinode->mutex);
                 {
+                        /* Irrespective of whether unlock succeeds or not,
+                         * the extra inode ref that was done before the switch
+                         * block must be negated. Towards this,
+                         * @need_inode_unref flag is set unconditionally here.
+                         */
+                        need_inode_unref = _gf_true;
                         unlocked = __unlock_entrylk (dom, reqlock);
 			if (unlocked) {
 				list_del_init (&unlocked->client_list);
@@ -623,13 +677,22 @@ pl_common_entrylk (call_frame_t *frame, xlator_t *this,
                 break;
 
         default:
+                inode_unref (pinode->inode);
                 gf_log (this->name, GF_LOG_ERROR,
                         "Unexpected case in entrylk (cmd=%d). Please file"
                         "a bug report at http://bugs.gluster.com", cmd);
                 goto out;
         }
+        if (need_inode_unref)
+                inode_unref (pinode->inode);
+
+        /* The following (extra) unref corresponds to the ref that
+         * was done at the time the lock was granted.
+         */
+        if ((cmd == ENTRYLK_UNLOCK) && (op_ret == 0))
+                inode_unref (pinode->inode);
+
 out:
-        pl_update_refkeeper (this, inode);
 
         if (unwind) {
                 entrylk_trace_out (this, frame, volume, fd, loc, basename,
@@ -684,24 +747,14 @@ static void
 pl_entrylk_log_cleanup (pl_entry_lock_t *lock)
 {
 	pl_inode_t *pinode = NULL;
-        char *path = NULL;
-        char *file = NULL;
 
 	pinode = lock->pinode;
 
-	inode_path (pinode->refkeeper, NULL, &path);
-
-	if (path)
-		file = path;
-	else
-		file = uuid_utoa (pinode->refkeeper->gfid);
-
-	gf_log (THIS->name, GF_LOG_WARNING,
-		"releasing lock on %s held by "
-		"{client=%p, pid=%"PRId64" lk-owner=%s}",
-		file, lock->client, (uint64_t) lock->client_pid,
-		lkowner_utoa (&lock->owner));
-	GF_FREE (path);
+        gf_log (THIS->name, GF_LOG_WARNING,
+                "releasing lock on %s held by "
+                "{client=%p, pid=%"PRId64" lk-owner=%s}",
+                uuid_utoa (pinode->gfid), lock->client,
+                (uint64_t) lock->client_pid, lkowner_utoa (&lock->owner));
 }
 
 
@@ -715,15 +768,16 @@ pl_entrylk_client_cleanup (xlator_t *this, pl_ctx_t *ctx)
         pl_inode_t *pinode = NULL;
 
         struct list_head released;
+        struct list_head unwind;
 
         INIT_LIST_HEAD (&released);
+        INIT_LIST_HEAD (&unwind);
 
 	pthread_mutex_lock (&ctx->lock);
         {
                 list_for_each_entry_safe (l, tmp, &ctx->entrylk_lockers,
 					  client_list) {
                         list_del_init (&l->client_list);
-			list_add_tail (&l->client_list, &released);
 
 			pl_entrylk_log_cleanup (l);
 
@@ -731,31 +785,75 @@ pl_entrylk_client_cleanup (xlator_t *this, pl_ctx_t *ctx)
 
 			pthread_mutex_lock (&pinode->mutex);
 			{
-				list_del_init (&l->domain_list);
+                        /* If the entrylk object is part of granted list but not
+                         * blocked list, then perform the following actions:
+                         * i.   delete the object from granted list;
+                         * ii.  grant other locks (from other clients) that may
+                         *      have been blocked on this entrylk; and
+                         * iii. unref the object.
+                         *
+                         * If the entrylk object (L1) is part of both granted
+                         * and blocked lists, then this means that a parallel
+                         * unlock on another entrylk (L2 say) may have 'granted'
+                         * L1 and added it to 'granted' list in
+                         * __grant_blocked_entry_locks() (although using the
+                         * 'blocked_locks' member). In that case, the cleanup
+                         * codepath must try and grant other overlapping
+                         * blocked entrylks from other clients, now that L1 is
+                         * out of their way and then unref L1 in the end, and
+                         * leave it to the other thread (the one executing
+                         * unlock codepath) to unwind L1's frame, delete it from
+                         * blocked_locks list, and perform the last unref on L1.
+                         *
+                         * If the entrylk object (L1) is part of blocked list
+                         * only, the cleanup code path must:
+                         * i.   delete it from the blocked_locks list inside
+                         *      this critical section,
+                         * ii.  unwind its frame with EAGAIN,
+                         * iii. try and grant blocked entry locks from other
+                         *      clients that were otherwise grantable, but were
+                         *      blocked to avoid leaving L1 to starve forever.
+                         * iv.  unref the object.
+                         */
+                                if (!list_empty (&l->domain_list)) {
+                                        list_del_init (&l->domain_list);
+                                        list_add_tail (&l->client_list,
+                                                       &released);
+                                } else {
+                                        list_del_init (&l->blocked_locks);
+                                        list_add_tail (&l->client_list,
+                                                       &unwind);
+                                }
                         }
 			pthread_mutex_unlock (&pinode->mutex);
                 }
 	}
         pthread_mutex_unlock (&ctx->lock);
 
-        list_for_each_entry_safe (l, tmp, &released, client_list) {
+        list_for_each_entry_safe (l, tmp, &unwind, client_list) {
                 list_del_init (&l->client_list);
 
 		if (l->frame)
 			STACK_UNWIND_STRICT (entrylk, l->frame, -1, EAGAIN,
 					     NULL);
+                list_add_tail (&l->client_list, &released);
+        }
+
+        list_for_each_entry_safe (l, tmp, &released, client_list) {
+                list_del_init (&l->client_list);
 
 		pinode = l->pinode;
 
 		dom = get_domain (pinode, l->volume);
 
-		grant_blocked_inode_locks (this, pinode, dom);
+		grant_blocked_entry_locks (this, pinode, dom);
 
 		pthread_mutex_lock (&pinode->mutex);
 		{
 			__pl_entrylk_unref (l);
 		}
 		pthread_mutex_unlock (&pinode->mutex);
+                inode_unref (pinode->inode);
         }
 
         return 0;

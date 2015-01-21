@@ -15,6 +15,8 @@
 
 #ifdef HAVE_BACKTRACE
 #include <execinfo.h>
+#else
+#include "execinfo_compat.h"
 #endif
 
 #include <stdio.h>
@@ -33,10 +35,11 @@
 #include <signal.h>
 #include <assert.h>
 
-#if defined GF_BSD_HOST_OS || defined GF_DARWIN_HOST_OS
+#if defined(GF_BSD_HOST_OS) || defined(GF_DARWIN_HOST_OS)
 #include <sys/sysctl.h>
 #endif
 
+#include "compat-errno.h"
 #include "logging.h"
 #include "common-utils.h"
 #include "revision.h"
@@ -80,7 +83,9 @@ mkdir_p (char *path, mode_t mode, gf_boolean_t allow_symlinks)
         char            dir[PATH_MAX]   = {0,};
         struct stat     stbuf           = {0,};
 
-        strcpy (dir, path);
+        strncpy (dir, path, (PATH_MAX - 1));
+        dir[PATH_MAX - 1] = '\0';
+
         i = (dir[0] == '/')? 1: 0;
         do {
                 if (path[i] != '/' && path[i] != '\0')
@@ -488,6 +493,9 @@ gf_print_trace (int32_t signum, glusterfs_ctx_t *ctx)
          * which helps in debugging.
          */
         gf_log_flush();
+
+        gf_log_disable_suppression_before_exit (ctx);
+
         /* Pending frames, (if any), list them in order */
         gf_msg_plain_nomem (GF_LOG_ALERT, "pending frames:");
         {
@@ -526,11 +534,9 @@ gf_print_trace (int32_t signum, glusterfs_ctx_t *ctx)
         }
 
         gf_dump_config_flags ();
-#if HAVE_BACKTRACE
         gf_msg_backtrace_nomem (GF_LOG_ALERT, 200);
         sprintf (msg, "---------");
         gf_msg_plain_nomem (GF_LOG_ALERT, msg);
-#endif /* HAVE_BACKTRACE */
 
         /* Send a signal to terminate the process */
         signal (signum, SIG_DFL);
@@ -1170,7 +1176,7 @@ gf_string2uint8 (const char *str, uint8_t *n)
         if (rv != 0)
                 return rv;
 
-        if (l >= 0 && l <= UINT8_MAX) {
+        if (l <= UINT8_MAX) {
                 *n = (uint8_t) l;
                 return 0;
         }
@@ -1189,7 +1195,7 @@ gf_string2uint16 (const char *str, uint16_t *n)
         if (rv != 0)
                 return rv;
 
-        if (l >= 0 && l <= UINT16_MAX) {
+        if (l <= UINT16_MAX) {
                 *n = (uint16_t) l;
                 return 0;
         }
@@ -1208,7 +1214,7 @@ gf_string2uint32 (const char *str, uint32_t *n)
         if (rv != 0)
                 return rv;
 
-        if (l >= 0 && l <= UINT32_MAX) {
+	if (l <= UINT32_MAX) {
                 *n = (uint32_t) l;
                 return 0;
         }
@@ -1227,7 +1233,7 @@ gf_string2uint64 (const char *str, uint64_t *n)
         if (rv != 0)
                 return rv;
 
-        if (l >= 0 && l <= UINT64_MAX) {
+        if (l <= UINT64_MAX) {
                 *n = (uint64_t) l;
                 return 0;
         }
@@ -1258,7 +1264,7 @@ gf_string2uint8_base10 (const char *str, uint8_t *n)
         if (rv != 0)
                 return rv;
 
-        if (l >= 0 && l <= UINT8_MAX) {
+        if (l <= UINT8_MAX) {
                 *n = (uint8_t) l;
                 return 0;
         }
@@ -1277,7 +1283,7 @@ gf_string2uint16_base10 (const char *str, uint16_t *n)
         if (rv != 0)
                 return rv;
 
-        if (l >= 0 && l <= UINT16_MAX) {
+        if (l <= UINT16_MAX) {
                 *n = (uint16_t) l;
                 return 0;
         }
@@ -1296,7 +1302,7 @@ gf_string2uint32_base10 (const char *str, uint32_t *n)
         if (rv != 0)
                 return rv;
 
-        if (l >= 0 && l <= UINT32_MAX) {
+        if (l <= UINT32_MAX) {
                 *n = (uint32_t) l;
                 return 0;
         }
@@ -1315,7 +1321,7 @@ gf_string2uint64_base10 (const char *str, uint64_t *n)
         if (rv != 0)
                 return rv;
 
-        if (l >= 0 && l <= UINT64_MAX) {
+        if (l <= UINT64_MAX) {
                 *n = (uint64_t) l;
                 return 0;
         }
@@ -1361,7 +1367,7 @@ err:
 }
 
 int
-gf_string2bytesize (const char *str, uint64_t *n)
+gf_string2bytesize_range (const char *str, uint64_t *n, uint64_t max)
 {
         double value = 0.0;
         char *tail = NULL;
@@ -1410,7 +1416,7 @@ gf_string2bytesize (const char *str, uint64_t *n)
                         return -1;
         }
 
-        if ((UINT64_MAX - value) < 0) {
+        if ((max - value) < 0) {
                 errno = ERANGE;
                 return -1;
         }
@@ -1418,6 +1424,28 @@ gf_string2bytesize (const char *str, uint64_t *n)
         *n = (uint64_t) value;
 
         return 0;
+}
+
+int
+gf_string2bytesize_size (const char *str, size_t *n)
+{
+        uint64_t u64;
+        size_t max = (size_t) - 1;
+        int val = gf_string2bytesize_range (str, &u64, max);
+        *n = (size_t) u64;
+        return val;
+}
+
+int
+gf_string2bytesize (const char *str, uint64_t *n)
+{
+        return gf_string2bytesize_range(str, n, UINT64_MAX);
+}
+
+int
+gf_string2bytesize_uint64 (const char *str, uint64_t *n)
+{
+        return gf_string2bytesize_range(str, n, UINT64_MAX);
 }
 
 int
@@ -1807,7 +1835,7 @@ out:
 }
 
 /*  Matches all ipv4 address, if wildcard_acc is true  '*' wildcard pattern for*
-  subnets is considerd as valid strings as well                               */
+  subnets is considered as valid strings as well                               */
 char
 valid_ipv4_address (char *address, int length, gf_boolean_t wildcard_acc)
 {
@@ -1856,6 +1884,70 @@ valid_ipv4_address (char *address, int length, gf_boolean_t wildcard_acc)
 out:
         GF_FREE (tmp);
         return ret;
+}
+
+/**
+ * valid_ipv4_subnetwork() takes the pattern and checks if it contains
+ * a valid ipv4 subnetwork pattern i.e. xx.xx.xx.xx/n. IPv4 address
+ * part (xx.xx.xx.xx) and mask bits lengh part (n). The mask bits lengh
+ * must be in 0-32 range (ipv4 addr is 32 bit). The pattern must be
+ * in this format.
+ *
+ * Returns _gf_true if both IP addr and mask bits len are valid
+ *         _gf_false otherwise.
+ */
+gf_boolean_t
+valid_ipv4_subnetwork (const char *address)
+{
+        char         *slash     = NULL;
+        char         *paddr     = NULL;
+        char         *endptr    = NULL;
+        long         prefixlen  = -1;
+        gf_boolean_t retv       = _gf_true;
+
+        if (address == NULL) {
+                gf_log_callingfn (THIS->name, GF_LOG_WARNING,
+                                              "argument invalid");
+                return _gf_false;
+        }
+
+        paddr = gf_strdup (address);
+        if (paddr == NULL) /* ENOMEM */
+                return _gf_false;
+
+        /*
+         * INVALID: If '/' is not present OR
+         *          Nothing specified after '/'
+         */
+        slash = strchr(paddr, '/');
+        if ((slash == NULL) || (slash[1] == '\0')) {
+                gf_log_callingfn (THIS->name, GF_LOG_WARNING,
+                                  "Invalid IPv4 subnetwork format");
+                retv = _gf_false;
+                goto out;
+        }
+
+        *slash = '\0';
+        retv = valid_ipv4_address (paddr, strlen(paddr), _gf_false);
+        if (retv == _gf_false) {
+                gf_log_callingfn (THIS->name, GF_LOG_WARNING,
+                                  "Invalid IPv4 subnetwork address");
+                goto out;
+        }
+
+        prefixlen = strtol (slash + 1, &endptr, 10);
+        if ((errno != 0) || (*endptr != '\0') ||
+            (prefixlen < 0) || (prefixlen > IPv4_ADDR_SIZE)) {
+                gf_log_callingfn (THIS->name, GF_LOG_WARNING,
+                                  "Invalid IPv4 subnetwork mask");
+                retv = _gf_false;
+                goto out;
+        }
+
+        retv = _gf_true;
+out:
+        GF_FREE (paddr);
+        return retv;
 }
 
 char
@@ -1939,6 +2031,65 @@ out:
 }
 
 /**
+ * valid_mount_auth_address - Validate the rpc-auth.addr.allow/reject pattern
+ *
+ * @param address - Pattern to be validated
+ *
+ * @return _gf_true if "address" is "*" (anonymous) 'OR'
+ *                  if "address" is valid FQDN or valid IPv4/6 address 'OR'
+ *                  if "address" contains wildcard chars e.g. "'*' or '?' or '['"
+ *                  if "address" is valid ipv4 subnet pattern (xx.xx.xx.xx/n)
+ *         _gf_false otherwise
+ *
+ *
+ * NB: If the user/admin set for wildcard pattern, then it does not have
+ *     to be validated. Make it similar to the way exportfs (kNFS) works.
+ */
+gf_boolean_t
+valid_mount_auth_address (char *address)
+{
+        int    length = 0;
+        char   *cp    = NULL;
+
+        /* 1. Check for "NULL and empty string */
+        if ((address == NULL) || (address[0] == '\0')){
+                gf_log_callingfn (THIS->name,
+                                  GF_LOG_WARNING, "argument invalid");
+                return _gf_false;
+        }
+
+        /* 2. Check for Anonymous */
+        if (strcmp(address, "*") == 0)
+                return _gf_true;
+
+        for (cp = address; *cp; cp++) {
+                /* 3. Check for wildcard pattern */
+                if (*cp == '*' || *cp == '?' || *cp == '[') {
+                        return _gf_true;
+                }
+
+                /*
+                 * 4. check for IPv4 subnetwork i.e. xx.xx.xx.xx/n
+                 * TODO: check for IPv6 subnetwork
+                 * NB: Wildcard must not be mixed with subnetwork.
+                 */
+                if (*cp == '/') {
+                        return valid_ipv4_subnetwork (address);
+                }
+        }
+
+        /* 5. Check for v4/v6 IP addr and FQDN/hostname */
+        length = strlen (address);
+        if ((valid_ipv4_address (address, length, _gf_false)) ||
+            (valid_ipv6_address (address, length, _gf_false)) ||
+            (valid_host_name (address, length))) {
+                return _gf_true;
+        }
+
+        return _gf_false;
+}
+
+/**
  * gf_sock_union_equal_addr - check if two given gf_sock_unions have same addr
  *
  * @param a - first sock union
@@ -1981,6 +2132,23 @@ gf_sock_union_equal_addr (union gf_sock_union *a,
 
         return _gf_false;
 }
+
+/*
+ * Check if both have same network address.
+ * Extract the network address from the sockaddr(s) addr by applying the
+ * network mask. If they match, return boolean _gf_true, _gf_false otherwise.
+ *
+ * (x == y) <=> (x ^ y == 0)
+ * (x & y) ^ (x & z) <=> x & (y ^ z)
+ *
+ * ((ip1 & mask) == (ip2 & mask)) <=> ((mask & (ip1 ^ ip2)) == 0)
+ */
+gf_boolean_t
+mask_match(const uint32_t a, const uint32_t b, const uint32_t m)
+{
+        return (((a ^ b) & m) == 0);
+}
+
 
 /*Thread safe conversion function*/
 char *
@@ -2300,14 +2468,18 @@ static const char *__gf_timefmts[] = {
         "%F %T",
         "%Y/%m/%d-%T",
         "%b %d %T",
-        "%F %H%M%S"
+        "%F %H%M%S",
+	"%Y-%m-%d-%T",
+        "%s",
 };
 
 static const char *__gf_zerotimes[] = {
         "0000-00-00 00:00:00",
         "0000/00/00-00:00:00",
         "xxx 00 00:00:00",
-        "0000-00-00 000000"
+        "0000-00-00 000000",
+	"0000-00-00-00:00:00",
+        "0",
 };
 
 void
@@ -2893,82 +3065,29 @@ gf_set_log_ident (cmd_args_t *cmd_args)
 
 int
 gf_thread_create (pthread_t *thread, const pthread_attr_t *attr,
-		  void *(*start_routine)(void *), void *arg)
+                  void *(*start_routine)(void *), void *arg)
 {
-	sigset_t set, old;
-	int ret;
+        sigset_t set, old;
+        int ret;
 
-	sigemptyset (&set);
+        sigemptyset (&set);
 
-	sigfillset (&set);
-	sigdelset (&set, SIGSEGV);
-	sigdelset (&set, SIGBUS);
-	sigdelset (&set, SIGILL);
-	sigdelset (&set, SIGSYS);
-	sigdelset (&set, SIGFPE);
-	sigdelset (&set, SIGABRT);
+        sigfillset (&set);
+        sigdelset (&set, SIGSEGV);
+        sigdelset (&set, SIGBUS);
+        sigdelset (&set, SIGILL);
+        sigdelset (&set, SIGSYS);
+        sigdelset (&set, SIGFPE);
+        sigdelset (&set, SIGABRT);
 
-	pthread_sigmask (SIG_BLOCK, &set, &old);
+        pthread_sigmask (SIG_BLOCK, &set, &old);
 
-	ret = pthread_create (thread, attr, start_routine, arg);
+        ret = pthread_create (thread, attr, start_routine, arg);
 
-	pthread_sigmask (SIG_SETMASK, &old, NULL);
+        pthread_sigmask (SIG_SETMASK, &old, NULL);
 
-	return ret;
+        return ret;
 }
-
-#ifdef __NetBSD__
-#ifdef __MACHINE_STACK_GROWS_UP
-#define BELOW >
-#else
-#define BELOW <
-#endif
-
-struct frameinfo {
-	struct frameinfo *next;
-	void *return_address;
-};
-
-size_t
-backtrace(void **trace, size_t len)
-{
-	const struct frameinfo *frame = __builtin_frame_address(0);
-	void *stack = &stack;
-	size_t i;
-
-	for (i = 0; i < len; i++) {
-		if ((void *)frame BELOW stack)
-			return i;
-		trace[i] = frame->return_address;
-		frame = frame->next;
-	}
-
-	return len;
-}
-
-char **
-backtrace_symbols(void *const *trace, size_t len)
-{
-	static const size_t slen = sizeof("0x123456789abcdef");
-	char **ptr = calloc(len, sizeof(*ptr) + slen);
-	size_t i;
-
-	if (ptr == NULL)
-		return NULL;
-
-	char *str = (void *)(ptr + len);
-	size_t cur = 0, left = len * slen;
-
-	for (i = 0; i < len; i++) {
-		ptr[i] = str + cur;
-		cur += snprintf(str + cur, left - cur, "%p", trace[i]) + 1;
-		assert(cur < left);
-	}
-
-	return ptr;
-}
-#undef BELOW
-#endif /* __NetBSD__ */
 
 int
 gf_skip_header_section (int fd, int header_len)
@@ -3082,4 +3201,450 @@ gf_check_logger (const char *value)
                         GF_LOGGER_GLUSTER_LOG "|" GF_LOGGER_SYSLOG);
 
         return logger;
+}
+
+/* gf_compare_sockaddr compares the given addresses @addr1 and @addr2 for
+ * equality, ie. if they both refer to the same address.
+ *
+ * This was inspired by sock_addr_cmp_addr() from
+ * https://www.opensource.apple.com/source/postfix/postfix-197/postfix/src/util/sock_addr.c
+ */
+gf_boolean_t
+gf_compare_sockaddr (const struct sockaddr *addr1,
+                     const struct sockaddr *addr2)
+{
+        GF_ASSERT (addr1 != NULL);
+        GF_ASSERT (addr2 != NULL);
+
+        /* Obviously, the addresses don't match if their families are different
+         */
+        if (addr1->sa_family != addr2->sa_family)
+                return _gf_false;
+
+
+        if (AF_INET == addr1->sa_family) {
+                if (((struct sockaddr_in *)addr1)->sin_addr.s_addr ==
+                       ((struct sockaddr_in *)addr2)->sin_addr.s_addr)
+                        return _gf_true;
+
+        } else if (AF_INET6 == addr1->sa_family) {
+                if (memcmp ((char *)&((struct sockaddr_in6 *)addr1)->sin6_addr,
+                            (char *)&((struct sockaddr_in6 *)addr2)->sin6_addr,
+                            sizeof (struct in6_addr)) == 0)
+                        return _gf_true;
+        }
+        return _gf_false;
+}
+
+/*
+ * gf_set_timestamp:
+ *      It sets the mtime and atime of 'dest' file as of 'src'.
+ */
+
+int
+gf_set_timestamp  (const char *src, const char* dest)
+{
+        struct stat    sb             = {0, };
+        struct timeval new_time[2]    = {{0, },{0,}};
+        int            ret            = 0;
+        xlator_t       *this          = NULL;
+
+        this = THIS;
+        GF_ASSERT (this);
+        GF_ASSERT (src);
+        GF_ASSERT (dest);
+
+        ret = stat (src, &sb);
+        if (ret) {
+                gf_log (this->name, GF_LOG_ERROR, "stat on %s failed: %s",
+                        src, strerror(errno));
+                goto out;
+        }
+        new_time[0].tv_sec = sb.st_atime;
+        new_time[0].tv_usec = ST_ATIM_NSEC (&sb)/1000;
+
+        new_time[1].tv_sec = sb.st_mtime;
+        new_time[1].tv_usec = ST_MTIM_NSEC (&sb)/1000;
+
+        /* The granularity is micro seconds as per the current
+         * requiremnt. Hence using 'utimes'. This can be updated
+         * to 'utimensat' if we need timestamp in nanoseconds.
+         */
+        ret = utimes (dest, new_time);
+        if (ret) {
+                gf_log (this->name, GF_LOG_ERROR, "utimes on %s failed: %s",
+                        dest, strerror(errno));
+        }
+out:
+        return ret;
+}
+
+static void
+gf_backtrace_end (char *buf, size_t frames)
+{
+        size_t pos = 0;
+
+        if (!buf)
+                return;
+
+        pos = strlen (buf);
+
+        frames = min(frames, GF_BACKTRACE_LEN - pos -1);
+
+        if (frames <= 0)
+                return;
+
+        memset (buf+pos, ')', frames);
+        buf[pos+frames] = '\0';
+}
+
+/*Returns bytes written*/
+static int
+gf_backtrace_append (char *buf, size_t pos, char *framestr)
+{
+        if (pos >= GF_BACKTRACE_LEN)
+                return -1;
+        return snprintf (buf+pos, GF_BACKTRACE_LEN-pos, "(--> %s ", framestr);
+}
+
+static int
+gf_backtrace_fillframes (char *buf)
+{
+        void    *array[GF_BACKTRACE_FRAME_COUNT];
+        size_t  frames                  = 0;
+        FILE    *fp                     = NULL;
+        char    callingfn[GF_BACKTRACE_FRAME_COUNT-2][1024] = {{0},};
+        int     ret                     = -1;
+        int     fd                      = -1;
+        size_t  idx                     = 0;
+        size_t  pos                     = 0;
+        size_t  inc                     = 0;
+        char    tmpl[32]                = "/tmp/btXXXXXX";
+
+        frames = backtrace (array, GF_BACKTRACE_FRAME_COUNT);
+        if (!frames)
+                return -1;
+
+        fd = gf_mkostemp (tmpl, 0, O_RDWR);
+        if (fd == -1)
+                return -1;
+
+        /*The most recent two frames are the calling function and
+         * gf_backtrace_save, which we can infer.*/
+
+        backtrace_symbols_fd (&array[2], frames-2, fd);
+
+        fp = fdopen (fd, "r");
+        if (!fp) {
+                close (fd);
+                ret = -1;
+                goto out;
+        }
+
+        ret = fseek (fp, 0L, SEEK_SET);
+        if (ret)
+                goto out;
+
+        pos = 0;
+        for (idx = 0; idx < frames - 2; idx++) {
+                ret = fscanf (fp, "%s", callingfn[idx]);
+                if (ret == EOF)
+                        break;
+                inc = gf_backtrace_append (buf, pos, callingfn[idx]);
+                if (inc == -1)
+                        break;
+                pos += inc;
+        }
+        gf_backtrace_end (buf, idx);
+
+out:
+        if (fp)
+                fclose (fp);
+
+        unlink (tmpl);
+
+        return (idx > 0)? 0: -1;
+
+}
+
+/* Optionally takes @buf to save backtrace.  If @buf is NULL, uses the
+ * pre-allocated ctx->btbuf to avoid allocating memory while printing
+ * backtrace.
+ * TODO: This API doesn't provide flexibility in terms of no. of frames
+ * of the backtrace is being saved in the buffer. Deferring fixing it
+ * when there is a real-use for that.*/
+
+char *
+gf_backtrace_save (char *buf)
+{
+        char *bt = NULL;
+
+        if (!buf) {
+                bt = THIS->ctx->btbuf;
+                GF_ASSERT (bt);
+
+        } else {
+                bt = buf;
+
+        }
+
+        if ((0 == gf_backtrace_fillframes (bt)))
+                return bt;
+
+        gf_log (THIS->name, GF_LOG_WARNING, "Failed to save the backtrace.");
+        return NULL;
+}
+
+gf_loglevel_t
+fop_log_level (glusterfs_fop_t fop, int op_errno)
+{
+        /* if gfid doesn't exist ESTALE comes */
+        if (op_errno == ENOENT || op_errno == ESTALE)
+                return GF_LOG_DEBUG;
+
+        if ((fop == GF_FOP_ENTRYLK) ||
+            (fop == GF_FOP_FENTRYLK) ||
+            (fop == GF_FOP_FINODELK) ||
+            (fop == GF_FOP_INODELK) ||
+            (fop == GF_FOP_LK)) {
+                /*
+                 * if non-blocking lock fails EAGAIN comes
+                 * if locks xlator is not loaded ENOSYS comes
+                 */
+                if (op_errno == EAGAIN || op_errno == ENOSYS)
+                        return GF_LOG_DEBUG;
+        }
+
+        if ((fop == GF_FOP_GETXATTR) ||
+            (fop == GF_FOP_FGETXATTR)) {
+                if (op_errno == ENOTSUP || op_errno == ENODATA)
+                        return GF_LOG_DEBUG;
+        }
+
+        if ((fop == GF_FOP_SETXATTR) ||
+            (fop == GF_FOP_FSETXATTR) ||
+            (fop == GF_FOP_REMOVEXATTR) ||
+            (fop == GF_FOP_FREMOVEXATTR)) {
+                if (op_errno == ENOTSUP)
+                        return GF_LOG_DEBUG;
+        }
+
+        return GF_LOG_ERROR;
+}
+
+/* This function will build absolute path of file/directory from the
+ * current location and relative path given from the current location
+ * For example consider our current path is /a/b/c/ and relative path
+ * from current location is ./../x/y/z .After parsing through this
+ * function the absolute path becomes /a/b/x/y/z/.
+ *
+ * The function gives a pointer to absolute path if it is successful
+ * and also returns zero.
+ * Otherwise function gives NULL pointer with returning an err value.
+ *
+ * So the user need to free memory allocated for path.
+ *
+ */
+
+int32_t
+gf_build_absolute_path (char *current_path, char *relative_path, char **path)
+{
+        char                    *absolute_path          = NULL;
+        char                    *token                  = NULL;
+        char                    *component              = NULL;
+        char                    *saveptr                = NULL;
+        char                    *end                    = NULL;
+        int                     ret                     = 0;
+        size_t                  relativepath_len        = 0;
+        size_t                  currentpath_len         = 0;
+        size_t                  max_absolutepath_len    = 0;
+
+        GF_ASSERT (current_path);
+        GF_ASSERT (relative_path);
+        GF_ASSERT (path);
+
+        if (!path || !current_path || !relative_path) {
+                ret = -EFAULT;
+                goto err;
+        }
+        /* Check for current and relative path
+         * current path should be absolute one and  start from '/'
+         * relative path should not start from '/'
+         */
+        currentpath_len = strlen (current_path);
+        if (current_path[0] != '/' || (currentpath_len > PATH_MAX)) {
+                gf_log (THIS->name, GF_LOG_ERROR, "Wrong value for"
+                                   " current path %s", current_path);
+                ret = -EINVAL;
+                goto err;
+        }
+
+        relativepath_len = strlen (relative_path);
+        if (relative_path[0] == '/' || (relativepath_len > PATH_MAX)) {
+                gf_log (THIS->name, GF_LOG_ERROR, "Wrong value for"
+                                   " relative path %s", relative_path);
+                ret = -EINVAL;
+                goto err;
+        }
+
+        /* It is maximum possible value for absolute path */
+        max_absolutepath_len = currentpath_len + relativepath_len + 2;
+
+        absolute_path = GF_CALLOC (1, max_absolutepath_len, gf_common_mt_char);
+        if (!absolute_path) {
+                ret = -ENOMEM;
+                goto err;
+        }
+        absolute_path[0] = '\0';
+
+        /* If current path is root i.e contains only "/", we do not
+         * need to copy it
+         */
+        if (strcmp (current_path, "/") != 0) {
+                strcpy (absolute_path, current_path);
+
+                /* We trim '/' at the end for easier string manipulation */
+                gf_path_strip_trailing_slashes (absolute_path);
+        }
+
+        /* Used to spilt relative path based on '/' */
+        component = gf_strdup (relative_path);
+        if (!component) {
+                ret = -ENOMEM;
+                goto err;
+        }
+
+        /* In the relative path, we want to consider ".." and "."
+         * if token is ".." , we just need to reduce one level hierarchy
+         * if token is "." , we just ignore it
+         * if token is NULL , end of relative path
+         * if absolute path becomes '\0' and still "..", then it is a bad
+         * relative path,  it points to out of boundary area and stop
+         * building the absolute path
+         * All other cases we just concatenate token to the absolute path
+         */
+        for (token = strtok_r (component,  "/", &saveptr),
+             end = strchr (absolute_path, '\0'); token;
+             token = strtok_r (NULL, "/", &saveptr)) {
+                if (strcmp (token, ".") == 0)
+                        continue;
+
+                else if (strcmp (token, "..") == 0) {
+
+                        if (absolute_path[0] == '\0') {
+                                ret = -EACCES;
+                                goto err;
+                         }
+
+                         end = strrchr (absolute_path, '/');
+                         *end = '\0';
+                } else {
+                        ret = snprintf (end, max_absolutepath_len -
+                                        strlen (absolute_path), "/%s", token);
+                        end = strchr (absolute_path , '\0');
+                }
+        }
+
+        if (strlen (absolute_path) > PATH_MAX) {
+                ret = -EINVAL;
+                goto err;
+        }
+        *path = gf_strdup (absolute_path);
+
+err:
+        if (component)
+                GF_FREE (component);
+        if (absolute_path)
+                GF_FREE (absolute_path);
+        return ret;
+}
+
+/* This is an utility function which will recursively delete
+ * a folder and its contents.
+ *
+ * @param delete_path folder to be deleted.
+ *
+ * @return 0 on success and -1 on failure.
+ */
+int
+recursive_rmdir (const char *delete_path)
+{
+        int             ret             = -1;
+        char            path[PATH_MAX]  = {0,};
+        struct stat     st              = {0,};
+        DIR            *dir             = NULL;
+        struct dirent  *entry           = NULL;
+        xlator_t       *this            = NULL;
+
+        this = THIS;
+        GF_ASSERT (this);
+        GF_VALIDATE_OR_GOTO (this->name, delete_path, out);
+
+        dir = opendir (delete_path);
+        if (!dir) {
+                gf_log (this->name, GF_LOG_DEBUG, "Failed to open directory %s."
+                        " Reason : %s", delete_path, strerror (errno));
+                ret = 0;
+                goto out;
+        }
+
+        GF_FOR_EACH_ENTRY_IN_DIR (entry, dir);
+        while (entry) {
+                snprintf (path, PATH_MAX, "%s/%s", delete_path, entry->d_name);
+                ret = lstat (path, &st);
+                if (ret == -1) {
+                        gf_log (this->name, GF_LOG_DEBUG, "Failed to stat "
+                                "entry %s : %s", path, strerror (errno));
+                        goto out;
+                }
+
+                if (S_ISDIR (st.st_mode))
+                        ret = recursive_rmdir (path);
+                else
+                        ret = unlink (path);
+
+                if (ret) {
+                        gf_log (this->name, GF_LOG_DEBUG, " Failed to remove "
+                                "%s. Reason : %s", path, strerror (errno));
+                }
+
+                gf_log (this->name, GF_LOG_DEBUG, "%s %s",
+                                ret ? "Failed to remove":"Removed",
+                                entry->d_name);
+
+                GF_FOR_EACH_ENTRY_IN_DIR (entry, dir);
+        }
+
+        ret = closedir (dir);
+        if (ret) {
+                gf_log (this->name, GF_LOG_DEBUG, "Failed to close dir %s. "
+                        "Reason : %s", delete_path, strerror (errno));
+        }
+
+        ret = rmdir (delete_path);
+        if (ret) {
+                gf_log (this->name, GF_LOG_DEBUG, "Failed to rmdir: %s,err: %s",
+                        delete_path, strerror (errno));
+        }
+
+out:
+        return ret;
+}
+/*
+ * Input: Array of strings 'array' terminating in NULL
+ *        string 'elem' to be searched in the array
+ *
+ * Output: Index of the element in the array if found, '-1' otherwise
+ */
+int
+gf_get_index_by_elem (char **array, char *elem)
+{
+        int     i = 0;
+
+        for (i = 0; array[i]; i++) {
+                if (strcmp (elem, array[i]) == 0)
+                        return i;
+        }
+
+        return -1;
 }

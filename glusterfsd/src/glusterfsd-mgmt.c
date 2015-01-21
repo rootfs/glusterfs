@@ -1205,6 +1205,124 @@ out:
         return ret;
 
 }
+
+int
+glusterfs_handle_barrier (rpcsvc_request_t *req)
+{
+        int                     ret         = -1;
+        gd1_mgmt_brick_op_req   brick_req   = {0,};
+        gd1_mgmt_brick_op_rsp   brick_rsp   = {0,};
+        glusterfs_ctx_t         *ctx        = NULL;
+        glusterfs_graph_t       *active     = NULL;
+        xlator_t                *any        = NULL;
+        xlator_t                *xlator     = NULL;
+        xlator_t                *old_THIS   = NULL;
+        dict_t                  *dict       = NULL;
+        char                    name[1024]  = {0,};
+        gf_boolean_t            barrier     = _gf_true;
+        gf_boolean_t            barrier_err = _gf_false;
+
+        GF_ASSERT (req);
+
+        ret = xdr_to_generic(req->msg[0], &brick_req,
+                             (xdrproc_t)xdr_gd1_mgmt_brick_op_req);
+        if (ret < 0) {
+                req->rpc_err = GARBAGE_ARGS;
+                goto out;
+        }
+
+        ctx = glusterfsd_ctx;
+        GF_ASSERT (ctx);
+        active = ctx->active;
+        any = active->first;
+
+        dict = dict_new();
+        if (!dict) {
+                ret = -1;
+                goto out;
+        }
+
+        ret = dict_unserialize(brick_req.input.input_val,
+                               brick_req.input.input_len, &dict);
+        if (ret < 0) {
+                gf_log (THIS->name, GF_LOG_ERROR, "Failed to unserialize "
+                        "request dictionary");
+                goto out;
+        }
+
+        brick_rsp.op_ret = 0;
+        brick_rsp.op_errstr = ""; // initing to prevent serilaztion failures
+        old_THIS = THIS;
+
+        /* Send barrier request to the barrier xlator */
+        snprintf (name, sizeof (name), "%s-barrier", brick_req.name);
+        xlator = xlator_search_by_name(any, name);
+        if (!xlator) {
+                ret = -1;
+                gf_log (THIS->name, GF_LOG_ERROR, "%s xlator is not loaded",
+                        name);
+                goto out;
+        }
+
+        THIS = xlator;
+        // TODO: Extend this to accept return of errnos
+        ret = xlator->notify (xlator, GF_EVENT_TRANSLATOR_OP, dict);
+        if (ret) {
+                brick_rsp.op_ret = ret;
+                brick_rsp.op_errstr = gf_strdup ("Failed to reconfigure "
+                                                 "barrier.");
+                /* This is to invoke changelog-barrier disable if barrier
+                 * disable fails and don't invoke if barrier enable fails.
+                 */
+                barrier = dict_get_str_boolean (dict, "barrier", _gf_true);
+                if (barrier)
+                        goto submit_reply;
+                else
+                        barrier_err = _gf_true;
+        }
+
+        /* Reset THIS so that we have it correct in case of an error below
+         */
+        THIS = old_THIS;
+
+        /* Send barrier request to changelog as well */
+
+        memset (name, 0, sizeof (name));
+        snprintf (name, sizeof (name), "%s-changelog", brick_req.name);
+        xlator = xlator_search_by_name(any, name);
+        if (!xlator) {
+                ret = -1;
+                gf_log (THIS->name, GF_LOG_ERROR, "%s xlator is not loaded",
+                        name);
+                goto out;
+        }
+
+        THIS = xlator;
+        ret = xlator->notify (xlator, GF_EVENT_TRANSLATOR_OP, dict);
+        if (ret) {
+                brick_rsp.op_ret = ret;
+                brick_rsp.op_errstr = gf_strdup ("changelog notify failed");
+                goto submit_reply;
+        }
+
+        if (barrier_err)
+                ret = -1;
+
+submit_reply:
+        THIS = old_THIS;
+
+        ret = glusterfs_submit_reply (req, &brick_rsp, NULL, 0, NULL,
+                                      (xdrproc_t)xdr_gd1_mgmt_brick_op_rsp);
+
+out:
+        if (dict)
+                dict_unref (dict);
+        free (brick_req.input.input_val);
+
+        gf_log (THIS->name, GF_LOG_DEBUG, "Returning %d", ret);
+        return ret;
+}
+
 int
 glusterfs_handle_rpc_msg (rpcsvc_request_t *req)
 {
@@ -1213,7 +1331,7 @@ glusterfs_handle_rpc_msg (rpcsvc_request_t *req)
         return ret;
 }
 
-rpcclnt_cb_actor_t mgmt_cbk_actors[] = {
+rpcclnt_cb_actor_t mgmt_cbk_actors[GF_CBK_MAXVALUE] = {
         [GF_CBK_FETCHSPEC] = {"FETCHSPEC", GF_CBK_FETCHSPEC, mgmt_cbk_spec },
         [GF_CBK_EVENT_NOTIFY] = {"EVENTNOTIFY", GF_CBK_EVENT_NOTIFY,
                                  mgmt_cbk_event},
@@ -1260,7 +1378,7 @@ rpc_clnt_prog_t clnt_handshake_prog = {
         .procnames = clnt_handshake_procs,
 };
 
-rpcsvc_actor_t glusterfs_actors[] = {
+rpcsvc_actor_t glusterfs_actors[GLUSTERD_BRICK_MAXVALUE] = {
         [GLUSTERD_BRICK_NULL]          = {"NULL",              GLUSTERD_BRICK_NULL,          glusterfs_handle_rpc_msg,             NULL, 0, DRC_NA},
         [GLUSTERD_BRICK_TERMINATE]     = {"TERMINATE",         GLUSTERD_BRICK_TERMINATE,     glusterfs_handle_terminate,           NULL, 0, DRC_NA},
         [GLUSTERD_BRICK_XLATOR_INFO]   = {"TRANSLATOR INFO",   GLUSTERD_BRICK_XLATOR_INFO,   glusterfs_handle_translator_info_get, NULL, 0, DRC_NA},
@@ -1270,6 +1388,7 @@ rpcsvc_actor_t glusterfs_actors[] = {
         [GLUSTERD_NODE_PROFILE]        = {"NFS PROFILE",       GLUSTERD_NODE_PROFILE,        glusterfs_handle_nfs_profile,         NULL, 0, DRC_NA},
         [GLUSTERD_NODE_STATUS]         = {"NFS STATUS",        GLUSTERD_NODE_STATUS,         glusterfs_handle_node_status,         NULL, 0, DRC_NA},
         [GLUSTERD_VOLUME_BARRIER_OP]   = {"VOLUME BARRIER OP", GLUSTERD_VOLUME_BARRIER_OP,   glusterfs_handle_volume_barrier_op,   NULL, 0, DRC_NA},
+        [GLUSTERD_BRICK_BARRIER]       = {"BARRIER",           GLUSTERD_BRICK_BARRIER,       glusterfs_handle_barrier,             NULL, 0, DRC_NA},
 };
 
 struct rpcsvc_program glusterfs_mop_prog = {
@@ -1522,6 +1641,16 @@ glusterfs_volfile_fetch (glusterfs_ctx_t *ctx)
                 gf_log (THIS->name, GF_LOG_ERROR, "Failed to set max-op-version"
                         " in request dict");
                 goto out;
+        }
+
+        if (cmd_args->brick_name) {
+                ret = dict_set_dynstr_with_alloc (dict, "brick_name",
+                                                  cmd_args->brick_name);
+                if (ret) {
+                        gf_log (THIS->name, GF_LOG_ERROR,
+                                "Failed to set brick_name in request dict");
+                        goto out;
+                }
         }
 
         ret = dict_allocate_and_serialize (dict, &req.xdata.xdata_val,
@@ -2031,10 +2160,11 @@ out:
 int
 glusterfs_mgmt_pmap_signin (glusterfs_ctx_t *ctx)
 {
-        call_frame_t     *frame = NULL;
-        pmap_signin_req   req = {0, };
-        int               ret = -1;
-        cmd_args_t       *cmd_args = NULL;
+        call_frame_t     *frame                 = NULL;
+        pmap_signin_req   req                   = {0, };
+        int               ret                   = -1;
+        cmd_args_t       *cmd_args              = NULL;
+        char              brick_name[PATH_MAX]  = {0,};
 
         frame = create_frame (THIS, ctx->pool);
         cmd_args = &ctx->cmd_args;
@@ -2045,8 +2175,15 @@ glusterfs_mgmt_pmap_signin (glusterfs_ctx_t *ctx)
                 goto out;
         }
 
+        if (cmd_args->volfile_server_transport &&
+                      !strcmp(cmd_args->volfile_server_transport, "rdma")) {
+                snprintf (brick_name, sizeof(brick_name), "%s.rdma",
+                          cmd_args->brick_name);
+                req.brick = brick_name;
+        } else
+                req.brick = cmd_args->brick_name;
+
         req.port  = cmd_args->brick_port;
-        req.brick = cmd_args->brick_name;
 
         ret = mgmt_submit_request (&req, frame, ctx, &clnt_pmap_prog,
                                    GF_PMAP_SIGNIN, mgmt_pmap_signin_cbk,
@@ -2097,6 +2234,7 @@ glusterfs_mgmt_pmap_signout (glusterfs_ctx_t *ctx)
         pmap_signout_req  req = {0, };
         call_frame_t     *frame = NULL;
         cmd_args_t       *cmd_args = NULL;
+        char              brick_name[PATH_MAX]  = {0,};
 
         frame = create_frame (THIS, ctx->pool);
         cmd_args = &ctx->cmd_args;
@@ -2107,9 +2245,16 @@ glusterfs_mgmt_pmap_signout (glusterfs_ctx_t *ctx)
                 goto out;
         }
 
-        req.port  = cmd_args->brick_port;
-        req.brick = cmd_args->brick_name;
+        if (cmd_args->volfile_server_transport &&
+                      !strcmp(cmd_args->volfile_server_transport, "rdma")) {
+                snprintf (brick_name, sizeof(brick_name), "%s.rdma",
+                          cmd_args->brick_name);
+                req.brick = brick_name;
+        } else
+                req.brick = cmd_args->brick_name;
 
+        req.port  = cmd_args->brick_port;
+        req.rdma_port = cmd_args->brick_port2;
         ret = mgmt_submit_request (&req, frame, ctx, &clnt_pmap_prog,
                                    GF_PMAP_SIGNOUT, mgmt_pmap_signout_cbk,
                                    (xdrproc_t)xdr_pmap_signout_req);

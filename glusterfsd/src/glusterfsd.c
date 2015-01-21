@@ -115,6 +115,10 @@ static struct argp_option gf_options[] = {
         "[default: \"gluster-log\"]"},
         {"log-format", ARGP_LOG_FORMAT, "LOG-FORMAT", 0, "Set log format, valid"
          " options are: no-msg-id and with-msg-id, [default: \"with-msg-id\"]"},
+        {"log-buf-size", ARGP_LOG_BUF_SIZE, "LOG-BUF-SIZE", 0, "Set logging "
+         "buffer size, [default: 5]"},
+        {"log-flush-timeout", ARGP_LOG_FLUSH_TIMEOUT, "LOG-FLUSH-TIMEOUT", 0,
+         "Set log flush timeout, [default: 2 minutes]"},
 
         {0, 0, 0, 0, "Advanced Options:"},
         {"volfile-server-port", ARGP_VOLFILE_SERVER_PORT_KEY, "PORT", 0,
@@ -150,11 +154,8 @@ static struct argp_option gf_options[] = {
          "Enable SELinux label (extened attributes) support on inodes"},
         {"volfile-max-fetch-attempts", ARGP_VOLFILE_MAX_FETCH_ATTEMPTS, "0",
          OPTION_HIDDEN, "Maximum number of attempts to fetch the volfile"},
-
-#ifdef GF_LINUX_HOST_OS
         {"aux-gfid-mount", ARGP_AUX_GFID_MOUNT_KEY, 0, 0,
          "Enable access to filesystem through gfid directly"},
-#endif
         {"enable-ino32", ARGP_INODE32_KEY, "BOOL", OPTION_ARG_OPTIONAL,
          "Use 32-bit inodes when mounting to workaround broken applications"
          "that don't support 64-bit inodes"},
@@ -208,12 +209,14 @@ static struct argp_option gf_options[] = {
         {"volfile-check", ARGP_VOLFILE_CHECK_KEY, 0, 0,
          "Enable strict volume file checking"},
         {"mem-accounting", ARGP_MEM_ACCOUNTING_KEY, 0, OPTION_HIDDEN,
-         "Enable internal memory accounting"},
+         "Enable internal memory accounting (enabled by default, obsolete)"},
         {"fuse-mountopts", ARGP_FUSE_MOUNTOPTS_KEY, "OPTIONS", OPTION_HIDDEN,
          "Extra mount options to pass to FUSE"},
         {"use-readdirp", ARGP_FUSE_USE_READDIRP_KEY, "BOOL", OPTION_ARG_OPTIONAL,
          "Use readdirp mode in fuse kernel module"
          " [default: \"off\"]"},
+        {"secure-mgmt", ARGP_SECURE_MGMT_KEY, "BOOL", OPTION_ARG_OPTIONAL,
+         "Override default for secure (SSL) management connections"},
         {0, 0, 0, 0, "Miscellaneous Options:"},
         {0, }
 };
@@ -1110,6 +1113,50 @@ parse_opts (int key, char *arg, struct argp_state *state)
 
                 break;
 
+        case ARGP_LOG_BUF_SIZE:
+                if (gf_string2uint32 (arg, &cmd_args->log_buf_size)) {
+                        argp_failure (state, -1, 0,
+                                      "unknown log buf size option %s", arg);
+                } else if ((cmd_args->log_buf_size < GF_LOG_LRU_BUFSIZE_MIN) ||
+                          (cmd_args->log_buf_size > GF_LOG_LRU_BUFSIZE_MAX)) {
+                            argp_failure (state, -1, 0,
+                                          "Invalid log buf size %s. "
+                                          "Valid range: ["
+                                          GF_LOG_LRU_BUFSIZE_MIN_STR","
+                                          GF_LOG_LRU_BUFSIZE_MAX_STR"]", arg);
+                }
+
+                break;
+
+        case ARGP_LOG_FLUSH_TIMEOUT:
+                if (gf_string2uint32 (arg, &cmd_args->log_flush_timeout)) {
+                        argp_failure (state, -1, 0,
+                                "unknown log flush timeout option %s", arg);
+                } else if ((cmd_args->log_flush_timeout <
+                            GF_LOG_FLUSH_TIMEOUT_MIN) ||
+                           (cmd_args->log_flush_timeout >
+                            GF_LOG_FLUSH_TIMEOUT_MAX)) {
+                            argp_failure (state, -1, 0,
+                                          "Invalid log flush timeout %s. "
+                                          "Valid range: ["
+                                          GF_LOG_FLUSH_TIMEOUT_MIN_STR","
+                                          GF_LOG_FLUSH_TIMEOUT_MAX_STR"]", arg);
+                }
+
+                break;
+
+        case ARGP_SECURE_MGMT_KEY:
+                if (!arg)
+                        arg = "yes";
+
+                if (gf_string2boolean (arg, &b) == 0) {
+                        cmd_args->secure_mgmt = b ? 1 : 0;
+                        break;
+                }
+
+                argp_failure (state, -1, 0,
+                              "unknown secure-mgmt setting \"%s\"", arg);
+                break;
 	}
 
         return 0;
@@ -1126,6 +1173,23 @@ cleanup_and_exit (int signum)
 
         if (!ctx)
                 return;
+
+        /* To take or not to take the mutex here and in the other
+         * signal handler - gf_print_trace() - is the big question here.
+         *
+         * Taking mutex in signal handler would mean that if the process
+         * receives a fatal signal while another thread is holding
+         * ctx->log.log_buf_lock to perhaps log a message in _gf_msg_internal(),
+         * the offending thread hangs on the mutex lock forever without letting
+         * the process exit.
+         *
+         * On the other hand. not taking the mutex in signal handler would cause
+         * it to modify the lru_list of buffered log messages in a racy manner,
+         * corrupt the list and potentially give rise to an unending
+         * cascade of SIGSEGVs and other re-entrancy issues.
+         */
+
+        gf_log_disable_suppression_before_exit (ctx);
 
         gf_msg_callingfn ("", GF_LOG_WARNING, 0, glusterfsd_msg_32, signum);
 
@@ -1250,7 +1314,16 @@ glusterfs_ctx_defaults_init (glusterfs_ctx_t *ctx)
         struct rlimit        lim      = {0, };
         int                  ret      = -1;
 
-        xlator_mem_acct_init (THIS, gfd_mt_end);
+        ret = xlator_mem_acct_init (THIS, gfd_mt_end);
+        if (ret != 0) {
+                gf_msg(THIS->name, GF_LOG_CRITICAL, 0, glusterfsd_msg_34);
+                return ret;
+        }
+
+        /* reset ret to -1 so that we don't need to explicitly
+         * set it in all error paths before "goto err"
+         */
+        ret = -1;
 
         ctx->process_uuid = generate_glusterfs_ctx_id ();
         if (!ctx->process_uuid) {
@@ -1313,6 +1386,11 @@ glusterfs_ctx_defaults_init (glusterfs_ctx_t *ctx)
         if (!ctx->dict_data_pool)
                 goto out;
 
+        ctx->logbuf_pool = mem_pool_new (log_buf_t,
+                                         GF_MEMPOOL_COUNT_OF_LRU_BUF_T);
+        if (!ctx->logbuf_pool)
+                goto out;
+
         pthread_mutex_init (&(ctx->lock), NULL);
 
         ctx->clienttable = gf_clienttable_alloc();
@@ -1325,6 +1403,8 @@ glusterfs_ctx_defaults_init (glusterfs_ctx_t *ctx)
         cmd_args->log_level = DEFAULT_LOG_LEVEL;
         cmd_args->logger    = gf_logger_glusterlog;
         cmd_args->log_format = gf_logformat_withmsgid;
+        cmd_args->log_buf_size = GF_LOG_LRU_BUFSIZE_DEFAULT;
+        cmd_args->log_flush_timeout = GF_LOG_FLUSH_TIMEOUT_DEFAULT;
 
         cmd_args->mac_compat = GF_OPTION_DISABLE;
 #ifdef GF_DARWIN_HOST_OS
@@ -1359,6 +1439,7 @@ out:
                 mem_pool_destroy (ctx->dict_pool);
                 mem_pool_destroy (ctx->dict_data_pool);
                 mem_pool_destroy (ctx->dict_pair_pool);
+                mem_pool_destroy (ctx->logbuf_pool);
         }
 
         return ret;
@@ -1397,26 +1478,27 @@ logging_init (glusterfs_ctx_t *ctx, const char *progpath)
 
         gf_log_set_logformat (cmd_args->log_format);
 
+        gf_log_set_log_buf_size (cmd_args->log_buf_size);
+
+        gf_log_set_log_flush_timeout (cmd_args->log_flush_timeout);
+
         if (gf_log_init (ctx, cmd_args->log_file, cmd_args->log_ident) == -1) {
                 fprintf (stderr, "ERROR: failed to open logfile %s\n",
                          cmd_args->log_file);
                 return -1;
         }
 
+        /* At this point, all the logging related parameters are initialised
+         * except for the log flush timer, which will be injected post fork(2)
+         * in daemonize() . During this time, any log message that is logged
+         * will be kept buffered. And if the list that holds these messages
+         * overflows, then the same lru policy is used to drive out the least
+         * recently used message and displace it with the message just logged.
+         */
+
         return 0;
 }
 
-void
-gf_check_and_set_mem_acct (glusterfs_ctx_t *ctx, int argc, char *argv[])
-{
-        int i = 0;
-        for (i = 0; i < argc; i++) {
-                if (strcmp (argv[i], "--mem-accounting") == 0) {
-			gf_mem_acct_enable_set (ctx);
-                        break;
-                }
-        }
-}
 
 int
 parse_cmdline (int argc, char *argv[], glusterfs_ctx_t *ctx)
@@ -1432,7 +1514,14 @@ parse_cmdline (int argc, char *argv[], glusterfs_ctx_t *ctx)
 
         cmd_args = &ctx->cmd_args;
 
+        /* Do this before argp_parse so it can be overridden. */
+        if (access(SECURE_ACCESS_FILE,F_OK) == 0) {
+                cmd_args->secure_mgmt = 1;
+        }
+
         argp_parse (&argp, argc, argv, ARGP_IN_ORDER, NULL, cmd_args);
+
+        ctx->secure_mgmt = cmd_args->secure_mgmt;
 
         if (ENABLE_DEBUG_MODE == cmd_args->debug_mode) {
                 cmd_args->log_level = GF_LOG_DEBUG;
@@ -1516,7 +1605,7 @@ parse_cmdline (int argc, char *argv[], glusterfs_ctx_t *ctx)
 
 #ifdef GF_DARWIN_HOST_OS
         if (cmd_args->mount_point)
-                cmd_args->mac_compat = GF_OPTION_DEFERRED;
+               cmd_args->mac_compat = GF_OPTION_DEFERRED;
 #endif
 
         ret = 0;
@@ -1792,6 +1881,8 @@ postfork:
         if (ret)
                 goto out;
 
+        ret = gf_log_inject_timer_event (ctx);
+
         glusterfs_signals_setup (ctx);
 out:
         return ret;
@@ -1904,13 +1995,6 @@ main (int argc, char *argv[])
         }
 	glusterfsd_ctx = ctx;
 
-#ifdef DEBUG
-        gf_mem_acct_enable_set (ctx);
-#else
-        /* Enable memory accounting on the fly based on argument */
-        gf_check_and_set_mem_acct (ctx, argc, argv);
-#endif
-
         ret = glusterfs_globals_init (ctx);
         if (ret)
                 return ret;
@@ -1929,6 +2013,7 @@ main (int argc, char *argv[])
         if (ret)
                 goto out;
 
+
         /* log the version of glusterfs running here along with the actual
            command line options. */
         {
@@ -1940,6 +2025,8 @@ main (int argc, char *argv[])
                 }
                 gf_msg (argv[0], GF_LOG_INFO, 0, glusterfsd_msg_30,
                         argv[0], PACKAGE_VERSION, cmdlinestr);
+
+		ctx->cmdlinestr = gf_strdup (cmdlinestr);
         }
 
         gf_proc_dump_init();

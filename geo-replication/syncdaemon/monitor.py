@@ -18,10 +18,47 @@ import xml.etree.ElementTree as XET
 from subprocess import PIPE
 from resource import Popen, FILE, GLUSTER, SSH
 from threading import Lock
+import re
+import random
 from gconf import gconf
 from syncdutils import update_file, select, waitpid
 from syncdutils import set_term_handler, is_host_local, GsyncdError
 from syncdutils import escape, Thread, finalize, memoize
+
+
+ParseError = XET.ParseError if hasattr(XET, 'ParseError') else SyntaxError
+
+
+def get_slave_bricks_status(host, vol):
+    po = Popen(['gluster', '--xml', '--remote-host=' + host,
+                'volume', 'status', vol, "detail"],
+               stdout=PIPE, stderr=PIPE)
+    vix = po.stdout.read()
+    po.wait()
+    po.terminate_geterr(fail_on_err=False)
+    if po.returncode != 0:
+        logging.info("Volume status command failed, unable to get "
+                     "list of up nodes of %s, returning empty list: %s" %
+                     (vol, po.returncode))
+        return []
+    vi = XET.fromstring(vix)
+    if vi.find('opRet').text != '0':
+        logging.info("Unable to get list of up nodes of %s, "
+                     "returning empty list: %s" %
+                     (vol, vi.find('opErrstr').text))
+        return []
+
+    up_hosts = set()
+
+    try:
+        for el in vi.findall('volStatus/volumes/volume/node'):
+            if el.find('status').text == '1':
+                up_hosts.add(el.find('hostname').text)
+    except (ParseError, AttributeError, ValueError) as e:
+        logging.info("Parsing failed to get list of up nodes of %s, "
+                     "returning empty list: %s" % (vol, e))
+
+    return list(up_hosts)
 
 
 class Volinfo(object):
@@ -96,8 +133,17 @@ class Monitor(object):
             if state != old_state:
                 self.set_state(state)
         else:
-            logging.info('new state: %s' % state)
             if getattr(gconf, 'state_file', None):
+                # If previous state is paused, suffix the
+                # new state with '(Paused)'
+                try:
+                    with open(gconf.state_file, "r") as f:
+                        content = f.read()
+                        if "paused" in content.lower():
+                            state = state + '(Paused)'
+                except IOError:
+                    pass
+                logging.info('new state: %s' % state)
                 update_file(gconf.state_file, lambda f: f.write(state + '\n'))
 
     @staticmethod
@@ -108,7 +154,7 @@ class Monitor(object):
         # give a chance to graceful exit
         os.kill(-os.getpid(), signal.SIGTERM)
 
-    def monitor(self, w, argv, cpids):
+    def monitor(self, w, argv, cpids, agents, slave_vol, slave_host):
         """the monitor loop
 
         Basic logic is a blantantly simple blunt heuristics:
@@ -129,6 +175,7 @@ class Monitor(object):
         """
 
         self.set_state(self.ST_INIT, w)
+
         ret = 0
 
         def nwait(p, o=0):
@@ -145,10 +192,50 @@ class Monitor(object):
             if os.WIFEXITED(s):
                 return os.WEXITSTATUS(s)
             return 1
+
         conn_timeout = int(gconf.connection_timeout)
         while ret in (0, 1):
+            remote_host = w[1]
+            # Check the status of the connected slave node
+            # If the connected slave node is down then try to connect to
+            # different up node.
+            m = re.match("(ssh|gluster|file):\/\/(.+)@([^:]+):(.+)",
+                         remote_host)
+            if m:
+                current_slave_host = m.group(3)
+                slave_up_hosts = get_slave_bricks_status(
+                    slave_host, slave_vol)
+
+                if current_slave_host not in slave_up_hosts:
+                    if len(slave_up_hosts) > 0:
+                        remote_host = "%s://%s@%s:%s" % (m.group(1),
+                                                         m.group(2),
+                                                         random.choice(
+                                                             slave_up_hosts),
+                                                         m.group(4))
+
+            # Spawn the worker and agent in lock to avoid fd leak
+            self.lock.acquire()
+
             logging.info('-' * conn_timeout)
             logging.info('starting gsyncd worker')
+
+            # Couple of pipe pairs for RPC communication b/w
+            # worker and changelog agent.
+
+            # read/write end for agent
+            (ra, ww) = os.pipe()
+            # read/write end for worker
+            (rw, wa) = os.pipe()
+
+            # spawn the agent process
+            apid = os.fork()
+            if apid == 0:
+                os.execv(sys.executable, argv + ['--local-path', w[0],
+                                                 '--agent',
+                                                 '--rpc-fd',
+                                                 ','.join([str(ra), str(wa),
+                                                           str(rw), str(ww)])])
             pr, pw = os.pipe()
             cpid = os.fork()
             if cpid == 0:
@@ -157,19 +244,33 @@ class Monitor(object):
                                                  '--local-path', w[0],
                                                  '--local-id',
                                                  '.' + escape(w[0]),
-                                                 '--resource-remote', w[1]])
-            self.lock.acquire()
+                                                 '--rpc-fd',
+                                                 ','.join([str(rw), str(ww),
+                                                           str(ra), str(wa)]),
+                                                 '--resource-remote',
+                                                 remote_host])
+
             cpids.add(cpid)
-            self.lock.release()
+            agents.add(apid)
             os.close(pw)
+
+            # close all RPC pipes in monitor
+            os.close(ra)
+            os.close(wa)
+            os.close(rw)
+            os.close(ww)
+            self.lock.release()
+
             t0 = time.time()
             so = select((pr,), (), (), conn_timeout)[0]
             os.close(pr)
+
             if so:
                 ret = nwait(cpid, os.WNOHANG)
                 if ret is not None:
                     logging.info("worker(%s) died before establishing "
                                  "connection" % w[0])
+                    nwait(apid) #wait for agent
                 else:
                     logging.debug("worker(%s) connected" % w[0])
                     while time.time() < t0 + conn_timeout:
@@ -177,15 +278,20 @@ class Monitor(object):
                         if ret is not None:
                             logging.info("worker(%s) died in startup "
                                          "phase" % w[0])
+                            nwait(apid) #wait for agent
                             break
                         time.sleep(1)
             else:
                 logging.info("worker(%s) not confirmed in %d sec, "
                              "aborting it" % (w[0], conn_timeout))
                 os.kill(cpid, signal.SIGKILL)
+                nwait(apid) #wait for agent
                 ret = nwait(cpid)
             if ret is None:
                 self.set_state(self.ST_STABLE, w)
+                #If worker dies, agent terminates on EOF.
+                #So lets wait for agent first.
+                nwait(apid)
                 ret = nwait(cpid)
             if exit_signalled(ret):
                 ret = 0
@@ -197,7 +303,7 @@ class Monitor(object):
         self.set_state(self.ST_INCON, w)
         return ret
 
-    def multiplex(self, wspx, suuid):
+    def multiplex(self, wspx, suuid, slave_vol, slave_host):
         argv = sys.argv[:]
         for o in ('-N', '--no-daemon', '--monitor'):
             while o in argv:
@@ -206,14 +312,18 @@ class Monitor(object):
         argv.insert(0, os.path.basename(sys.executable))
 
         cpids = set()
+        agents = set()
         ta = []
         for wx in wspx:
             def wmon(w):
-                cpid, _ = self.monitor(w, argv, cpids)
+                cpid, _ = self.monitor(w, argv, cpids, agents, slave_vol,
+                                       slave_host)
                 time.sleep(1)
                 self.lock.acquire()
                 for cpid in cpids:
                     os.kill(cpid, signal.SIGKILL)
+                for apid in agents:
+                    os.kill(apid, signal.SIGKILL)
                 self.lock.release()
                 finalize(exval=1)
             t = Thread(target=wmon, args=[wx])
@@ -229,6 +339,9 @@ def distribute(*resources):
     logging.debug('master bricks: ' + repr(mvol.bricks))
     prelude = []
     si = slave
+    slave_host = None
+    slave_vol = None
+
     if isinstance(slave, SSH):
         prelude = gconf.ssh_command.split() + [slave.remote_addr]
         si = slave.inner_rsc
@@ -237,9 +350,11 @@ def distribute(*resources):
         sbricks = {'host': 'localhost', 'dir': si.path}
         suuid = uuid.uuid5(uuid.NAMESPACE_URL, slave.get_url(canonical=True))
     elif isinstance(si, GLUSTER):
-        svol = Volinfo(si.volume, si.host, prelude)
+        svol = Volinfo(si.volume, slave.remote_addr.split('@')[-1])
         sbricks = svol.bricks
         suuid = svol.uuid
+        slave_host = slave.remote_addr.split('@')[-1]
+        slave_vol = si.volume
     else:
         raise GsyncdError("unkown slave type " + slave.url)
     logging.info('slave bricks: ' + repr(sbricks))
@@ -263,9 +378,15 @@ def distribute(*resources):
                   for idx, brick in enumerate(mvol.bricks)
                   if is_host_local(brick['host'])]
     logging.info('worker specs: ' + repr(workerspex))
-    return workerspex, suuid
+    return workerspex, suuid, slave_vol, slave_host
 
 
 def monitor(*resources):
+    # Check if gsyncd restarted in pause state. If
+    # yes, send SIGSTOP to negative of monitor pid
+    # to go back to pause state.
+    if gconf.pause_on_start:
+        os.kill(-os.getpid(), signal.SIGSTOP)
+
     """oh yeah, actually Monitor is used as singleton, too"""
     return Monitor().multiplex(*distribute(*resources))

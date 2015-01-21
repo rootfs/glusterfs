@@ -491,6 +491,7 @@ out:
         return ret;
 }
 
+
 int32_t
 glusterd_mgmt_v3_lock (const char *name, uuid_t uuid, char *type)
 {
@@ -501,6 +502,7 @@ glusterd_mgmt_v3_lock (const char *name, uuid_t uuid, char *type)
         gf_boolean_t                    is_valid        = _gf_true;
         uuid_t                          owner           = {0};
         xlator_t                       *this            = NULL;
+        char                           *bt              = NULL;
 
         this = THIS;
         GF_ASSERT (this);
@@ -515,7 +517,7 @@ glusterd_mgmt_v3_lock (const char *name, uuid_t uuid, char *type)
 
         is_valid = glusterd_mgmt_v3_is_type_valid (type);
         if (is_valid != _gf_true) {
-                gf_log (this->name, GF_LOG_ERROR,
+                gf_log_callingfn (this->name, GF_LOG_ERROR,
                         "Invalid entity. Cannot perform locking "
                         "operation on %s types", type);
                 ret = -1;
@@ -543,8 +545,9 @@ glusterd_mgmt_v3_lock (const char *name, uuid_t uuid, char *type)
         /* If the lock has already been held for the given volume
          * we fail */
         if (!uuid_is_null (owner)) {
-                gf_log (this->name, GF_LOG_WARNING, "Lock for %s held by %s",
-                        name, uuid_utoa (owner));
+                gf_log_callingfn (this->name, GF_LOG_WARNING,
+                                  "Lock for %s held by %s",
+                                  name, uuid_utoa (owner));
                 ret = -1;
                 goto out;
         }
@@ -566,6 +569,18 @@ glusterd_mgmt_v3_lock (const char *name, uuid_t uuid, char *type)
                 if (lock_obj)
                         GF_FREE (lock_obj);
                 goto out;
+        }
+
+        /* Saving the backtrace into the pre-allocated buffer, ctx->btbuf*/
+        if ((bt = gf_backtrace_save (NULL))) {
+                snprintf (key, sizeof (key), "debug.last-success-bt-%s-%s",
+                          name, type);
+                ret = dict_set_dynstr_with_alloc (priv->mgmt_v3_lock, key, bt);
+                if (ret)
+                        gf_log (this->name, GF_LOG_WARNING, "Failed to save "
+                                "the back trace for lock %s-%s granted to %s",
+                                name, type, uuid_utoa (uuid));
+                ret = 0;
         }
 
         gf_log (this->name, GF_LOG_DEBUG,
@@ -601,7 +616,7 @@ glusterd_mgmt_v3_unlock (const char *name, uuid_t uuid, char *type)
 
         is_valid = glusterd_mgmt_v3_is_type_valid (type);
         if (is_valid != _gf_true) {
-                gf_log (this->name, GF_LOG_ERROR,
+                gf_log_callingfn (this->name, GF_LOG_ERROR,
                         "Invalid entity. Cannot perform unlocking "
                         "operation on %s types", type);
                 ret = -1;
@@ -628,7 +643,7 @@ glusterd_mgmt_v3_unlock (const char *name, uuid_t uuid, char *type)
         }
 
         if (uuid_is_null (owner)) {
-                gf_log (this->name, GF_LOG_WARNING,
+                gf_log_callingfn (this->name, GF_LOG_WARNING,
                         "Lock for %s %s not held", type, name);
                 ret = -1;
                 goto out;
@@ -636,13 +651,26 @@ glusterd_mgmt_v3_unlock (const char *name, uuid_t uuid, char *type)
 
         ret = uuid_compare (uuid, owner);
         if (ret) {
-                gf_log (this->name, GF_LOG_WARNING, "Lock owner mismatch. "
-                        "Lock for %s %s held by %s",
-                        type, name, uuid_utoa (owner));
+                gf_log_callingfn (this->name, GF_LOG_WARNING,
+                                  "Lock owner mismatch. "
+                                  "Lock for %s %s held by %s",
+                                  type, name, uuid_utoa (owner));
                 goto out;
         }
 
         /* Removing the mgmt_v3 lock from the global list */
+        dict_del (priv->mgmt_v3_lock, key);
+
+        /* Remove the backtrace key as well */
+        ret = snprintf (key, sizeof(key), "debug.last-success-bt-%s-%s", name,
+                        type);
+        if (ret != strlen ("debug.last-success-bt-") + strlen (name) +
+                   strlen (type) + 1) {
+                gf_log (this->name, GF_LOG_ERROR, "Unable to create backtrace "
+                        "key");
+                ret = -1;
+                goto out;
+        }
         dict_del (priv->mgmt_v3_lock, key);
 
         gf_log (this->name, GF_LOG_DEBUG,

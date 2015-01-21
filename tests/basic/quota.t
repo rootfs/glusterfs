@@ -2,7 +2,9 @@
 
 . $(dirname $0)/../include.rc
 . $(dirname $0)/../volume.rc
+. $(dirname $0)/../nfs.rc
 . $(dirname $0)/../dht.rc
+. $(dirname $0)/../nfs.rc
 
 cleanup;
 
@@ -39,7 +41,7 @@ EXPECT '4' brick_count $V0
 TEST $CLI volume start $V0;
 EXPECT 'Started' volinfo_field $V0 'Status';
 
-TEST glusterfs -s $H0 --volfile-id $V0 $M0;
+TEST $GFS -s $H0 --volfile-id $V0 $M0;
 
 TEST mkdir -p $M0/test_dir/in_test_dir
 
@@ -70,24 +72,27 @@ TEST $CLI volume quota $V0 hard-timeout 0
 ## Verify quota enforcement
 ## -----------------------------
 
-TEST ! dd if=/dev/urandom of=$M0/test_dir/1.txt bs=1M count=12
+# compile the test write program and run it
+TEST $CC $(dirname $0)/quota.c -o $(dirname $0)/quota;
+# Try to create a 12MB file which should fail
+TEST ! $(dirname $0)/quota $M0/test_dir/1.txt "12582912"
 TEST rm $M0/test_dir/1.txt
 
 # wait for marker's accounting to complete
-EXPECT_WITHIN 10 "0Bytes" usage "/test_dir"
+EXPECT_WITHIN $MARKER_UPDATE_TIMEOUT "0Bytes" usage "/test_dir"
 
-TEST dd if=/dev/urandom of=$M0/test_dir/2.txt bs=1M count=8
-EXPECT_WITHIN 20 "8.0MB" usage "/test_dir"
+TEST dd if=/dev/urandom of=$M0/test_dir/2.txt bs=1024k count=8
+EXPECT_WITHIN $MARKER_UPDATE_TIMEOUT "8.0MB" usage "/test_dir"
 TEST rm $M0/test_dir/2.txt
-EXPECT_WITHIN 10 "0Bytes" usage "/test_dir"
+EXPECT_WITHIN $MARKER_UPDATE_TIMEOUT "0Bytes" usage "/test_dir"
 
 ## rename tests
-TEST dd if=/dev/urandom of=$M0/test_dir/2 bs=1M count=8
-EXPECT_WITHIN 20 "8.0MB" usage "/test_dir"
+TEST dd if=/dev/urandom of=$M0/test_dir/2 bs=1024k count=8
+EXPECT_WITHIN $MARKER_UPDATE_TIMEOUT "8.0MB" usage "/test_dir"
 TEST mv $M0/test_dir/2 $M0/test_dir/0
-EXPECT_WITHIN 10 "8.0MB" usage "/test_dir"
+EXPECT_WITHIN $MARKER_UPDATE_TIMEOUT "8.0MB" usage "/test_dir"
 TEST rm $M0/test_dir/0
-EXPECT_WITHIN 10 "0Bytes" usage "/test_dir"
+EXPECT_WITHIN $MARKER_UPDATE_TIMEOUT "0Bytes" usage "/test_dir"
 
 ## ---------------------------
 
@@ -97,7 +102,10 @@ EXPECT_WITHIN 10 "0Bytes" usage "/test_dir"
 #  though this may change.
 ## -----------------------------
 
-TEST mount -t nfs -o nolock,soft,intr $H0:/$V0 $N0;
+##Wait for connection establishment between nfs server and brick process
+EXPECT_WITHIN $NFS_EXPORT_TIMEOUT "1" is_nfs_export_available;
+
+TEST mount_nfs $H0:/$V0 $N0 nolock;
 TEST $CLI volume quota $V0 limit-usage /test_dir 100MB
 
 TEST $CLI volume quota $V0 limit-usage /test_dir/in_test_dir 150MB
@@ -137,7 +145,7 @@ done
 #53-62
 for i in `seq 1 9`; do
         TEST_IN_LOOP dd if=/dev/urandom of="$M0/$TESTDIR/dir1/10MBfile$i" \
-                        bs=1M count=10;
+                        bs=1024k count=10;
 done
 
 # 63-64
@@ -159,14 +167,14 @@ done
 ## <Try creating data beyond limit>
 ## --------------------------------
 for i in `seq 1 200`; do
-        dd if=/dev/urandom of="$M0/$TESTDIR/dir1/1MBfile$i" bs=1M count=1 \
-           &>/dev/null
+        dd if=/dev/urandom of="$M0/$TESTDIR/dir1/1MBfile$i" bs=1024k count=1 \
+           2>&1 | egrep -v '(No space left|Disc quota exceeded)'
 done
 
 # 65
 ## <Test whether quota limit crossed more than 10% of limit>
 ## ---------------------------------------------------------
-USED_KB=`du -s $M0/$TESTDIR/dir1 | cut -f1`;
+USED_KB=`du -ks $M0/$TESTDIR/dir1 | cut -f1`;
 USED_MB=$(($USED_KB/1024));
 TEST [ $USED_MB -le $((($QUOTALIMIT * 110) / 100)) ]
 
@@ -183,13 +191,13 @@ TEST getfattr -d -m "trusted.glusterfs.quota.limit-set" -e hex \
 ## </Test quota functionality in add-brick senarios>
 ## -------------------------------------------------
 
+EXPECT_WITHIN $UMOUNT_TIMEOUT "Y" force_umount $N0
+
 TEST $CLI volume quota $V0 disable
 TEST $CLI volume stop $V0;
 EXPECT 'Stopped' volinfo_field $V0 'Status';
 
 TEST $CLI volume delete $V0;
 TEST ! $CLI volume info $V0;
-
-umount -l $N0
 
 cleanup;

@@ -17,6 +17,7 @@
 #include <signal.h>
 
 #include "dht-mem-types.h"
+#include "dht-messages.h"
 #include "libxlator.h"
 #include "syncop.h"
 
@@ -27,6 +28,7 @@
 #define GF_DHT_LOOKUP_UNHASHED_ON   1
 #define GF_DHT_LOOKUP_UNHASHED_AUTO 2
 #define DHT_PATHINFO_HEADER         "DISTRIBUTE:"
+#define DHT_FILE_MIGRATE_DOMAIN     "dht.file.migrate"
 
 #include <fnmatch.h>
 
@@ -47,7 +49,7 @@ struct dht_layout {
         int                gen;
         int                type;
         int                ref; /* use with dht_conf_t->layout_lock */
-        int                search_unhashed;
+        gf_boolean_t       search_unhashed;
         struct {
                 int        err;   /* 0 = normal
                                      -1 = dir exists and no xattr
@@ -98,6 +100,36 @@ struct dht_rebalance_ {
         dht_defrag_cbk_fn_t  target_op_fn;
         dict_t              *xdata;
 };
+
+/**
+ * Enum to store decided action based on the qdstatfs (quota-deem-statfs)
+ * events
+ **/
+typedef enum {
+        qdstatfs_action_OFF = 0,
+        qdstatfs_action_REPLACE,
+        qdstatfs_action_NEGLECT,
+        qdstatfs_action_COMPARE,
+} qdstatfs_action_t;
+
+struct dht_skip_linkto_unlink {
+
+        gf_boolean_t    handle_valid_link;
+        int             opend_fd_count;
+        xlator_t        *hash_links_to;
+        uuid_t          cached_gfid;
+        uuid_t          hashed_gfid;
+};
+
+typedef struct {
+        xlator_t     *xl;
+        loc_t         loc;     /* contains/points to inode to lock on. */
+        short         type;    /* read/write lock.                     */
+        char         *domain;  /* Only locks within a single domain
+                                * contend with each other
+                                */
+        gf_boolean_t  locked;
+} dht_lock_t;
 
 struct dht_local {
         int                      call_cnt;
@@ -186,6 +218,22 @@ struct dht_local {
         struct dht_rebalance_ rebalance;
         xlator_t        *first_up_subvol;
 
+        gf_boolean_t     quota_deem_statfs;
+
+        gf_boolean_t     added_link;
+        gf_boolean_t     is_linkfile;
+
+        struct dht_skip_linkto_unlink  skip_unlink;
+
+        struct {
+                fop_inodelk_cbk_t   inodelk_cbk;
+                dht_lock_t        **locks;
+                int                 lk_count;
+
+                /* whether locking failed on _any_ of the "locks" above */
+                int                 op_ret;
+                int                 op_errno;
+        } lock;
 };
 typedef struct dht_local dht_local_t;
 
@@ -195,6 +243,7 @@ struct dht_du {
 	double   avail_inodes;
         uint64_t avail_space;
         uint32_t log;
+        uint32_t chunks;
 };
 typedef struct dht_du dht_du_t;
 
@@ -263,7 +312,7 @@ struct dht_conf {
         int            gen;
         dht_du_t      *du_stats;
         double         min_free_disk;
-	double         min_free_inodes;
+        double         min_free_inodes;
         char           disk_unit;
         int32_t        refresh_interval;
         gf_boolean_t   unhashed_sticky_bit;
@@ -302,6 +351,12 @@ struct dht_conf {
         char            *xattr_name;
         char            *link_xattr_name;
         char            *wild_xattr_name;
+
+        /* Support size-weighted rebalancing (heterogeneous bricks). */
+        gf_boolean_t    do_weighting;
+        gf_boolean_t    randomize_by_gfid;
+
+        struct mem_pool *lock_pool;
 };
 typedef struct dht_conf dht_conf_t;
 
@@ -380,15 +435,14 @@ typedef enum {
         } while (0)
 
 #define DHT_UPDATE_TIME(ctx_sec, ctx_nsec, new_sec, new_nsec, inode, post) do {\
-                int32_t sec = 0;                                        \
-                sec = new_sec;                                          \
                 LOCK (&inode->lock);                                    \
                 {                                                       \
-                        new_sec = max(new_sec, ctx_sec);                \
-                        if (sec < new_sec)                              \
-                                new_nsec = ctx_nsec;                    \
-                        if (sec == new_sec)                             \
+                        if (ctx_sec == new_sec)                         \
                                 new_nsec = max (new_nsec, ctx_nsec);    \
+                        else if (ctx_sec > new_sec) {                   \
+                                new_sec = ctx_sec;                      \
+                                new_nsec = ctx_nsec;                    \
+                        }                                               \
                         if (post) {                                     \
                                 ctx_sec = new_sec;                      \
                                 ctx_nsec = new_nsec;                    \
@@ -454,6 +508,12 @@ int                                       dht_lookup_everywhere (call_frame_t *f
 int
 dht_selfheal_directory (call_frame_t     *frame, dht_selfheal_dir_cbk_t cbk,
                         loc_t            *loc, dht_layout_t *layout);
+
+int
+dht_selfheal_directory_for_nameless_lookup (call_frame_t  *frame,
+                                            dht_selfheal_dir_cbk_t cbk,
+                                            loc_t  *loc, dht_layout_t *layout);
+
 int
 dht_selfheal_new_directory (call_frame_t *frame, dht_selfheal_dir_cbk_t cbk,
                             dht_layout_t *layout);
@@ -483,11 +543,11 @@ int dht_filter_loc_subvol_key (xlator_t  *this, loc_t *loc, loc_t *new_loc,
                                xlator_t **subvol);
 
 int                                     dht_rename_cleanup (call_frame_t *frame);
-int dht_rename_links_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
-                          int32_t           op_ret, int32_t op_errno,
-                          inode_t          *inode, struct iatt *stbuf,
-                          struct iatt      *preparent, struct iatt *postparent,
-                          dict_t *xdata);
+int dht_rename_link_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                         int32_t           op_ret, int32_t op_errno,
+                         inode_t          *inode, struct iatt *stbuf,
+                         struct iatt      *preparent, struct iatt *postparent,
+                         dict_t *xdata);
 
 int dht_fix_directory_layout (call_frame_t *frame,
                               dht_selfheal_dir_cbk_t  dir_cbk,
@@ -783,5 +843,54 @@ dht_inodectx_dump (xlator_t *this, inode_t *inode);
 
 int
 dht_inode_ctx_get1 (xlator_t *this, inode_t *inode, xlator_t **subvol);
+
+int
+dht_subvol_status (dht_conf_t *conf, xlator_t *subvol);
+
+void
+dht_log_new_layout_for_dir_selfheal (xlator_t *this, loc_t *loc,
+                                     dht_layout_t *layout);
+int
+dht_lookup_everywhere_done (call_frame_t *frame, xlator_t *this);
+
+int
+dht_fill_dict_to_avoid_unlink_of_migrating_file (dict_t *dict);
+
+
+/* Acquire non-blocking inodelk on a list of xlators.
+ *
+ * @lk_array: array of lock requests lock on.
+ *
+ * @lk_count: number of locks in @lk_array
+ *
+ * @inodelk_cbk: will be called after inodelk replies are received
+ *
+ * @retval: -1 if stack_winding inodelk fails. 0 otherwise.
+ *          inodelk_cbk is called with appropriate error on errors.
+ *          On failure to acquire lock on all members of list, successful
+ *          locks are unlocked before invoking cbk.
+ */
+
+int
+dht_nonblocking_inodelk (call_frame_t *frame, dht_lock_t **lk_array,
+                         int lk_count, fop_inodelk_cbk_t inodelk_cbk);
+
+/* same as dht_nonblocking_inodelk, but issues sequential blocking locks on
+ * @lk_array directly. locks are issued on some order which remains same
+ * for a list of xlators (irrespective of order of xlators within list).
+ */
+int
+dht_blocking_inodelk (call_frame_t *frame, dht_lock_t **lk_array,
+                      int lk_count, fop_inodelk_cbk_t inodelk_cbk);
+
+int32_t
+dht_unlock_inodelk (call_frame_t *frame, dht_lock_t **lk_array, int lk_count,
+                    fop_inodelk_cbk_t inodelk_cbk);
+
+dht_lock_t *
+dht_lock_new (xlator_t *this, xlator_t *xl, loc_t *loc, short type,
+              const char *domain);
+void
+dht_lock_array_free (dht_lock_t **lk_array, int count);
 
 #endif/* _DHT_H */

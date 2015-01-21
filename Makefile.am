@@ -2,14 +2,16 @@ EXTRA_DIST = autogen.sh \
 	COPYING-GPLV2 COPYING-LGPLV3 \
 	INSTALL README AUTHORS THANKS NEWS \
 	glusterfs.spec glusterfs-api.pc.in libgfchangelog.pc.in \
-	error-codes.json gf-error-codes.h.template \
-	gen-headers.py run-tests.sh \
+	run-tests.sh \
 	build-aux/pkg-version \
+	build-aux/xdrgen \
         contrib/argp-standalone \
+        contrib/umountd \
 	$(shell find $(top_srcdir)/tests -type f -print)
 
 SUBDIRS = $(ARGP_STANDALONE_DIR) libglusterfs rpc api xlators glusterfsd \
-	$(FUSERMOUNT_SUBDIR) doc extras cli @SYNCDAEMON_SUBDIR@
+	$(FUSERMOUNT_SUBDIR) doc extras cli heal @SYNCDAEMON_SUBDIR@ \
+	@UMOUNTD_SUBDIR@
 
 pkgconfigdir = @pkgconfigdir@
 pkgconfig_DATA = glusterfs-api.pc libgfchangelog.pc

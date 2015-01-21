@@ -14,12 +14,12 @@
 #endif
 
 #include "client.h"
+#include "rpc-common-xdr.h"
 #include "glusterfs3-xdr.h"
 #include "glusterfs3.h"
 #include "compat-errno.h"
 
 int32_t client3_getspec (call_frame_t *frame, xlator_t *this, void *data);
-void client_start_ping (void *data);
 rpc_clnt_prog_t clnt3_3_fop_prog;
 
 
@@ -35,12 +35,9 @@ client_submit_vec_request (xlator_t  *this, void *req, call_frame_t  *frame,
         struct iovec    iov        = {0, };
         struct iobuf   *iobuf      = NULL;
         int             count      = 0;
-        int             start_ping = 0;
         struct iobref  *new_iobref = NULL;
         ssize_t         xdr_size   = 0;
         struct rpc_req  rpcreq     = {0, };
-
-        start_ping = 0;
 
         conf = this->private;
 
@@ -94,19 +91,6 @@ client_submit_vec_request (xlator_t  *this, void *req, call_frame_t  *frame,
         if (ret < 0) {
                 gf_log (this->name, GF_LOG_DEBUG, "rpc_clnt_submit failed");
         }
-
-        if (ret == 0) {
-                pthread_mutex_lock (&conf->rpc->conn.lock);
-                {
-                        if (!conf->rpc->conn.ping_started) {
-                                start_ping = 1;
-                        }
-                }
-                pthread_mutex_unlock (&conf->rpc->conn.lock);
-        }
-
-        if (start_ping)
-                client_start_ping ((void *) this);
 
         if (new_iobref)
                 iobref_unref (new_iobref);
@@ -458,7 +442,8 @@ client3_3_open_cbk (struct rpc_req *req, struct iovec *iov, int count,
 
 out:
         if (rsp.op_ret == -1) {
-                gf_log (this->name, GF_LOG_WARNING,
+                gf_log (this->name, fop_log_level (GF_FOP_OPEN,
+                                        gf_error_to_errno (rsp.op_errno)),
                         "remote operation failed: %s. Path: %s (%s)",
                         strerror (gf_error_to_errno (rsp.op_errno)),
                         local->loc.path, loc_gfid_utoa (&local->loc));
@@ -843,7 +828,7 @@ client3_3_writev_cbk (struct rpc_req *req, struct iovec *iov, int count,
                 goto out;
         }
 
-        ret = xdr_to_generic (*iov, &rsp, (xdrproc_t)xdr_gfs3_truncate_rsp);
+        ret = xdr_to_generic (*iov, &rsp, (xdrproc_t)xdr_gfs3_write_rsp);
         if (ret < 0) {
                 gf_log (this->name, GF_LOG_ERROR, "XDR decoding failed");
                 rsp.op_ret   = -1;
@@ -923,7 +908,8 @@ client3_3_flush_cbk (struct rpc_req *req, struct iovec *iov, int count,
 
 out:
         if (rsp.op_ret == -1) {
-                gf_log (this->name, GF_LOG_WARNING,
+                gf_log (this->name, fop_log_level (GF_FOP_FLUSH,
+                                        gf_error_to_errno (rsp.op_errno)),
                         "remote operation failed: %s",
                         strerror (gf_error_to_errno (rsp.op_errno)));
         }
@@ -961,7 +947,7 @@ client3_3_fsync_cbk (struct rpc_req *req, struct iovec *iov, int count,
                 goto out;
         }
 
-        ret = xdr_to_generic (*iov, &rsp, (xdrproc_t)xdr_gfs3_truncate_rsp);
+        ret = xdr_to_generic (*iov, &rsp, (xdrproc_t)xdr_gfs3_fsync_rsp);
         if (ret < 0) {
                 gf_log (this->name, GF_LOG_ERROR, "XDR decoding failed");
                 rsp.op_ret   = -1;
@@ -1095,6 +1081,7 @@ out:
         if (rsp.op_ret == -1) {
                 gf_log (this->name, (((op_errno == ENOTSUP) ||
                                       (op_errno == ENODATA) ||
+                                      (op_errno == ESTALE) ||
                                       (op_errno == ENOENT)) ?
                                      GF_LOG_DEBUG : GF_LOG_WARNING),
                         "remote operation failed: %s. Path: %s (%s). Key: %s",
@@ -1164,10 +1151,13 @@ client3_3_fgetxattr_cbk (struct rpc_req *req, struct iovec *iov, int count,
 
 out:
         if (rsp.op_ret == -1) {
-                gf_log (this->name, ((op_errno == ENOTSUP) ?
-                                     GF_LOG_DEBUG : GF_LOG_WARNING),
-                        "remote operation failed: %s",
-                        strerror (op_errno));
+                gf_log (this->name, (((op_errno == ENOTSUP) ||
+                                      (op_errno == ERANGE)  ||
+                                      (op_errno == ENODATA) ||
+                                      (op_errno == ENOENT)) ?
+                                      GF_LOG_DEBUG : GF_LOG_WARNING),
+                                      "remote operation failed: %s",
+                                      strerror (op_errno));
         }
 
         CLIENT_STACK_UNWIND (fgetxattr, frame, rsp.op_ret, op_errno, dict, xdata);
@@ -1192,8 +1182,9 @@ client3_3_removexattr_cbk (struct rpc_req *req, struct iovec *iov, int count,
         call_frame_t    *frame      = NULL;
         gf_common_rsp    rsp        = {0,};
         int              ret        = 0;
-        xlator_t *this       = NULL;
-        dict_t  *xdata       = NULL;
+        xlator_t        *this       = NULL;
+        dict_t          *xdata      = NULL;
+        gf_loglevel_t    loglevel   = GF_LOG_NONE;
 
         this = THIS;
 
@@ -1219,7 +1210,12 @@ client3_3_removexattr_cbk (struct rpc_req *req, struct iovec *iov, int count,
 
 out:
         if (rsp.op_ret == -1) {
-                gf_log (this->name, GF_LOG_WARNING, "remote operation failed: %s",
+                if ((ENODATA == rsp.op_errno) || (ENOATTR == rsp.op_errno))
+                        loglevel = GF_LOG_DEBUG;
+                else
+                        loglevel = GF_LOG_WARNING;
+
+                gf_log (this->name, loglevel, "remote operation failed: %s",
                         strerror (gf_error_to_errno (rsp.op_errno)));
         }
 
@@ -1523,9 +1519,10 @@ client3_3_inodelk_cbk (struct rpc_req *req, struct iovec *iov, int count,
                                       rsp.op_errno, out);
 
 out:
-        if ((rsp.op_ret == -1) &&
-            (EAGAIN != gf_error_to_errno (rsp.op_errno))) {
-                gf_log (this->name, GF_LOG_WARNING, "remote operation failed: %s",
+        if (rsp.op_ret == -1) {
+                gf_log (this->name, fop_log_level (GF_FOP_INODELK,
+                                        gf_error_to_errno (rsp.op_errno)),
+                        "remote operation failed: %s",
                         strerror (gf_error_to_errno (rsp.op_errno)));
         }
         CLIENT_STACK_UNWIND (inodelk, frame, rsp.op_ret,
@@ -1573,9 +1570,10 @@ client3_3_finodelk_cbk (struct rpc_req *req, struct iovec *iov, int count,
                                       rsp.op_errno, out);
 
 out:
-        if ((rsp.op_ret == -1) &&
-            (EAGAIN != gf_error_to_errno (rsp.op_errno))) {
-                gf_log (this->name, GF_LOG_WARNING, "remote operation failed: %s",
+        if (rsp.op_ret == -1) {
+                gf_log (this->name, fop_log_level (GF_FOP_FINODELK,
+                                        gf_error_to_errno (rsp.op_errno)),
+                        "remote operation failed: %s",
                         strerror (gf_error_to_errno (rsp.op_errno)));
         } else if (rsp.op_ret == 0) {
                 if (local->attempt_reopen)
@@ -1625,9 +1623,10 @@ client3_3_entrylk_cbk (struct rpc_req *req, struct iovec *iov, int count,
                                       rsp.op_errno, out);
 
 out:
-        if ((rsp.op_ret == -1) &&
-            (EAGAIN != gf_error_to_errno (rsp.op_errno))) {
-                gf_log (this->name, GF_LOG_WARNING, "remote operation failed: %s",
+        if (rsp.op_ret == -1) {
+                gf_log (this->name, fop_log_level (GF_FOP_ENTRYLK,
+                                        gf_error_to_errno (rsp.op_errno)),
+                        "remote operation failed: %s",
                         strerror (gf_error_to_errno (rsp.op_errno)));
         }
 
@@ -2683,7 +2682,8 @@ client3_3_opendir_cbk (struct rpc_req *req, struct iovec *iov, int count,
 
 out:
         if (rsp.op_ret == -1) {
-                gf_log (this->name, GF_LOG_WARNING,
+                gf_log (this->name, fop_log_level (GF_FOP_OPENDIR,
+                                        gf_error_to_errno (rsp.op_errno)),
                         "remote operation failed: %s. Path: %s (%s)",
                         strerror (gf_error_to_errno (rsp.op_errno)),
                         local->loc.path, loc_gfid_utoa (&local->loc));
@@ -2752,8 +2752,12 @@ client3_3_lookup_cbk (struct rpc_req *req, struct iovec *iov, int count,
             && (uuid_compare (stbuf.ia_gfid, inode->gfid) != 0)) {
                 gf_log (frame->this->name, GF_LOG_DEBUG,
                         "gfid changed for %s", local->loc.path);
+
                 rsp.op_ret = -1;
                 op_errno = ESTALE;
+                if (xdata)
+                        ret = dict_set_int32 (xdata, "gfid-changed", 1);
+
                 goto out;
         }
 
@@ -2834,7 +2838,7 @@ client3_3_readv_cbk (struct rpc_req *req, struct iovec *iov, int count,
                                       rsp.op_errno, out);
 
 #ifdef GF_TESTING_IO_XDATA
-        dict_dump (xdata);
+        dict_dump_to_log (xdata);
 #endif
 
 out:
@@ -3485,6 +3489,7 @@ client3_3_unlink (call_frame_t *frame, xlator_t *this,
                                        !uuid_is_null (*((uuid_t*)req.pargfid)),
                                        unwind, op_errno, EINVAL);
         req.bname = (char *)args->loc->name;
+        req.xflags = args->flags;
         conf = this->private;
 
         GF_PROTOCOL_DICT_SERIALIZE (this, args->xdata, (&req.xdata.xdata_val),
@@ -5669,15 +5674,15 @@ client3_3_readdir (call_frame_t *frame, xlator_t *this,
         readdir_rsp_size = xdr_sizeof ((xdrproc_t) xdr_gfs3_readdir_rsp, &rsp)
                 + args->size;
 
+        local = mem_get0 (this->local_pool);
+        if (!local) {
+                op_errno = ENOMEM;
+                goto unwind;
+        }
+        frame->local = local;
+
         if ((readdir_rsp_size + GLUSTERFS_RPC_REPLY_SIZE + GLUSTERFS_RDMA_MAX_HEADER_SIZE)
             > (GLUSTERFS_RDMA_INLINE_THRESHOLD)) {
-                local = mem_get0 (this->local_pool);
-                if (!local) {
-                        op_errno = ENOMEM;
-                        goto unwind;
-                }
-                frame->local = local;
-
                 rsp_iobref = iobref_new ();
                 if (rsp_iobref == NULL) {
                         goto unwind;

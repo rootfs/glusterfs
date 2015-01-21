@@ -334,6 +334,8 @@ rpc_transport_load (glusterfs_ctx_t *ctx, dict_t *options, char *trans_name)
 		goto fail;
 	}
 
+        INIT_LIST_HEAD (&trans->list);
+
         return_trans = trans;
 
         GF_FREE (name);
@@ -446,6 +448,10 @@ rpc_transport_destroy (rpc_transport_t *this)
 
         if (this->dl_handle)
                 dlclose (this->dl_handle);
+
+        if (this->ssl_name) {
+                GF_FREE(this->ssl_name);
+        }
 
 	GF_FREE (this);
 fail:

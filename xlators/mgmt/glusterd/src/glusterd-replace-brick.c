@@ -521,8 +521,9 @@ glusterd_op_stage_replace_brick (dict_t *dict, char **op_errstr,
         }
 
         if (!gf_is_local_addr (host)) {
-                ret = glusterd_friend_find (NULL, host, &peerinfo);
-                if (ret) {
+                peerinfo = glusterd_peerinfo_find (NULL, host);
+                if (peerinfo == NULL) {
+                        ret = -1;
                         snprintf (msg, sizeof (msg), "%s, is not a friend",
                                   host);
                         *op_errstr = gf_strdup (msg);
@@ -542,6 +543,33 @@ glusterd_op_stage_replace_brick (dict_t *dict, char **op_errstr,
                                   "at the moment", host);
                         *op_errstr = gf_strdup (msg);
                         ret = -1;
+                        goto out;
+                }
+        } else if (priv->op_version >= GD_OP_VERSION_3_6_0) {
+                /* A bricks mount dir is required only by snapshots which were
+                 * introduced in gluster-3.6.0
+                 */
+                ret = glusterd_get_brick_mount_dir (dst_brickinfo->path,
+                                                    dst_brickinfo->hostname,
+                                                    dst_brickinfo->mount_dir);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "Failed to get brick mount_dir");
+                        goto out;
+                }
+
+                ret = dict_set_dynstr_with_alloc (rsp_dict, "brick1.mount_dir",
+                                                  dst_brickinfo->mount_dir);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "Failed to set brick1.mount_dir");
+                        goto out;
+                }
+
+                ret = dict_set_int32 (rsp_dict, "brick_count", 1);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "Failed to set local_brick_count");
                         goto out;
                 }
         }
@@ -821,20 +849,6 @@ rb_spawn_glusterfs_client (glusterd_volinfo_t *volinfo,
         if (ret)
                 goto out;
 
-        runinit (&runner);
-        runner_add_args (&runner, "/bin/umount", "-l", mntpt, NULL);
-        ret = runner_run_reuse (&runner);
-        if (ret) {
-                runner_log (&runner, this->name, GF_LOG_DEBUG,
-                            "Lazy unmount failed on maintenance client");
-                runner_end (&runner);
-                goto out;
-        } else {
-                runner_log (&runner, this->name, GF_LOG_DEBUG,
-                            "Successfully unmounted  maintenance client");
-                runner_end (&runner);
-        }
-
 
 out:
 
@@ -882,7 +896,7 @@ rb_generate_client_volfile (glusterd_volinfo_t *volinfo,
                         "%s", strerror (errno));
                 goto out;
         }
-        close (fd);
+        sys_close (fd);
 
         file = fopen (filename, "w+");
         if (!file) {
@@ -906,12 +920,14 @@ rb_generate_client_volfile (glusterd_volinfo_t *volinfo,
                  glusterd_auth_get_username (volinfo),
                  glusterd_auth_get_password (volinfo));
 
-        fclose (file);
         GF_FREE (ttype);
 
         ret = 0;
 
 out:
+        if (file)
+                fclose (file);
+
         return ret;
 }
 
@@ -955,13 +971,13 @@ rb_generate_dst_brick_volfile (glusterd_volinfo_t *volinfo,
                   priv->workdir, volinfo->volname,
                   RB_DSTBRICKVOL_FILENAME);
 
-        fd = creat (filename, S_IRUSR | S_IWUSR);
+        fd = sys_creat (filename, S_IRUSR | S_IWUSR);
         if (fd < 0) {
                 gf_log (this->name, GF_LOG_ERROR,
                         "%s", strerror (errno));
                 goto out;
         }
-        close (fd);
+        sys_close (fd);
 
         file = fopen (filename, "w+");
         if (!file) {
@@ -991,11 +1007,12 @@ rb_generate_dst_brick_volfile (glusterd_volinfo_t *volinfo,
 
 	GF_FREE (trans_type);
 
-        fclose (file);
-
         ret = 0;
 
 out:
+        if (file)
+                fclose (file);
+
         return ret;
 }
 
@@ -1022,27 +1039,6 @@ out:
 }
 
 static int
-rb_mountpoint_rmdir (glusterd_volinfo_t *volinfo,
-                     glusterd_brickinfo_t *src_brickinfo)
-{
-        char             mntpt[PATH_MAX] = {0,};
-        int              ret                        = -1;
-
-        GLUSTERD_GET_RB_MNTPT (mntpt, sizeof (mntpt), volinfo);
-        ret = rmdir (mntpt);
-        if (ret) {
-                gf_log ("", GF_LOG_DEBUG, "rmdir failed, reason: %s",
-                        strerror (errno));
-                goto out;
-        }
-
-        ret = 0;
-
-out:
-        return ret;
-}
-
-static int
 rb_destroy_maintenance_client (glusterd_volinfo_t *volinfo,
                                glusterd_brickinfo_t *src_brickinfo)
 {
@@ -1051,6 +1047,7 @@ rb_destroy_maintenance_client (glusterd_volinfo_t *volinfo,
         char              volfile[PATH_MAX]           = {0,};
         int               ret                         = -1;
         int               mntfd                       = -1;
+        char              mntpt[PATH_MAX]             = {0,};
 
         this = THIS;
         priv = this->private;
@@ -1066,11 +1063,14 @@ rb_destroy_maintenance_client (glusterd_volinfo_t *volinfo,
                 goto out;
         }
 
-        ret = rb_mountpoint_rmdir (volinfo, src_brickinfo);
+        GLUSTERD_GET_RB_MNTPT (mntpt, sizeof (mntpt), volinfo);
+        ret = gf_umount_lazy (this->name, mntpt, 1);
         if (ret) {
-                gf_log (this->name, GF_LOG_DEBUG, "rmdir of mountpoint "
-                        "failed");
-                goto out;
+                gf_log (this->name, GF_LOG_WARNING,
+                        "Lazy unmount failed on maintenance client");
+        } else {
+                gf_log (this->name, GF_LOG_DEBUG,
+                        "Successfully unmounted  maintenance client");
         }
 
         snprintf (volfile, PATH_MAX, "%s/vols/%s/%s", priv->workdir,
@@ -1393,14 +1393,16 @@ umount:
  * after all commit acks are received.
  */
 static int
-rb_update_srcbrick_port (glusterd_brickinfo_t *src_brickinfo, dict_t *rsp_dict,
-                         dict_t *req_dict, int32_t replace_op)
+rb_update_srcbrick_port (glusterd_volinfo_t *volinfo,
+                         glusterd_brickinfo_t *src_brickinfo,
+                         dict_t *rsp_dict, dict_t *req_dict, int32_t replace_op)
 {
-        xlator_t *this            = NULL;
-        dict_t   *ctx             = NULL;
-        int       ret             = 0;
-        int       dict_ret        = 0;
-        int       src_port        = 0;
+        xlator_t *this                  = NULL;
+        dict_t   *ctx                   = NULL;
+        int       ret                   = 0;
+        int       dict_ret              = 0;
+        int       src_port              = 0;
+        char      brickname[PATH_MAX]   = {0,};
 
         this = THIS;
 
@@ -1412,8 +1414,15 @@ rb_update_srcbrick_port (glusterd_brickinfo_t *src_brickinfo, dict_t *rsp_dict,
                 gf_log ("", GF_LOG_INFO,
                         "adding src-brick port no");
 
+                if (volinfo->transport_type == GF_TRANSPORT_RDMA) {
+                        snprintf (brickname, sizeof(brickname), "%s.rdma",
+                                  src_brickinfo->path);
+                } else
+                        snprintf (brickname, sizeof(brickname), "%s",
+                                  src_brickinfo->path);
+
                 src_brickinfo->port = pmap_registry_search (this,
-                                      src_brickinfo->path, GF_PMAP_PORT_BRICKSERVER);
+                                      brickname, GF_PMAP_PORT_BRICKSERVER);
                 if (!src_brickinfo->port &&
                     replace_op != GF_REPLACE_OP_COMMIT_FORCE ) {
                         gf_log ("", GF_LOG_ERROR,
@@ -1493,13 +1502,23 @@ out:
 
 static int
 glusterd_op_perform_replace_brick (glusterd_volinfo_t  *volinfo,
-                                   char *old_brick, char  *new_brick)
+                                   char *old_brick, char *new_brick,
+                                   dict_t *dict)
 {
+        char                                    *brick_mount_dir = NULL;
         glusterd_brickinfo_t                    *old_brickinfo = NULL;
         glusterd_brickinfo_t                    *new_brickinfo = NULL;
         int32_t                                 ret = -1;
+        xlator_t                                *this = NULL;
+        glusterd_conf_t                         *conf = NULL;
 
+        this = THIS;
+        GF_ASSERT (this);
+        GF_ASSERT (dict);
         GF_ASSERT (volinfo);
+
+        conf = this->private;
+        GF_ASSERT (conf);
 
         ret = glusterd_brickinfo_new_from_brick (new_brick,
                                                  &new_brickinfo);
@@ -1518,6 +1537,20 @@ glusterd_op_perform_replace_brick (glusterd_volinfo_t  *volinfo,
 
         strncpy (new_brickinfo->brick_id, old_brickinfo->brick_id,
                  sizeof (new_brickinfo->brick_id));
+
+        /* A bricks mount dir is required only by snapshots which were
+         * introduced in gluster-3.6.0
+         */
+        if (conf->op_version >= GD_OP_VERSION_3_6_0) {
+                ret = dict_get_str (dict, "brick1.mount_dir", &brick_mount_dir);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "brick1.mount_dir not present");
+                        goto out;
+                }
+                strncpy (new_brickinfo->mount_dir, brick_mount_dir,
+                         sizeof(new_brickinfo->mount_dir));
+        }
 
         list_add_tail (&new_brickinfo->brick_list,
                        &old_brickinfo->brick_list);
@@ -1624,11 +1657,10 @@ glusterd_op_replace_brick (dict_t *dict, dict_t *rsp_dict)
                 goto out;
         }
 
-        ret = rb_update_srcbrick_port (src_brickinfo, rsp_dict,
+        ret = rb_update_srcbrick_port (volinfo, src_brickinfo, rsp_dict,
                                        dict, replace_op);
         if (ret)
                 goto out;
-
 
 	if ((GF_REPLACE_OP_START != replace_op)) {
 
@@ -1753,7 +1785,7 @@ glusterd_op_replace_brick (dict_t *dict, dict_t *rsp_dict)
                 }
 
 		ret = glusterd_op_perform_replace_brick (volinfo, src_brick,
-							 dst_brick);
+							 dst_brick, dict);
 		if (ret) {
 			gf_log (this->name, GF_LOG_CRITICAL, "Unable to add "
 				"dst-brick: %s to volume: %s", dst_brick,
@@ -1891,6 +1923,7 @@ glusterd_do_replace_brick (void *data)
         int32_t                 op      = 0;
         int32_t                 src_port = 0;
         int32_t                 dst_port = 0;
+        int32_t                 ret      = 0;
         dict_t                 *dict    = NULL;
         char                   *src_brick = NULL;
         char                   *dst_brick = NULL;
@@ -1899,16 +1932,16 @@ glusterd_do_replace_brick (void *data)
         glusterd_brickinfo_t   *dst_brickinfo = NULL;
 	glusterd_conf_t	       *priv = NULL;
         uuid_t                 *txn_id = NULL;
+        xlator_t               *this = NULL;
 
-        int ret = 0;
-
-        dict = data;
-
-	GF_ASSERT (THIS);
-	priv = THIS->private;
+        this = THIS;
+	GF_ASSERT (this);
+	priv = this->private;
         GF_ASSERT (priv);
+        GF_ASSERT (data);
 
         txn_id = &priv->global_txn_id;
+        dict = data;
 
 	if (priv->timer) {
 		gf_timer_call_cancel (THIS->ctx, priv->timer);
@@ -1921,8 +1954,8 @@ glusterd_do_replace_brick (void *data)
                 "Replace brick operation detected");
 
         ret = dict_get_bin (dict, "transaction_id", (void **)&txn_id);
-
-        gf_log ("", GF_LOG_DEBUG, "transaction ID = %s", uuid_utoa (*txn_id));
+        gf_log (this->name, GF_LOG_DEBUG, "transaction ID = %s",
+                uuid_utoa (*txn_id));
 
         ret = dict_get_int32 (dict, "operation", &op);
         if (ret) {

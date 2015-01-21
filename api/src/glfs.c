@@ -66,11 +66,22 @@ glusterfs_ctx_defaults_init (glusterfs_ctx_t *ctx)
 	call_pool_t   *pool = NULL;
 	int	       ret = -1;
 
-	xlator_mem_acct_init (THIS, glfs_mt_end + 1);
-
 	if (!ctx) {
 		goto err;
-	}
+        }
+
+        ret = xlator_mem_acct_init (THIS, glfs_mt_end + 1);
+        if (ret != 0) {
+                gf_log (THIS->name, GF_LOG_ERROR,
+                   "Memory accounting init failed");
+                return ret;
+        }
+
+        /* reset ret to -1 so that we don't need to explicitly
+         * set it in all error paths before "goto err"
+         */
+
+        ret = -1;
 
 	ctx->process_uuid = generate_glusterfs_ctx_id ();
 	if (!ctx->process_uuid) {
@@ -129,6 +140,11 @@ glusterfs_ctx_defaults_init (glusterfs_ctx_t *ctx)
 	if (!ctx->dict_data_pool)
 		goto err;
 
+        ctx->logbuf_pool = mem_pool_new (log_buf_t,
+                                         GF_MEMPOOL_COUNT_OF_LRU_BUF_T);
+        if (!ctx->logbuf_pool)
+                goto err;
+
 	INIT_LIST_HEAD (&pool->all_frames);
 	INIT_LIST_HEAD (&ctx->cmd_args.xlator_options);
         INIT_LIST_HEAD (&ctx->cmd_args.volfile_servers);
@@ -157,6 +173,8 @@ err:
 			mem_pool_destroy (ctx->dict_data_pool);
 		if (ctx->dict_pair_pool)
 			mem_pool_destroy (ctx->dict_pair_pool);
+                if (ctx->logbuf_pool)
+                        mem_pool_destroy (ctx->logbuf_pool);
 	}
 
 	return ret;
@@ -275,8 +293,8 @@ out:
 
 
 int
-glfs_set_xlator_option (struct glfs *fs, const char *xlator, const char *key,
-			const char *value)
+pub_glfs_set_xlator_option (struct glfs *fs, const char *xlator,
+                            const char *key, const char *value)
 {
 	xlator_cmdline_option_t *option = NULL;
 
@@ -314,9 +332,12 @@ enomem:
 	return -1;
 }
 
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_set_xlator_option, 3.4.0);
+
+
 int
-glfs_unset_volfile_server (struct glfs *fs, const char *transport,
-                           const char *host, const int port)
+pub_glfs_unset_volfile_server (struct glfs *fs, const char *transport,
+                               const char *host, const int port)
 {
         cmd_args_t       *cmd_args = NULL;
         server_cmdline_t *server = NULL;
@@ -342,16 +363,19 @@ out:
         return ret;
 }
 
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_unset_volfile_server, 3.5.1);
+
+
 int
-glfs_set_volfile_server (struct glfs *fs, const char *transport,
-                         const char *host, int port)
+pub_glfs_set_volfile_server (struct glfs *fs, const char *transport,
+                             const char *host, int port)
 {
         cmd_args_t            *cmd_args = NULL;
         server_cmdline_t      *server = NULL;
         server_cmdline_t      *tmp = NULL;
         int                    ret = -1;
 
-        if (!transport || !host) {
+        if (!fs || !host) {
                 errno = EINVAL;
                 return ret;
         }
@@ -376,10 +400,12 @@ glfs_set_volfile_server (struct glfs *fs, const char *transport,
                 goto out;
         }
 
-        server->transport = gf_strdup (transport);
-        if (!server->transport) {
-                errno = ENOMEM;
-                goto out;
+        if (transport) {
+                server->transport = gf_strdup (transport);
+                if (!server->transport) {
+                        errno = ENOMEM;
+                        goto out;
+                }
         }
 
         server->port = port;
@@ -416,26 +442,43 @@ out:
         return ret;
 }
 
-int glfs_setfsuid (uid_t fsuid)
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_set_volfile_server, 3.4.0);
+
+
+int
+pub_glfs_setfsuid (uid_t fsuid)
 {
 	return syncopctx_setfsuid (&fsuid);
 }
 
-int glfs_setfsgid (gid_t fsgid)
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_setfsuid, 3.4.2);
+
+
+int
+pub_glfs_setfsgid (gid_t fsgid)
 {
 	return syncopctx_setfsgid (&fsgid);
 }
 
-int glfs_setfsgroups (size_t size, const gid_t *list)
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_setfsgid, 3.4.2);
+
+
+int
+pub_glfs_setfsgroups (size_t size, const gid_t *list)
 {
 	return syncopctx_setfsgroups(size, list);
 }
 
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_setfsgroups, 3.4.2);
+
+
 struct glfs *
-glfs_from_glfd (struct glfs_fd *glfd)
+pub_glfs_from_glfd (struct glfs_fd *glfd)
 {
 	return glfd->fs;
 }
+
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_from_glfd, 3.4.0);
 
 
 struct glfs_fd *
@@ -504,7 +547,7 @@ glfs_poller (void *data)
 
 
 struct glfs *
-glfs_new (const char *volname)
+pub_glfs_new (const char *volname)
 {
 	struct glfs     *fs = NULL;
 	int              ret = -1;
@@ -514,10 +557,6 @@ glfs_new (const char *volname)
 	if (!ctx) {
 		return NULL;
 	}
-
-#ifdef DEBUG
-        gf_mem_acct_enable_set (ctx);
-#endif
 
 	/* first globals init, for gf_mem_acct_enable_set () */
 	ret = glusterfs_globals_init (ctx);
@@ -544,15 +583,60 @@ glfs_new (const char *volname)
 
 	pthread_mutex_init (&fs->mutex, NULL);
 	pthread_cond_init (&fs->cond, NULL);
+        pthread_cond_init (&fs->child_down_cond, NULL);
 
 	INIT_LIST_HEAD (&fs->openfds);
 
 	return fs;
 }
 
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_new, 3.4.0);
+
+
+struct glfs *
+priv_glfs_new_from_ctx (glusterfs_ctx_t *ctx)
+{
+        struct glfs    *fs = NULL;
+
+        if (!ctx)
+                return NULL;
+
+        fs = GF_CALLOC (1, sizeof (*fs), glfs_mt_glfs_t);
+        if (!fs)
+                return NULL;
+        fs->ctx = ctx;
+
+        (void) pthread_cond_init (&fs->cond, NULL);
+
+        (void) pthread_mutex_init (&fs->mutex, NULL);
+
+        INIT_LIST_HEAD (&fs->openfds);
+
+        return fs;
+}
+
+GFAPI_SYMVER_PRIVATE_DEFAULT(glfs_new_from_ctx, 3.7.0);
+
+
+void
+priv_glfs_free_from_ctx (struct glfs *fs)
+{
+        if (!fs)
+                return;
+
+        (void) pthread_cond_destroy (&fs->cond);
+        (void) pthread_cond_destroy (&fs->child_down_cond);
+
+        (void) pthread_mutex_destroy (&fs->mutex);
+
+        GF_FREE (fs);
+}
+
+GFAPI_SYMVER_PRIVATE_DEFAULT(glfs_free_from_ctx, 3.7.0);
+
 
 int
-glfs_set_volfile (struct glfs *fs, const char *volfile)
+pub_glfs_set_volfile (struct glfs *fs, const char *volfile)
 {
 	cmd_args_t  *cmd_args = NULL;
 
@@ -566,9 +650,11 @@ glfs_set_volfile (struct glfs *fs, const char *volfile)
 	return 0;
 }
 
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_set_volfile, 3.4.0);
+
 
 int
-glfs_set_logging (struct glfs *fs, const char *logfile, int loglevel)
+pub_glfs_set_logging (struct glfs *fs, const char *logfile, int loglevel)
 {
         int  ret = 0;
         char *tmplog = NULL;
@@ -590,9 +676,15 @@ glfs_set_logging (struct glfs *fs, const char *logfile, int loglevel)
         if (ret)
                 goto out;
 
+        ret = gf_log_inject_timer_event (fs->ctx);
+        if (ret)
+                goto out;
+
 out:
         return ret;
 }
+
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_set_logging, 3.4.0);
 
 
 int
@@ -616,7 +708,7 @@ glfs_init_wait (struct glfs *fs)
 
 
 void
-glfs_init_done (struct glfs *fs, int ret)
+priv_glfs_init_done (struct glfs *fs, int ret)
 {
 	glfs_init_cbk init_cbk;
 
@@ -645,6 +737,8 @@ glfs_init_done (struct glfs *fs, int ret)
 out:
 	return;
 }
+
+GFAPI_SYMVER_PRIVATE_DEFAULT(glfs_init_done, 3.4.0);
 
 
 int
@@ -690,7 +784,7 @@ glfs_init_async (struct glfs *fs, glfs_init_cbk cbk)
 
 
 int
-glfs_init (struct glfs *fs)
+pub_glfs_init (struct glfs *fs)
 {
 	int  ret = -1;
 
@@ -710,18 +804,22 @@ glfs_init (struct glfs *fs)
 	return ret;
 }
 
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_init, 3.4.0);
+
 
 int
-glfs_fini (struct glfs *fs)
+pub_glfs_fini (struct glfs *fs)
 {
-        int             ret = -1;
-        int             countdown = 100;
-        xlator_t        *subvol = NULL;
-        glusterfs_ctx_t *ctx = NULL;
-        call_pool_t     *call_pool = NULL;
+        int                ret = -1;
+        int                countdown = 100;
+        xlator_t           *subvol = NULL;
+        glusterfs_ctx_t    *ctx = NULL;
+        glusterfs_graph_t  *graph = NULL;
+        call_pool_t        *call_pool = NULL;
+        int                fs_init = 0;
+        int                err = -1;
 
         ctx = fs->ctx;
-
         if (ctx->mgmt) {
                 rpc_clnt_disable (ctx->mgmt);
                 ctx->mgmt = NULL;
@@ -743,45 +841,89 @@ glfs_fini (struct glfs *fs)
          *pool*/
         ret = (call_pool->cnt == 0)? 0: -1;
 
-        subvol = glfs_active_subvol (fs);
-        if (subvol) {
-                /* PARENT_DOWN within glfs_subvol_done() is issued only
-                   on graph switch (new graph should activiate and
-                   decrement the extra @winds count taken in glfs_graph_setup()
-
-                   Since we are explicitly destroying, PARENT_DOWN is necessary
-                */
-                xlator_notify (subvol, GF_EVENT_PARENT_DOWN, subvol, 0);
-                /* TBD: wait for CHILD_DOWN before exiting, in case of
-                   asynchronous cleanup like graceful socket disconnection
-                   in the future.
-                */
+        pthread_mutex_lock (&fs->mutex);
+        {
+                fs_init = fs->init;
         }
+        pthread_mutex_unlock (&fs->mutex);
 
-        glfs_subvol_done (fs, subvol);
+        if (fs_init != 0) {
+                subvol = glfs_active_subvol (fs);
+                if (subvol) {
+                        /* PARENT_DOWN within glfs_subvol_done() is issued
+                           only on graph switch (new graph should activiate
+                           and decrement the extra @winds count taken in
+                           glfs_graph_setup()
+
+                           Since we are explicitly destroying,
+                           PARENT_DOWN is necessary
+                        */
+                        xlator_notify (subvol, GF_EVENT_PARENT_DOWN, subvol, 0);
+                        /* Here we wait for GF_EVENT_CHILD_DOWN before exiting,
+                           in case of asynchrnous cleanup
+                        */
+                        graph = subvol->graph;
+                        err = pthread_mutex_lock (&fs->mutex);
+                        if (err != 0) {
+                                gf_log ("glfs", GF_LOG_ERROR,
+                                        "pthread lock on glfs mutex, "
+                                        "returned error: (%s)", strerror (err));
+                                goto fail;
+                        }
+                        /* check and wait for CHILD_DOWN for active subvol*/
+                        {
+                                while (graph->used) {
+                                        err = pthread_cond_wait (&fs->child_down_cond,
+                                                                 &fs->mutex);
+                                        if (err != 0)
+                                                gf_log ("glfs", GF_LOG_INFO,
+                                                        "%s cond wait failed %s",
+                                                        subvol->name,
+                                                        strerror (err));
+                                }
+                        }
+
+                        err = pthread_mutex_unlock (&fs->mutex);
+                        if (err != 0) {
+                                gf_log ("glfs", GF_LOG_ERROR,
+                                        "pthread unlock on glfs mutex, "
+                                        "returned error: (%s)", strerror (err));
+                                goto fail;
+                        }
+                }
+                glfs_subvol_done (fs, subvol);
+        }
 
         if (gf_log_fini(ctx) != 0)
                 ret = -1;
-
+fail:
+        if (!ret)
+                ret = err;
         return ret;
 }
 
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_fini, 3.4.0);
+
+
 ssize_t
-glfs_get_volfile (struct glfs *fs, void *buf, size_t len)
+pub_glfs_get_volfile (struct glfs *fs, void *buf, size_t len)
 {
         ssize_t         res;
 
         glfs_lock(fs);
         if (len >= fs->oldvollen) {
-                gf_log ("glfs", GF_LOG_TRACE, "copying %lu to %p", len, buf);
+                gf_log ("glfs", GF_LOG_TRACE, "copying %zu to %p", len, buf);
                 memcpy(buf,fs->oldvolfile,len);
                 res = len;
         }
         else {
                 res = len - fs->oldvollen;
-                gf_log ("glfs", GF_LOG_TRACE, "buffer is %ld too short", -res);
+                gf_log ("glfs", GF_LOG_TRACE, "buffer is %zd too short", -res);
         }
         glfs_unlock(fs);
 
         return res;
 }
+
+GFAPI_SYMVER_PUBLIC_DEFAULT(glfs_get_volfile, 3.6.0);
+

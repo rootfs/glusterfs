@@ -17,81 +17,13 @@
 #include "glusterd-utils.h"
 
 static int
-check_dict_key_value (dict_t *dict, char *key, char *value)
-{
-        glusterd_conf_t     *priv          = NULL;
-        int                  ret           = 0;
-        xlator_t            *this          = NULL;
-
-        this = THIS;
-        GF_ASSERT (this);
-        priv = this->private;
-        GF_ASSERT (priv);
-
-        if (!dict) {
-                gf_log (this->name, GF_LOG_ERROR, "Received Empty Dict.");
-                ret = -1;
-                goto out;
-        }
-
-        if (!key) {
-                gf_log (this->name, GF_LOG_ERROR, "Received Empty Key.");
-                ret = -1;
-                goto out;
-        }
-
-        if (!value) {
-                gf_log (this->name, GF_LOG_ERROR, "Received Empty Value.");
-                ret = -1;
-                goto out;
-        }
-
-out:
-        gf_log (this->name, GF_LOG_DEBUG, "Returning %d", ret);
-
-        return ret;
-}
-
-static int
-get_volname_volinfo (dict_t *dict, char **volname, glusterd_volinfo_t **volinfo)
-{
-        glusterd_conf_t     *priv          = NULL;
-        int                  ret           = 0;
-        xlator_t            *this          = NULL;
-
-        this = THIS;
-        GF_ASSERT (this);
-        priv = this->private;
-        GF_ASSERT (priv);
-
-        ret = dict_get_str (dict, "volname", volname);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "Unable to get volume name");
-                goto out;
-        }
-
-        ret = glusterd_volinfo_find (*volname, volinfo);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "Unable to allocate memory");
-                goto out;
-        }
-
-out:
-        gf_log (this->name, GF_LOG_DEBUG, "Returning %d", ret);
-
-        return ret;
-}
-
-static int
-validate_cache_max_min_size (dict_t *dict, char *key, char *value,
-                             char **op_errstr)
+validate_cache_max_min_size (glusterd_volinfo_t *volinfo, dict_t *dict,
+                             char *key, char *value, char **op_errstr)
 {
         char                *current_max_value = NULL;
         char                *current_min_value = NULL;
         char                 errstr[2048]  = "";
-        char                *volname       = NULL;
         glusterd_conf_t     *priv          = NULL;
-        glusterd_volinfo_t  *volinfo       = NULL;
         int                  ret           = 0;
         uint64_t             max_value     = 0;
         uint64_t             min_value     = 0;
@@ -102,22 +34,14 @@ validate_cache_max_min_size (dict_t *dict, char *key, char *value,
         priv = this->private;
         GF_ASSERT (priv);
 
-        ret = check_dict_key_value (dict, key, value);
-        if (ret)
-                goto out;
-
-        ret = get_volname_volinfo (dict, &volname, &volinfo);
-        if (ret)
-                goto out;
-
         if ((!strcmp (key, "performance.cache-min-file-size")) ||
             (!strcmp (key, "cache-min-file-size"))) {
                 glusterd_volinfo_get (volinfo,
                                       "performance.cache-max-file-size",
                                       &current_max_value);
                 if (current_max_value) {
-                        gf_string2bytesize (current_max_value, &max_value);
-                        gf_string2bytesize (value, &min_value);
+                        gf_string2bytesize_uint64 (current_max_value, &max_value);
+                        gf_string2bytesize_uint64 (value, &min_value);
                         current_min_value = value;
                 }
         } else  if ((!strcmp (key, "performance.cache-max-file-size")) ||
@@ -126,8 +50,8 @@ validate_cache_max_min_size (dict_t *dict, char *key, char *value,
                                       "performance.cache-min-file-size",
                                       &current_min_value);
                 if (current_min_value) {
-                        gf_string2bytesize (current_min_value, &min_value);
-                        gf_string2bytesize (value, &max_value);
+                        gf_string2bytesize_uint64 (current_min_value, &min_value);
+                        gf_string2bytesize_uint64 (value, &max_value);
                         current_max_value = value;
                 }
         }
@@ -150,13 +74,11 @@ out:
 }
 
 static int
-validate_quota (dict_t *dict, char *key, char *value,
-                char **op_errstr)
+validate_quota (glusterd_volinfo_t *volinfo, dict_t *dict, char *key,
+                char *value, char **op_errstr)
 {
         char                 errstr[2048] = "";
-        char                *volname      = NULL;
         glusterd_conf_t     *priv         = NULL;
-        glusterd_volinfo_t  *volinfo      = NULL;
         int                  ret          = 0;
         xlator_t            *this         = NULL;
 
@@ -164,14 +86,6 @@ validate_quota (dict_t *dict, char *key, char *value,
         GF_ASSERT (this);
         priv = this->private;
         GF_ASSERT (priv);
-
-        ret = check_dict_key_value (dict, key, value);
-        if (ret)
-                goto out;
-
-        ret = get_volname_volinfo (dict, &volname, &volinfo);
-        if (ret)
-                goto out;
 
         ret = glusterd_volinfo_get_boolean (volinfo, VKEY_FEATURES_QUOTA);
         if (ret == -1) {
@@ -197,12 +111,38 @@ out:
 }
 
 static int
-validate_stripe (dict_t *dict, char *key, char *value, char **op_errstr)
+validate_uss (glusterd_volinfo_t *volinfo, dict_t *dict, char *key,
+              char *value, char **op_errstr)
 {
         char                 errstr[2048]  = "";
-        char                *volname       = NULL;
+        int                  ret           = 0;
+        xlator_t            *this          = NULL;
+        gf_boolean_t         b             = _gf_false;
+
+        this = THIS;
+        GF_ASSERT (this);
+
+        ret = gf_string2boolean (value, &b);
+        if (ret) {
+                snprintf (errstr, sizeof (errstr), "%s is not a valid boolean "
+                          "value. %s expects a valid boolean value.", value,
+                          key);
+                gf_log (this->name, GF_LOG_ERROR, "%s", errstr);
+                *op_errstr = gf_strdup (errstr);
+                goto out;
+        }
+out:
+        gf_log (this->name, GF_LOG_DEBUG, "Returning %d", ret);
+
+        return ret;
+}
+
+static int
+validate_stripe (glusterd_volinfo_t *volinfo, dict_t *dict, char *key,
+                 char *value, char **op_errstr)
+{
+        char                 errstr[2048]  = "";
         glusterd_conf_t     *priv          = NULL;
-        glusterd_volinfo_t  *volinfo       = NULL;
         int                  ret           = 0;
         xlator_t            *this          = NULL;
 
@@ -210,14 +150,6 @@ validate_stripe (dict_t *dict, char *key, char *value, char **op_errstr)
         GF_ASSERT (this);
         priv = this->private;
         GF_ASSERT (priv);
-
-        ret = check_dict_key_value (dict, key, value);
-        if (ret)
-                goto out;
-
-        ret = get_volname_volinfo (dict, &volname, &volinfo);
-        if (ret)
-                goto out;
 
         if (volinfo->stripe_count == 1) {
                 snprintf (errstr, sizeof (errstr),
@@ -235,13 +167,11 @@ out:
 }
 
 static int
-validate_subvols_per_directory (dict_t *dict, char *key, char *value,
-                                char **op_errstr)
+validate_subvols_per_directory (glusterd_volinfo_t *volinfo, dict_t *dict,
+                                char *key, char *value, char **op_errstr)
 {
         char                 errstr[2048]  = "";
-        char                *volname       = NULL;
         glusterd_conf_t     *priv          = NULL;
-        glusterd_volinfo_t  *volinfo       = NULL;
         int                  ret           = 0;
         int                  subvols       = 0;
         xlator_t            *this          = NULL;
@@ -250,14 +180,6 @@ validate_subvols_per_directory (dict_t *dict, char *key, char *value,
         GF_ASSERT (this);
         priv = this->private;
         GF_ASSERT (priv);
-
-        ret = check_dict_key_value (dict, key, value);
-        if (ret)
-                goto out;
-
-        ret = get_volname_volinfo (dict, &volname, &volinfo);
-        if (ret)
-                goto out;
 
         subvols = atoi(value);
 
@@ -281,6 +203,36 @@ out:
         return ret;
 }
 
+static int
+validate_replica_heal_enable_disable (glusterd_volinfo_t *volinfo, dict_t *dict,
+                                      char *key, char *value, char **op_errstr)
+{
+        int                  ret = 0;
+
+        if (!glusterd_is_volume_replicate (volinfo)) {
+                gf_asprintf (op_errstr, "Volume %s is not of replicate type",
+                             volinfo->volname);
+                ret = -1;
+        }
+
+        return ret;
+}
+
+static int
+validate_disperse_heal_enable_disable (glusterd_volinfo_t *volinfo,
+                                       dict_t *dict, char *key, char *value,
+                                       char **op_errstr)
+{
+        int                  ret = 0;
+
+        if (volinfo->type != GF_CLUSTER_TYPE_DISPERSE) {
+                gf_asprintf (op_errstr, "Volume %s is not of disperse type",
+                             volinfo->volname);
+                ret = -1;
+        }
+
+        return ret;
+}
 
 /* dispatch table for VOLUME SET
  * -----------------------------
@@ -398,7 +350,13 @@ struct volopt_map_entry glusterd_volopt_map[] = {
           .op_version = 3,
           .flags      = OPT_FLAG_CLIENT_OPT
         },
-
+        { .key        = "cluster.randomize-hash-range-by-gfid",
+          .voltype    = "cluster/distribute",
+          .option     = "randomize-hash-range-by-gfid",
+          .type       = NO_DOC,
+          .op_version = GD_OP_VERSION_3_6_0,
+          .flags      = OPT_FLAG_CLIENT_OPT,
+        },
         /* NUFA xlator options (Distribute special case) */
         { .key        = "cluster.nufa",
           .voltype    = "cluster/distribute",
@@ -413,6 +371,10 @@ struct volopt_map_entry glusterd_volopt_map[] = {
           .type       = NO_DOC,
           .op_version = 3,
           .flags      = OPT_FLAG_CLIENT_OPT
+        },
+        { .key        = "cluster.weighted-rebalance",
+          .voltype    = "cluster/distribute",
+          .op_version = GD_OP_VERSION_3_6_0,
         },
 
         /* Switch xlator options (Distribute special case) */
@@ -475,7 +437,8 @@ struct volopt_map_entry glusterd_volopt_map[] = {
         { .key           = "cluster.self-heal-daemon",
           .voltype       = "cluster/replicate",
           .option        = "!self-heal-daemon",
-          .op_version    = 1
+          .op_version    = 1,
+          .validate_fn   = validate_replica_heal_enable_disable
         },
         { .key        = "cluster.heal-timeout",
           .voltype    = "cluster/replicate",
@@ -613,23 +576,45 @@ struct volopt_map_entry glusterd_volopt_map[] = {
         { .key         = "diagnostics.brick-logger",
           .voltype     = "debug/io-stats",
           .option      = "!logger",
-          .op_version  = 4
+          .op_version  = GD_OP_VERSION_3_6_0,
         },
         { .key        = "diagnostics.client-logger",
           .voltype    = "debug/io-stats",
           .option     = "!logger",
-          .op_version = 4,
+          .op_version = GD_OP_VERSION_3_6_0,
           .flags      = OPT_FLAG_CLIENT_OPT
         },
         { .key         = "diagnostics.brick-log-format",
           .voltype     = "debug/io-stats",
           .option      = "!log-format",
-          .op_version  = 4
+          .op_version  = GD_OP_VERSION_3_6_0,
         },
         { .key        = "diagnostics.client-log-format",
           .voltype    = "debug/io-stats",
           .option     = "!log-format",
-          .op_version = 4,
+          .op_version = GD_OP_VERSION_3_6_0,
+          .flags      = OPT_FLAG_CLIENT_OPT
+        },
+        { .key         = "diagnostics.brick-log-buf-size",
+          .voltype     = "debug/io-stats",
+          .option      = "!log-buf-size",
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
+        { .key        = "diagnostics.client-log-buf-size",
+          .voltype    = "debug/io-stats",
+          .option     = "!log-buf-size",
+          .op_version = GD_OP_VERSION_3_6_0,
+          .flags      = OPT_FLAG_CLIENT_OPT
+        },
+        { .key         = "diagnostics.brick-log-flush-timeout",
+          .voltype     = "debug/io-stats",
+          .option      = "!log-flush-timeout",
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
+        { .key        = "diagnostics.client-log-flush-timeout",
+          .voltype    = "debug/io-stats",
+          .option     = "!log-flush-timeout",
+          .op_version = GD_OP_VERSION_3_6_0,
           .flags      = OPT_FLAG_CLIENT_OPT
         },
 
@@ -709,7 +694,19 @@ struct volopt_map_entry glusterd_volopt_map[] = {
           .op_version = 1,
           .flags      = OPT_FLAG_CLIENT_OPT
         },
+        { .key        = "performance.nfs.flush-behind",
+          .voltype    = "performance/write-behind",
+          .option     = "flush-behind",
+          .op_version = 1,
+          .flags      = OPT_FLAG_CLIENT_OPT
+        },
         { .key        = "performance.write-behind-window-size",
+          .voltype    = "performance/write-behind",
+          .option     = "cache-size",
+          .op_version = 1,
+          .flags      = OPT_FLAG_CLIENT_OPT
+        },
+        { .key        = "performance.nfs.write-behind-window-size",
           .voltype    = "performance/write-behind",
           .option     = "cache-size",
           .op_version = 1,
@@ -721,7 +718,19 @@ struct volopt_map_entry glusterd_volopt_map[] = {
           .op_version = 2,
           .flags      = OPT_FLAG_CLIENT_OPT
         },
+        { .key        = "performance.nfs.strict-o-direct",
+          .voltype    = "performance/write-behind",
+          .option     = "strict-O_DIRECT",
+          .op_version = 2,
+          .flags      = OPT_FLAG_CLIENT_OPT
+        },
         { .key        = "performance.strict-write-ordering",
+          .voltype    = "performance/write-behind",
+          .option     = "strict-write-ordering",
+          .op_version = 2,
+          .flags      = OPT_FLAG_CLIENT_OPT
+        },
+        { .key        = "performance.nfs.strict-write-ordering",
           .voltype    = "performance/write-behind",
           .option     = "strict-write-ordering",
           .op_version = 2,
@@ -821,6 +830,12 @@ struct volopt_map_entry glusterd_volopt_map[] = {
           .op_version = 2,
           .flags      = OPT_FLAG_CLIENT_OPT
         },
+        { .key         = "client.own-thread",
+          .voltype     = "protocol/client",
+          .option      = "transport.socket.own-thread",
+          .type        = NO_DOC,
+          .op_version  = GD_OP_VERSION_3_7_0,
+        },
 
         /* Server xlator options */
         { .key         = "network.tcp-window-size",
@@ -898,6 +913,44 @@ struct volopt_map_entry glusterd_volopt_map[] = {
           .type        = NO_DOC,
           .op_version  = 2
         },
+        { .key         = "auth.ssl-allow",
+          .voltype     = "protocol/server",
+          .option      = "!ssl-allow",
+          .value       = "*",
+          .type        = NO_DOC,
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
+        { .key         = "server.manage-gids",
+          .voltype     = "protocol/server",
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
+        { .key         = "client.send-gids",
+          .voltype     = "protocol/client",
+          .type        = NO_DOC,
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
+        { .key         = "server.gid-timeout",
+          .voltype     = "protocol/server",
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
+        { .key         = "server.own-thread",
+          .voltype     = "protocol/server",
+          .option      = "transport.socket.own-thread",
+          .type        = NO_DOC,
+          .op_version  = GD_OP_VERSION_3_7_0,
+        },
+
+        /* Generic transport options */
+        { .key         = SSL_CERT_DEPTH_OPT,
+          .voltype     = "rpc-transport/socket",
+          .option      = "!ssl-cert-depth",
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
+        { .key         = SSL_CIPHER_LIST_OPT,
+          .voltype     = "rpc-transport/socket",
+          .option      = "!ssl-cipher-list",
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
 
         /* Performance xlators enable/disbable options */
         { .key         = "performance.write-behind",
@@ -970,13 +1023,13 @@ struct volopt_map_entry glusterd_volopt_map[] = {
                          "graph of volume.",
           .flags       = OPT_FLAG_CLIENT_OPT | OPT_FLAG_XLATOR_OPT
         },
-        { .key        = "performance.nfs.write-behind",
-          .voltype    = "performance/write-behind",
-          .option     = "!nfsperf",
-          .value      = "on",
-          .type       = NO_DOC,
-          .op_version = 1,
-          .flags      = OPT_FLAG_XLATOR_OPT
+        { .key         = "performance.nfs.write-behind",
+          .voltype     = "performance/write-behind",
+          .option      = "!nfsperf",
+          .value       = "on",
+          .op_version  = 1,
+          .description = "enable/disable write-behind translator in the volume",
+          .flags       = OPT_FLAG_XLATOR_OPT
         },
         { .key        = "performance.nfs.read-ahead",
           .voltype    = "performance/read-ahead",
@@ -1034,6 +1087,33 @@ struct volopt_map_entry glusterd_volopt_map[] = {
           .description = "enable/disable file-snapshot feature in the "
                          "volume.",
           .flags       = OPT_FLAG_CLIENT_OPT | OPT_FLAG_XLATOR_OPT
+        },
+
+        { .key         = "features.uss",
+          .voltype     = "features/snapview-server",
+          .op_version  = GD_OP_VERSION_3_6_0,
+          .value       = "off",
+          .flags       = OPT_FLAG_CLIENT_OPT | OPT_FLAG_XLATOR_OPT,
+          .validate_fn = validate_uss,
+          .description = "enable/disable User Serviceable Snapshots on the "
+                         "volume."
+        },
+
+        { .key         = "features.snapshot-directory",
+          .voltype     = "features/snapview-client",
+          .op_version  = GD_OP_VERSION_3_6_0,
+          .value       = ".snaps",
+          .flags       = OPT_FLAG_CLIENT_OPT | OPT_FLAG_XLATOR_OPT,
+          .description = "Entry point directory for entering snapshot world"
+        },
+
+        { .key         = "features.show-snapshot-directory",
+          .voltype     = "features/snapview-client",
+          .op_version  = GD_OP_VERSION_3_6_0,
+          .value       = "off",
+          .flags       = OPT_FLAG_CLIENT_OPT | OPT_FLAG_XLATOR_OPT,
+          .description = "show entry point in readdir output of "
+                         "snapdir-entry-path which is set by samba"
         },
 
 #ifdef HAVE_LIB_Z
@@ -1316,7 +1396,6 @@ struct volopt_map_entry glusterd_volopt_map[] = {
         { .key         = "nfs.transport-type",
           .voltype     = "nfs/server",
           .option      = "!nfs.transport-type",
-          .value       = "tcp",
           .op_version  = 1,
           .description = "Specifies the nfs transport type. Valid "
                          "transport types are 'tcp' and 'rdma'."
@@ -1346,6 +1425,16 @@ struct volopt_map_entry glusterd_volopt_map[] = {
           .option      = "!nfs-disable",
           .op_version  = 1
         },
+        { .key         = "nfs-ganesha.enable",
+          .voltype     = "nfs/server",
+          .option      = "!nfs-ganesha.enable",
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
+        { .key         = "nfs-ganesha.host",
+          .voltype     = "nfs/server",
+          .option      = "!nfs-ganesha.host",
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
         { .key         = "nfs.nlm",
           .voltype     = "nfs/server",
           .option      = "nfs.nlm",
@@ -1369,6 +1458,18 @@ struct volopt_map_entry glusterd_volopt_map[] = {
           .option      = "nfs.mount-rmtab",
           .type        = GLOBAL_DOC,
           .op_version  = 1
+        },
+        { .key         = "nfs.rpc-statd",
+          .voltype     = "nfs/server",
+          .option      = "nfs.rpc-statd",
+          .type        = NO_DOC,
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
+        { .key         = "nfs.log-level",
+          .voltype     = "nfs/server",
+          .option      = "nfs.log-level",
+          .type        = NO_DOC,
+          .op_version  = GD_OP_VERSION_3_6_0,
         },
         { .key         = "nfs.server-aux-gids",
           .voltype     = "nfs/server",
@@ -1434,6 +1535,10 @@ struct volopt_map_entry glusterd_volopt_map[] = {
           .voltype     = "storage/posix",
           .op_version  = 3
         },
+        { .key         = "storage.xattr-user-namespace-mode",
+          .voltype     = "storage/posix",
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
         { .key         = "storage.owner-uid",
           .voltype     = "storage/posix",
           .option      = "brick-uid",
@@ -1455,7 +1560,7 @@ struct volopt_map_entry glusterd_volopt_map[] = {
         { .option      = "update-link-count-parent",
           .key         = "storage.build-pgfid",
           .voltype     = "storage/posix",
-          .op_version  = 4
+          .op_version  = GD_OP_VERSION_3_6_0,
         },
         { .key         = "storage.bd-aio",
           .voltype     = "storage/bd",
@@ -1507,6 +1612,40 @@ struct volopt_map_entry glusterd_volopt_map[] = {
           .voltype     = "features/changelog",
           .type        = NO_DOC,
           .op_version  = 3
+        },
+        { .key         = "changelog.changelog-barrier-timeout",
+          .voltype     = "features/changelog",
+          .value       = BARRIER_TIMEOUT,
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
+        { .key         = "features.barrier",
+          .voltype     = "features/barrier",
+          .value       = "disable",
+          .type        = NO_DOC,
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
+        { .key         = "features.barrier-timeout",
+          .voltype     = "features/barrier",
+          .value       = BARRIER_TIMEOUT,
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
+        { .key         = "cluster.op-version",
+          .voltype     = "mgmt/glusterd",
+          .op_version  = GD_OP_VERSION_3_6_0,
+        },
+        { .key         = "locks.trace",
+          .voltype     = "features/locks",
+          .value       = "disable",
+          .type        = NO_DOC,
+          .op_version  = GD_OP_VERSION_3_7_0,
+        },
+        { .key           = "cluster.disperse-self-heal-daemon",
+          .voltype       = "cluster/disperse",
+          .value         = "enable",
+          .type          = NO_DOC,
+          .option        = "self-heal-daemon",
+          .op_version    = GD_OP_VERSION_3_7_0,
+          .validate_fn   = validate_disperse_heal_enable_disable
         },
         { .key         = NULL
         }

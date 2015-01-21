@@ -520,7 +520,8 @@ gf_pump_traverse_directory (loc_t *loc)
 				continue;
 			}
 
-			ret = afr_selfheal_name (this, loc->gfid, entry->d_name);
+			ret = afr_selfheal_name (this, loc->gfid, entry->d_name,
+                                                 NULL);
 			if (ret) {
 				gf_log (this->name, GF_LOG_ERROR,
 					"%s: name self-heal failed (%s/%s)",
@@ -1428,6 +1429,7 @@ pump_getxattr (call_frame_t *frame, xlator_t *this, loc_t *loc,
                               strlen (AFR_XATTR_PREFIX))) {
 
                         op_errno = ENODATA;
+                        ret = -1;
                         goto out;
                 }
 
@@ -1435,14 +1437,12 @@ pump_getxattr (call_frame_t *frame, xlator_t *this, loc_t *loc,
                         gf_log (this->name, GF_LOG_DEBUG,
                                 "Hit pump command - status");
                         pump_execute_status (frame, this);
-                        ret = 0;
                         goto out;
                 }
         }
 
 	afr_getxattr (frame, this, loc, name, xdata);
 
-	ret = 0;
 out:
 	if (ret < 0)
 		AFR_STACK_UNWIND (getxattr, frame, -1, op_errno, NULL, NULL);

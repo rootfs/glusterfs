@@ -17,6 +17,7 @@
 #include "afr.h"
 #include "afr-self-heal.h"
 #include "byte-order.h"
+#include "protocol-common.h"
 
 enum {
 	AFR_SELFHEAL_DATA_FULL = 0,
@@ -176,6 +177,8 @@ __afr_selfheal_data_read_write (call_frame_t *frame, xlator_t *this, fd_t *fd,
 			healed_sinks[i] = 0;
 		}
 	}
+        if (iovec)
+                GF_FREE (iovec);
 	if (iobref)
 		iobref_unref (iobref);
 
@@ -298,28 +301,13 @@ afr_selfheal_data_do (call_frame_t *frame, xlator_t *this, fd_t *fd,
 		      struct afr_reply *replies)
 {
 	afr_private_t *priv = NULL;
-	int i = 0;
 	off_t off = 0;
 	size_t block = 128 * 1024;
 	int type = AFR_SELFHEAL_DATA_FULL;
 	int ret = -1;
 	call_frame_t *iter_frame = NULL;
-	char *sinks_str = NULL;
-	char *p = NULL;
 
 	priv = this->private;
-
-	sinks_str = alloca0 (priv->child_count * 8);
-	p = sinks_str;
-	for (i = 0; i < priv->child_count; i++) {
-		if (!healed_sinks[i])
-			continue;
-		p += sprintf (p, "%d ", i);
-	}
-
-	gf_log (this->name, GF_LOG_INFO, "performing data selfheal on %s. "
-		"source=%d sinks=%s",
-		uuid_utoa (fd->inode->gfid), source, sinks_str);
 
         type = afr_data_self_heal_type_get (priv, healed_sinks, source,
                                             replies);
@@ -329,6 +317,11 @@ afr_selfheal_data_do (call_frame_t *frame, xlator_t *this, fd_t *fd,
 		return -ENOMEM;
 
 	for (off = 0; off < replies[source].poststat.ia_size; off += block) {
+                if (AFR_COUNT (healed_sinks, priv->child_count) == 0) {
+                        ret = -ENOTCONN;
+                        goto out;
+                }
+
 		ret = afr_selfheal_data_block (iter_frame, this, fd, source,
 					       healed_sinks, off, block, type,
 					       replies);
@@ -380,56 +373,169 @@ __afr_selfheal_truncate_sinks (call_frame_t *frame, xlator_t *this,
 	return 0;
 }
 
-/*
- * If by chance there are multiple sources with differing sizes, select
- * the largest file as the source.
- *
- * This can only happen if data was directly modified in the backend.
- */
+gf_boolean_t
+afr_has_source_witnesses (xlator_t *this, unsigned char *sources,
+                          uint64_t *witness)
+{
+        int i = 0;
+        afr_private_t *priv = NULL;
+
+        priv = this->private;
+
+        for (i = 0; i < priv->child_count; i++) {
+                if (sources[i] && witness[i])
+                        return _gf_true;
+        }
+        return _gf_false;
+}
+
+static gf_boolean_t
+afr_does_size_mismatch (xlator_t *this, unsigned char *sources,
+                        struct afr_reply *replies)
+{
+        int     i = 0;
+        afr_private_t *priv = NULL;
+        struct iatt *min = NULL;
+        struct iatt *max = NULL;
+
+        priv = this->private;
+
+        for (i = 0; i < priv->child_count; i++) {
+                if (!replies[i].valid)
+                        continue;
+
+                if (replies[i].op_ret < 0)
+                        continue;
+
+                if (!min)
+                        min = &replies[i].poststat;
+
+                if (!max)
+                        max = &replies[i].poststat;
+
+                if (min->ia_size > replies[i].poststat.ia_size)
+                        min = &replies[i].poststat;
+
+                if (max->ia_size < replies[i].poststat.ia_size)
+                        max = &replies[i].poststat;
+        }
+
+        if (min && max) {
+                if (min->ia_size != max->ia_size)
+                        return _gf_true;
+        }
+
+        return _gf_false;
+}
+
+static void
+afr_mark_biggest_witness_as_source (xlator_t *this, unsigned char *sources,
+                                    uint64_t *witness)
+{
+        int i = 0;
+        afr_private_t *priv = NULL;
+        uint64_t biggest_witness = 0;
+
+        priv = this->private;
+        /* Find source with biggest witness count */
+        for (i = 0; i < priv->child_count; i++) {
+                if (!sources[i])
+                        continue;
+                if (biggest_witness < witness[i])
+                        biggest_witness = witness[i];
+        }
+
+        /* Mark files with less witness count as not source */
+        for (i = 0; i < priv->child_count; i++) {
+                if (!sources[i])
+                        continue;
+                if (witness[i] < biggest_witness)
+                        sources[i] = 0;
+        }
+
+        return;
+}
+
+/* This is a tie breaker function. Only one source be assigned here */
+static void
+afr_mark_newest_file_as_source (xlator_t *this, unsigned char *sources,
+                                struct afr_reply *replies)
+{
+        int i = 0;
+        afr_private_t *priv = NULL;
+        int source = -1;
+        uint32_t max_ctime = 0;
+
+        priv = this->private;
+        /* Find source with latest ctime */
+        for (i = 0; i < priv->child_count; i++) {
+                if (!sources[i])
+                        continue;
+
+                if (max_ctime <= replies[i].poststat.ia_ctime) {
+                        source = i;
+                        max_ctime = replies[i].poststat.ia_ctime;
+                }
+        }
+
+        /* Only mark one of the files as source to break ties */
+        memset (sources, 0, sizeof (*sources) * priv->child_count);
+        sources[source] = 1;
+}
+
 static int
-__afr_selfheal_data_finalize_source (xlator_t *this, unsigned char *sources,
-				     unsigned char *sinks,
+__afr_selfheal_data_finalize_source (call_frame_t *frame, xlator_t *this,
+                                     unsigned char *sources,
+                                     unsigned char *sinks,
 				     unsigned char *healed_sinks,
 				     unsigned char *locked_on,
-				     struct afr_reply *replies)
+				     struct afr_reply *replies,
+                                     uint64_t *witness)
 {
 	int i = 0;
 	afr_private_t *priv = NULL;
-	uint64_t size = 0;
 	int source = -1;
-	int locked_count = 0;
 	int sources_count = 0;
-	int healed_sinks_count = 0;
-
 	priv = this->private;
 
-	locked_count = AFR_COUNT (locked_on, priv->child_count);
 	sources_count = AFR_COUNT (sources, priv->child_count);
-	healed_sinks_count = AFR_COUNT (healed_sinks, priv->child_count);
 
-	if (locked_count == healed_sinks_count || !sources_count) {
+	if ((AFR_CMP (locked_on, healed_sinks, priv->child_count) == 0)
+            || !sources_count) {
 		/* split brain */
-		return -EIO;
+                source = afr_mark_split_brain_source_sinks (frame, this,
+                                                            sources, sinks,
+                                                            healed_sinks,
+                                                            locked_on, replies,
+                                                          AFR_DATA_TRANSACTION);
+                if (source < 0)
+                        return -EIO;
+                return source;
 	}
 
-	for (i = 0; i < priv->child_count; i++) {
-		if (!sources[i])
-			continue;
-		if (size <= replies[i].poststat.ia_size) {
-			size = replies[i].poststat.ia_size;
-			source = i;
-		}
-	}
+        /* No split brain at this point. If we were called from
+         * afr_heal_splitbrain_file(), abort.*/
+        if (afr_dict_contains_heal_op(frame))
+                return -EIO;
 
-	for (i = 0; i < priv->child_count; i++) {
-		if (!sources[i])
-			continue;
-		if (replies[i].poststat.ia_size < size) {
-			sources[i] = 0;
-			sinks[i] = 1;
-		}
-	}
+        /* If there are no witnesses/size-mismatches on sources we are done*/
+        if (!afr_does_size_mismatch (this, sources, replies) &&
+            !afr_has_source_witnesses (this, sources, witness))
+                goto out;
 
+        afr_mark_largest_file_as_source (this, sources, replies);
+        afr_mark_biggest_witness_as_source (this, sources, witness);
+        afr_mark_newest_file_as_source (this, sources, replies);
+
+out:
+        afr_mark_active_sinks (this, sources, locked_on, healed_sinks);
+
+        for (i = 0; i < priv->child_count; i++) {
+                if (sources[i]) {
+                        source = i;
+                        break;
+                }
+        }
 	return source;
 }
 
@@ -442,46 +548,48 @@ __afr_selfheal_data_finalize_source (xlator_t *this, unsigned char *sources,
  * The return value is the index of the subvolume to be used as the source
  * for self-healing, or -1 if no healing is necessary/split brain.
  */
-static int
-__afr_selfheal_data_prepare (call_frame_t *frame, xlator_t *this, fd_t *fd,
-			     unsigned char *locked_on, unsigned char *sources,
-			     unsigned char *sinks, unsigned char *healed_sinks,
+int
+__afr_selfheal_data_prepare (call_frame_t *frame, xlator_t *this,
+                             inode_t *inode, unsigned char *locked_on,
+                             unsigned char *sources, unsigned char *sinks,
+                             unsigned char *healed_sinks,
 			     struct afr_reply *replies)
 {
 	int ret = -1;
 	int source = -1;
 	afr_private_t *priv = NULL;
-	int i = 0;
+        uint64_t *witness = NULL;
 
 	priv = this->private;
 
-	ret = afr_selfheal_unlocked_discover (frame, fd->inode, fd->inode->gfid,
+	ret = afr_selfheal_unlocked_discover (frame, inode, inode->gfid,
 					      replies);
-	if (ret)
-		return ret;
 
+        if (ret)
+                return ret;
+
+        witness = alloca0(priv->child_count * sizeof (*witness));
 	ret = afr_selfheal_find_direction (frame, this, replies,
 					   AFR_DATA_TRANSACTION,
-					   locked_on, sources, sinks);
+					   locked_on, sources, sinks, witness);
 	if (ret)
 		return ret;
 
-	source = __afr_selfheal_data_finalize_source (this, sources, sinks,
-						      healed_sinks, locked_on,
-						      replies);
+        /* Initialize the healed_sinks[] array optimistically to
+           the intersection of to-be-healed (i.e sinks[]) and
+           the list of servers which are up (i.e locked_on[]).
+           As we encounter failures in the healing process, we
+           will unmark the respective servers in the healed_sinks[]
+           array.
+        */
+        AFR_INTERSECT (healed_sinks, sinks, locked_on, priv->child_count);
+
+	source = __afr_selfheal_data_finalize_source (frame, this, sources,
+                                                      sinks, healed_sinks,
+                                                      locked_on, replies,
+                                                      witness);
 	if (source < 0)
 		return -EIO;
-
-	for (i = 0; i < priv->child_count; i++)
-		/* Initialize the healed_sinks[] array optimistically to
-		   the intersection of to-be-healed (i.e sinks[]) and
-		   the list of servers which are up (i.e locked_on[]).
-
-		   As we encounter failures in the healing process, we
-		   will unmark the respective servers in the healed_sinks[]
-		   array.
-		*/
-		healed_sinks[i] = sinks[i] && locked_on[i];
 
 	return source;
 }
@@ -515,13 +623,18 @@ __afr_selfheal_data (call_frame_t *frame, xlator_t *this, fd_t *fd,
 	ret = afr_selfheal_inodelk (frame, this, fd->inode, this->name, 0, 0,
 				    data_lock);
 	{
-		if (ret < 2) {
+		if (ret < AFR_SH_MIN_PARTICIPANTS) {
+                        gf_log (this->name, GF_LOG_DEBUG, "%s: Skipping "
+                                "self-heal as only %d number of subvolumes "
+                                "could be locked", uuid_utoa (fd->inode->gfid),
+                                ret);
 			ret = -ENOTCONN;
 			goto unlock;
 		}
 
-		ret = __afr_selfheal_data_prepare (frame, this, fd, data_lock,
-						   sources, sinks, healed_sinks,
+		ret = __afr_selfheal_data_prepare (frame, this, fd->inode,
+                                                   data_lock, sources, sinks,
+                                                   healed_sinks,
 						   locked_replies);
 		if (ret < 0)
 			goto unlock;
@@ -548,7 +661,7 @@ __afr_selfheal_data (call_frame_t *frame, xlator_t *this, fd_t *fd,
 unlock:
 	afr_selfheal_uninodelk (frame, this, fd->inode, this->name, 0, 0,
 				data_lock);
-	if (ret < 0)
+        if (ret < 0)
 		goto out;
 
 	ret = afr_selfheal_data_do (frame, this, fd, source, healed_sinks,
@@ -563,6 +676,13 @@ out:
 	if (compat)
 		afr_selfheal_uninodelk (frame, this, fd->inode, this->name,
 					LLONG_MAX - 2, 1, compat_lock);
+
+        afr_log_selfheal (fd->inode->gfid, this, ret, "data", source,
+                          healed_sinks);
+
+        if (locked_replies)
+                afr_replies_wipe (locked_replies, priv->child_count);
+
 	return ret;
 }
 
@@ -594,7 +714,6 @@ afr_selfheal_data_open (xlator_t *this, inode_t *inode)
 	return fd;
 }
 
-
 int
 afr_selfheal_data (call_frame_t *frame, xlator_t *this, inode_t *inode)
 {
@@ -606,15 +725,22 @@ afr_selfheal_data (call_frame_t *frame, xlator_t *this, inode_t *inode)
 	priv = this->private;
 
 	fd = afr_selfheal_data_open (this, inode);
-	if (!fd)
-		return -EIO;
+	if (!fd) {
+                gf_log (this->name, GF_LOG_DEBUG, "%s: Failed to open",
+                        uuid_utoa (inode->gfid));
+                return -EIO;
+        }
 
 	locked_on = alloca0 (priv->child_count);
 
 	ret = afr_selfheal_tryinodelk (frame, this, inode, priv->sh_domain, 0, 0,
 				       locked_on);
 	{
-		if (ret < 2) {
+		if (ret < AFR_SH_MIN_PARTICIPANTS) {
+                        gf_log (this->name, GF_LOG_DEBUG, "%s: Skipping "
+                                "self-heal as only %d number of subvolumes "
+                                "could be locked", uuid_utoa (fd->inode->gfid),
+                                ret);
 			/* Either less than two subvols available, or another
 			   selfheal (from another server) is in progress. Skip
 			   for now in any case there isn't anything to do.

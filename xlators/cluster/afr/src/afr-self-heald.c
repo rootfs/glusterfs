@@ -20,8 +20,6 @@
 #include "protocol-common.h"
 
 #define SHD_INODE_LRU_LIMIT          2048
-#define AFR_EH_HEALED_LIMIT          1024
-#define AFR_EH_HEAL_FAIL_LIMIT       1024
 #define AFR_EH_SPLIT_BRAIN_LIMIT     1024
 #define AFR_STATISTICS_HISTORY_SIZE    50
 
@@ -41,8 +39,6 @@
 
 #define NTH_INDEX_HEALER(this, n) &((((afr_private_t *)this->private))->shd.index_healers[n])
 #define NTH_FULL_HEALER(this, n) &((((afr_private_t *)this->private))->shd.full_healers[n])
-
-int afr_shd_gfid_to_path (xlator_t *this, xlator_t *subvol, uuid_t gfid, char **path_p);
 
 char *
 afr_subvol_name (xlator_t *this, int subvol)
@@ -93,20 +89,31 @@ afr_shd_is_subvol_local (xlator_t *this, int subvol)
 	uuid_copy (loc.gfid, loc.inode->gfid);
 
 	ret = syncop_getxattr (priv->children[subvol], &loc, &xattr,
-			       GF_XATTR_PATHINFO_KEY);
-	if (ret)
-		return _gf_false;
-	if (!xattr)
-		return _gf_false;
+			       GF_XATTR_PATHINFO_KEY, NULL);
+	if (ret) {
+		is_local = _gf_false;
+                goto out;
+        }
+
+	if (!xattr) {
+		is_local = _gf_false;
+                goto out;
+        }
 
 	ret = dict_get_str (xattr, GF_XATTR_PATHINFO_KEY, &pathinfo);
-	if (ret)
-		return _gf_false;
+	if (ret) {
+		is_local =  _gf_false;
+                goto out;
+        }
 
 	afr_local_pathinfo (pathinfo, &is_local);
 
 	gf_log (this->name, GF_LOG_DEBUG, "subvol %s is %slocal",
 		priv->children[subvol]->name, is_local? "" : "not ");
+
+out:
+        if (xattr)
+                dict_unref (xattr);
 
 	return is_local;
 }
@@ -186,8 +193,10 @@ afr_shd_inode_find (xlator_t *this, xlator_t *subvol, uuid_t gfid)
 	struct iatt iatt = {0, };
 
 	inode = inode_find (this->itable, gfid);
-	if (inode)
+	if (inode) {
+                inode_lookup (inode);
 		goto out;
+        }
 
 	loc.inode = inode_new (this->itable);
 	if (!loc.inode)
@@ -218,6 +227,7 @@ afr_shd_index_opendir (xlator_t *this, int child)
 	int ret = 0;
 	dict_t *xattr = NULL;
 	void *index_gfid = NULL;
+	loc_t loc = {0, };
 
 	priv = this->private;
 	subvol = priv->children[child];
@@ -226,7 +236,7 @@ afr_shd_index_opendir (xlator_t *this, int child)
 	uuid_copy (rootloc.gfid, rootloc.inode->gfid);
 
 	ret = syncop_getxattr (subvol, &rootloc, &xattr,
-			       GF_XATTROP_INDEX_GFID);
+			       GF_XATTROP_INDEX_GFID, NULL);
 	if (ret || !xattr) {
 		errno = -ret;
 		goto out;
@@ -242,9 +252,46 @@ afr_shd_index_opendir (xlator_t *this, int child)
 	inode = afr_shd_inode_find (this, subvol, index_gfid);
 	if (!inode)
 		goto out;
-	fd = fd_anonymous (inode);
+
+	fd = fd_create (inode, GF_CLIENT_PID_AFR_SELF_HEALD);
+	if (!fd)
+		goto out;
+
+	uuid_copy (loc.gfid, index_gfid);
+	loc.inode = inode;
+
+	ret = syncop_opendir(this, &loc, fd);
+	if (ret) {
+	/*
+	 * On Linux, if the brick was not updated, opendir will
+	 * fail. We therefore use backward compatible code
+	 * that violate the standards by reusing offsets
+	 * in seekdir() from different DIR *, but it works on Linux.
+	 *
+	 * On other systems it never worked, hence we do not need
+	 * to provide backward-compatibility.
+	 */
+#ifdef GF_LINUX_HOST_OS
+		fd_unref (fd);
+		fd = fd_anonymous (inode);
+		if (!fd)
+		        goto out;
+#else /* GF_LINUX_HOST_OS */
+		gf_log(this->name, GF_LOG_ERROR,
+		       "opendir of %s for %s failed: %s",
+		       uuid_utoa (index_gfid), subvol->name, strerror(errno));
+		fd_unref (fd);
+		fd = NULL;
+		goto out;
+#endif /* GF_LINUX_HOST_OS */
+	}
+
 out:
 	loc_wipe (&rootloc);
+
+	if (inode)
+		inode_unref (inode);
+
 	if (xattr)
 		dict_unref (xattr);
 	return fd;
@@ -273,7 +320,7 @@ afr_shd_selfheal_name (struct subvol_healer *healer, int child, uuid_t parent,
 {
 	int ret = -1;
 
-	ret = afr_selfheal_name (THIS, parent, bname);
+	ret = afr_selfheal_name (THIS, parent, bname, NULL);
 
 	return ret;
 }
@@ -298,39 +345,40 @@ afr_shd_selfheal (struct subvol_healer *healer, int child, uuid_t gfid)
 
 	subvol = priv->children[child];
 
+        //If this fails with ENOENT/ESTALE index is stale
+        ret = afr_shd_gfid_to_path (this, subvol, gfid, &path);
+        if (ret < 0)
+                return ret;
+
 	ret = afr_selfheal (this, gfid);
 
 	if (ret == -EIO) {
 		eh = shd->split_brain;
 		crawl_event->split_brain_count++;
 	} else if (ret < 0) {
-		eh = shd->heal_failed;
 		crawl_event->heal_failed_count++;
 	} else if (ret == 0) {
-		eh = shd->healed;
 		crawl_event->healed_count++;
 	}
-
-	afr_shd_gfid_to_path (this, subvol, gfid, &path);
-	if (!path)
-		return ret;
 
 	if (eh) {
 		shd_event = GF_CALLOC (1, sizeof(*shd_event),
 				       gf_afr_mt_shd_event_t);
-		if (!shd_event) {
-			GF_FREE (path);
-			return ret;
-		}
+		if (!shd_event)
+                        goto out;
 
 		shd_event->child = child;
 		shd_event->path = path;
 
-		if (eh_save_history (eh, shd_event) < 0) {
-			GF_FREE (shd_event);
-			GF_FREE (path);
-		}
+		if (eh_save_history (eh, shd_event) < 0)
+                        goto out;
+
+                shd_event = NULL;
+                path = NULL;
 	}
+out:
+        GF_FREE (shd_event);
+        GF_FREE (path);
 	return ret;
 }
 
@@ -381,7 +429,7 @@ afr_shd_index_sweep (struct subvol_healer *healer)
 	fd_t *fd = NULL;
 	xlator_t *subvol = NULL;
 	afr_private_t *priv = NULL;
-	off_t offset = 0;
+	uint64_t offset = 0;
 	gf_dirent_t entries;
 	gf_dirent_t *entry = NULL;
 	uuid_t gfid;
@@ -440,8 +488,12 @@ afr_shd_index_sweep (struct subvol_healer *healer)
 			break;
 	}
 
-	if (fd)
+	if (fd) {
+                if (fd->inode)
+                        inode_forget (fd->inode, 1);
 		fd_unref (fd);
+        }
+
 	if (!ret)
 		ret = count;
 	return ret;
@@ -451,11 +503,12 @@ afr_shd_index_sweep (struct subvol_healer *healer)
 int
 afr_shd_full_sweep (struct subvol_healer *healer, inode_t *inode)
 {
+	loc_t loc = {0, };
 	fd_t *fd = NULL;
 	xlator_t *this = NULL;
 	xlator_t *subvol = NULL;
 	afr_private_t *priv = NULL;
-	off_t offset = 0;
+	uint64_t offset = 0;
 	gf_dirent_t entries;
 	gf_dirent_t *entry = NULL;
 	int ret = 0;
@@ -464,9 +517,38 @@ afr_shd_full_sweep (struct subvol_healer *healer, inode_t *inode)
 	priv = this->private;
 	subvol = priv->children[healer->subvol];
 
-	fd = fd_anonymous (inode);
-	if (!fd)
-		return -errno;
+	uuid_copy (loc.gfid, inode->gfid);
+	loc.inode = inode_ref(inode);
+
+	fd = fd_create (inode, GF_CLIENT_PID_AFR_SELF_HEALD);
+	if (!fd) {
+		gf_log(this->name, GF_LOG_ERROR,
+		       "fd_create of %s failed: %s",
+		       uuid_utoa (loc.gfid), strerror(errno));
+		ret = -errno;
+		goto out;
+	}
+
+	ret = syncop_opendir (subvol, &loc, fd);
+	if (ret) {
+#ifdef GF_LINUX_HOST_OS /* See comment in afr_shd_index_opendir() */
+		fd_unref(fd);
+		fd = fd_anonymous (inode);
+		if (!fd) {
+			gf_log(this->name, GF_LOG_ERROR,
+			       "fd_anonymous of %s failed: %s",
+			       uuid_utoa (loc.gfid), strerror(errno));
+			ret = -errno;
+			goto out;
+		}
+#else /* GF_LINUX_HOST_OS */
+		gf_log(this->name, GF_LOG_ERROR,
+		       "opendir of %s failed: %s",
+		       uuid_utoa (loc.gfid), strerror(errno));
+		ret = -errno;
+		goto out;
+#endif /* GF_LINUX_HOST_OS */
+	}
 
 	INIT_LIST_HEAD (&entries.list);
 
@@ -508,6 +590,8 @@ afr_shd_full_sweep (struct subvol_healer *healer, inode_t *inode)
 			break;
 	}
 
+out:
+	loc_wipe (&loc);
 	if (fd)
 		fd_unref (fd);
 	return ret;
@@ -856,27 +940,38 @@ out:
 int
 afr_shd_gfid_to_path (xlator_t *this, xlator_t *subvol, uuid_t gfid, char **path_p)
 {
-	loc_t loc = {0,};
-	char *path = NULL;
-	dict_t *xattr = NULL;
-	int ret = 0;
+        int      ret   = 0;
+        char    *path  = NULL;
+        loc_t    loc   = {0,};
+        dict_t  *xattr = NULL;
 
 	uuid_copy (loc.gfid, gfid);
 	loc.inode = inode_new (this->itable);
 
-	ret = syncop_getxattr (subvol, &loc, &xattr, GFID_TO_PATH_KEY);
-	loc_wipe (&loc);
+	ret = syncop_getxattr (subvol, &loc, &xattr, GFID_TO_PATH_KEY, NULL);
 	if (ret)
-		return ret;
+		goto out;
 
 	ret = dict_get_str (xattr, GFID_TO_PATH_KEY, &path);
-	if (ret || !path)
-		return -EINVAL;
+	if (ret || !path) {
+		ret = -EINVAL;
+                goto out;
+        }
 
 	*path_p = gf_strdup (path);
-	if (!*path_p)
-		return -ENOMEM;
-	return 0;
+	if (!*path_p) {
+		ret = -ENOMEM;
+                goto out;
+        }
+
+	ret = 0;
+
+out:
+        if (xattr)
+                dict_unref (xattr);
+	loc_wipe (&loc);
+
+        return ret;
 }
 
 
@@ -886,7 +981,7 @@ afr_shd_gather_index_entries (xlator_t *this, int child, dict_t *output)
 	fd_t *fd = NULL;
 	xlator_t *subvol = NULL;
 	afr_private_t *priv = NULL;
-	off_t offset = 0;
+	uint64_t offset = 0;
 	gf_dirent_t entries;
 	gf_dirent_t *entry = NULL;
 	uuid_t gfid;
@@ -942,8 +1037,12 @@ afr_shd_gather_index_entries (xlator_t *this, int child, dict_t *output)
 			break;
 	}
 
-	if (fd)
+	if (fd) {
+                if (fd->inode)
+                        inode_forget (fd->inode, 1);
 		fd_unref (fd);
+        }
+
 	if (!ret)
 		ret = count;
 	return ret;
@@ -1040,16 +1139,6 @@ afr_selfheal_daemon_init (xlator_t *this)
 			goto out;
 	}
 
-	shd->healed = eh_new (AFR_EH_HEALED_LIMIT, _gf_false,
-			      afr_destroy_shd_event_data);
-        if (!shd->healed)
-		goto out;
-
-	shd->heal_failed = eh_new (AFR_EH_HEAL_FAIL_LIMIT, _gf_false,
-				   afr_destroy_shd_event_data);
-	if (!shd->heal_failed)
-		goto out;
-
 	shd->split_brain = eh_new (AFR_EH_SPLIT_BRAIN_LIMIT, _gf_false,
 				   afr_destroy_shd_event_data);
 	if (!shd->split_brain)
@@ -1087,12 +1176,11 @@ afr_selfheal_childup (xlator_t *this, int subvol)
 }
 
 
-int64_t
-afr_shd_get_index_count (xlator_t *this, int i)
+int
+afr_shd_get_index_count (xlator_t *this, int i, uint64_t *count)
 {
 	afr_private_t *priv = NULL;
 	xlator_t *subvol = NULL;
-	uint64_t count = 0;
 	loc_t rootloc = {0, };
 	dict_t *xattr = NULL;
 	int ret = -1;
@@ -1104,16 +1192,22 @@ afr_shd_get_index_count (xlator_t *this, int i)
 	uuid_copy (rootloc.gfid, rootloc.inode->gfid);
 
 	ret = syncop_getxattr (subvol, &rootloc, &xattr,
-			       GF_XATTROP_INDEX_COUNT);
+			       GF_XATTROP_INDEX_COUNT, NULL);
+	if (ret < 0)
+		goto out;
+
+	ret = dict_get_uint64 (xattr, GF_XATTROP_INDEX_COUNT, count);
+	if (ret)
+		goto out;
+
+        ret = 0;
+
+out:
+        if (xattr)
+                dict_unref (xattr);
 	loc_wipe (&rootloc);
 
-	if (ret < 0)
-		return -1;
-
-	ret = dict_get_uint64 (xattr, GF_XATTROP_INDEX_COUNT, &count);
-	if (ret)
-		return -1;
-	return count;
+	return ret;
 }
 
 
@@ -1129,7 +1223,7 @@ afr_xl_op (xlator_t *this, dict_t *input, dict_t *output)
 	int i = 0;
 	char key[64];
 	int op_ret = 0;
-	int64_t cnt = 0;
+	uint64_t cnt = 0;
 
 	priv = this->private;
 	shd = &priv->shd;
@@ -1153,7 +1247,7 @@ afr_xl_op (xlator_t *this, dict_t *input, dict_t *output)
 
 		for (i = 0; i < priv->child_count; i++) {
 			healer = &shd->index_healers[i];
-			snprintf (key, 64, "%d-%d-status", xl_id, i);
+			snprintf (key, sizeof (key), "%d-%d-status", xl_id, i);
 
 			if (!priv->child_up[i]) {
 				ret = dict_set_str (output, key,
@@ -1178,7 +1272,7 @@ afr_xl_op (xlator_t *this, dict_t *input, dict_t *output)
 
 		for (i = 0; i < priv->child_count; i++) {
 			healer = &shd->full_healers[i];
-			snprintf (key, 64, "%d-%d-status", xl_id, i);
+			snprintf (key, sizeof (key), "%d-%d-status", xl_id, i);
 
 			if (!priv->child_up[i]) {
 				ret = dict_set_str (output, key,
@@ -1204,10 +1298,12 @@ afr_xl_op (xlator_t *this, dict_t *input, dict_t *output)
 				afr_shd_gather_index_entries (this, i, output);
                 break;
         case GF_AFR_OP_HEALED_FILES:
-		eh_dump (shd->healed, output, afr_add_shd_event);
-                break;
         case GF_AFR_OP_HEAL_FAILED_FILES:
-		eh_dump (shd->heal_failed, output, afr_add_shd_event);
+                for (i = 0; i < priv->child_count; i++) {
+                        snprintf (key, sizeof (key), "%d-%d-status", xl_id, i);
+                        ret = dict_set_str (output, key, "Operation Not "
+                                            "Supported");
+                }
                 break;
         case GF_AFR_OP_SPLIT_BRAIN_FILES:
 		eh_dump (shd->split_brain, output, afr_add_shd_event);
@@ -1228,13 +1324,15 @@ afr_xl_op (xlator_t *this, dict_t *input, dict_t *output)
 
 		for (i = 0; i < priv->child_count; i++) {
 			if (!priv->child_up[i]) {
-				snprintf (key, 64, "%d-%d-status", xl_id, i);
+				snprintf (key, sizeof (key), "%d-%d-status",
+                                          xl_id, i);
 				ret = dict_set_str (output, key,
 						    "Brick is not connected");
 			} else {
-				snprintf (key, 64, "%d-%d-hardlinks", xl_id, i);
-				cnt = afr_shd_get_index_count (this, i);
-				if (cnt >= 0) {
+				snprintf (key, sizeof (key), "%d-%d-hardlinks",
+                                          xl_id, i);
+				ret = afr_shd_get_index_count (this, i, &cnt);
+				if (ret == 0) {
 					ret = dict_set_uint64 (output, key, cnt);
 				}
 				op_ret = 0;

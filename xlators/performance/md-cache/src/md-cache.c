@@ -18,6 +18,7 @@
 #include "dict.h"
 #include "xlator.h"
 #include "md-cache-mem-types.h"
+#include "compat-errno.h"
 #include "glusterfs-acl.h"
 #include <assert.h>
 #include <sys/time.h>
@@ -410,9 +411,13 @@ mdc_inode_iatt_set_validate(xlator_t *this, inode_t *inode, struct iatt *prebuf,
 		 */
 		if (IA_ISREG(inode->ia_type) &&
 		    ((iatt->ia_mtime != mdc->md_mtime) ||
-		    (iatt->ia_ctime != mdc->md_ctime)))
+		    (iatt->ia_mtime_nsec != mdc->md_mtime_nsec) ||
+		    (iatt->ia_ctime != mdc->md_ctime) ||
+		    (iatt->ia_ctime_nsec != mdc->md_ctime_nsec)))
 			if (!prebuf || (prebuf->ia_ctime != mdc->md_ctime) ||
-			    (prebuf->ia_mtime != mdc->md_mtime))
+			    (prebuf->ia_ctime_nsec != mdc->md_ctime_nsec) ||
+			    (prebuf->ia_mtime != mdc->md_mtime) ||
+			    (prebuf->ia_mtime_nsec != mdc->md_mtime_nsec))
 				inode_invalidate(inode);
 
                 mdc_from_iatt (mdc, iatt);
@@ -484,6 +489,25 @@ updatefn(dict_t *dict, char *key, data_t *value, void *data)
 				return -1;
 			}
 		}
+
+                /* posix xlator as part of listxattr will send both names
+                 * and values of the xattrs in the dict. But as per man page
+                 * listxattr is mainly supposed to send names of the all the
+                 * xattrs. gfapi, as of now will put all the keys it obtained
+                 * in the dict (sent by posix) into a buffer provided by the
+                 * caller (thus the values of those xattrs are lost). If some
+                 * xlator makes gfapi based calls (ex: snapview-server), then
+                 * it has to unwind the calls by putting those names it got
+                 * in the buffer again into the dict. But now it would not be
+                 * having the values for those xattrs. So it might just put
+                 * a 0 byte value ("") into the dict for each xattr and unwind
+                 * the call. So the xlators which cache the xattrs (as of now
+                 * md-cache caches the acl and selinux related xattrs), should
+                 * not update their cache if the value of a xattr is a 0 byte
+                 * data (i.e. "").
+                 */
+                if (!strcmp (value->data, ""))
+                        continue;
 
 		if (dict_set(u->dict, key, value) < 0) {
 			u->ret = -1;
@@ -598,7 +622,7 @@ mdc_inode_xatt_unset (xlator_t *this, inode_t *inode, char *name)
         if (!mdc)
                 goto out;
 
-        if (!name)
+        if (!name || !mdc->xattr)
                 goto out;
 
         LOCK (&mdc->lock);
@@ -1435,7 +1459,7 @@ mdc_readv_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         local = frame->local;
 
-        if (op_ret != 0)
+        if (op_ret < 0)
                 goto out;
 
         if (!local)

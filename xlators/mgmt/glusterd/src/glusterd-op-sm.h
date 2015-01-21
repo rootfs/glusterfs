@@ -31,7 +31,6 @@
 #include "glusterd.h"
 #include "protocol-common.h"
 
-#define GD_VOLUME_NAME_MAX 256
 #define GD_OP_PROTECTED    (0x02)
 #define GD_OP_UNPROTECTED  (0x04)
 
@@ -286,7 +285,8 @@ glusterd_are_all_volumes_stopped ();
 int
 glusterd_stop_bricks (glusterd_volinfo_t *volinfo);
 int
-gsync_status (char *master, char *slave, char *conf_path, int *status);
+gsync_status (char *master, char *slave, char *conf_path,
+              int *status, gf_boolean_t *is_template_in_use);
 
 int
 glusterd_check_gsync_running (glusterd_volinfo_t *volinfo, gf_boolean_t *flag);
@@ -311,4 +311,6 @@ glusterd_clear_txn_opinfo (uuid_t *txn_id);
 int32_t
 glusterd_generate_txn_id (dict_t *dict, uuid_t **txn_id);
 
+void
+glusterd_set_opinfo (char *errstr, int32_t op_errno, int32_t op_ret);
 #endif

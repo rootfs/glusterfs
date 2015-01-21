@@ -188,7 +188,7 @@ set).
 
     For example, to remove server2:/exp2:
 
-        # gluster volume remove-brick test-volume server2:/exp2
+        # gluster volume remove-brick test-volume server2:/exp2 force
 
         Removing brick(s) can result in data loss. Do you want to Continue? (y/n)
 
@@ -267,7 +267,7 @@ cluster is online and available.
     For example, to pause the data migration from server3:/exp3 to
     server5:/exp5 in test-volume:
 
-        # gluster volume replace-brick test-volume server3:/exp3 server5:exp5 pause
+        # gluster volume replace-brick test-volume server3:/exp3 server5:/exp5 pause
         Replace brick pause operation successful
 
 4.  To abort the migration operation, if needed, use the following
@@ -365,6 +365,12 @@ still be distributed only among the old bricks. The
 layout information so that the files can also go to newly added nodes.
 When this command is issued, all the file stat information which is
 already cached will get revalidated.
+
+As of GlusterFS 3.6, the assignment of files to bricks will take into account
+the sizes of the bricks.  For example, a 20TB brick will be assigned twice as
+many files as a 10TB brick.  In versions before 3.6, the two bricks were
+treated as equal regardless of size, and would have been assigned an equal
+share of files.
 
 A fix-layout rebalance will only fix the layout changes and does not
 migrate data. If you want to migrate the existing data,

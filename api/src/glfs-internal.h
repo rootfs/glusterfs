@@ -18,6 +18,38 @@
 
 #define DEFAULT_REVAL_COUNT 1
 
+#ifndef GF_DARWIN_HOST_OS
+#ifndef GFAPI_PUBLIC
+#define GFAPI_PUBLIC(sym, ver) /**/
+#endif
+#ifndef GFAPI_PRIVATE
+#define GFAPI_PRIVATE(sym, ver) /**/
+#endif
+#define GFAPI_SYMVER_PUBLIC_DEFAULT(fn, ver) \
+        asm(".symver pub_"STR(fn)", "STR(fn)"@@GFAPI_"STR(ver))
+
+#define GFAPI_SYMVER_PRIVATE_DEFAULT(fn, ver) \
+        asm(".symver priv_"STR(fn)", "STR(fn)"@@GFAPI_PRIVATE_"STR(ver))
+
+#define GFAPI_SYMVER_PUBLIC(fn1, fn2, ver) \
+        asm(".symver pub_"STR(fn1)", "STR(fn2)"@@GFAPI_"STR(ver))
+
+#define GFAPI_SYMVER_PRIVATE(fn1, fn2, ver) \
+        asm(".symver priv_"STR(fn1)", "STR(fn2)"@@GFAPI_PRIVATE_"STR(ver))
+#define STR(str) #str
+#else
+#ifndef GFAPI_PUBLIC
+#define GFAPI_PUBLIC(sym, ver) __asm("_" __STRING(sym) "$GFAPI_" __STRING(ver))
+#endif
+#ifndef GFAPI_PRIVATE
+#define GFAPI_PRIVATE(sym, ver) __asm("_" __STRING(sym) "$GFAPI_PRIVATE_" __STRING(ver))
+#endif
+#define GFAPI_SYMVER_PUBLIC_DEFAULT(fn, dotver) /**/
+#define GFAPI_SYMVER_PRIVATE_DEFAULT(fn, dotver) /**/
+#define GFAPI_SYMVER_PUBLIC(fn1, fn2, dotver) /**/
+#define GFAPI_SYMVER_PRIVATE(fn1, fn2, dotver) /**/
+#endif
+
 /*
  * syncop_xxx() calls are executed in two ways, one is inside a synctask where
  * the executing function will do 'swapcontext' and the other is without
@@ -80,6 +112,7 @@ typedef int (*glfs_init_cbk) (struct glfs *fs, int ret);
 
 struct glfs {
 	char               *volname;
+        uuid_t              vol_uuid;
 
 	glusterfs_ctx_t    *ctx;
 
@@ -88,6 +121,7 @@ struct glfs {
 	glfs_init_cbk       init_cbk;
 	pthread_mutex_t     mutex;
 	pthread_cond_t      cond;
+        pthread_cond_t      child_down_cond; /* for broadcasting CHILD_DOWN */
 	int                 init;
 	int                 ret;
 	int                 err;
@@ -131,11 +165,15 @@ struct glfs_object {
 #define GF_MEMPOOL_COUNT_OF_DATA_T        (GF_MEMPOOL_COUNT_OF_DICT_T * 4)
 #define GF_MEMPOOL_COUNT_OF_DATA_PAIR_T   (GF_MEMPOOL_COUNT_OF_DICT_T * 4)
 
+#define GF_MEMPOOL_COUNT_OF_LRU_BUF_T     256
+
 int glfs_mgmt_init (struct glfs *fs);
-void glfs_init_done (struct glfs *fs, int ret);
+void glfs_init_done (struct glfs *fs, int ret)
+        GFAPI_PRIVATE(glfs_init_done, 3.4.0);
 int glfs_process_volfp (struct glfs *fs, FILE *fp);
-int glfs_resolve (struct glfs *fs, xlator_t *subvol, const char *path, loc_t *loc,
-		  struct iatt *iatt, int reval);
+int glfs_resolve (struct glfs *fs, xlator_t *subvol, const char *path,
+                       loc_t *loc, struct iatt *iatt, int reval)
+        GFAPI_PRIVATE(glfs_resolve, 3.7.0);
 int glfs_lresolve (struct glfs *fs, xlator_t *subvol, const char *path, loc_t *loc,
 		   struct iatt *iatt, int reval);
 fd_t *glfs_resolve_fd (struct glfs *fs, xlator_t *subvol, struct glfs_fd *glfd);
@@ -194,11 +232,13 @@ void glfs_fd_destroy (struct glfs_fd *glfd);
 struct glfs_fd *glfs_fd_new (struct glfs *fs);
 void glfs_fd_bind (struct glfs_fd *glfd);
 
-xlator_t * glfs_active_subvol (struct glfs *fs);
-xlator_t * __glfs_active_subvol (struct glfs *fs);
-void glfs_subvol_done (struct glfs *fs, xlator_t *subvol);
+xlator_t *glfs_active_subvol (struct glfs *fs)
+        GFAPI_PRIVATE(glfs_active_subvol, 3.4.0);
+xlator_t *__glfs_active_subvol (struct glfs *fs);
+void glfs_subvol_done (struct glfs *fs, xlator_t *subvol)
+        GFAPI_PRIVATE(glfs_subvol_done, 3.4.0);
 
-inode_t * glfs_refresh_inode (xlator_t *subvol, inode_t *inode);
+inode_t *glfs_refresh_inode (xlator_t *subvol, inode_t *inode);
 
 inode_t *glfs_cwd_get (struct glfs *fs);
 int glfs_cwd_set (struct glfs *fs, inode_t *inode);
@@ -210,14 +250,73 @@ int __glfs_cwd_set (struct glfs *fs, inode_t *inode);
 int glfs_resolve_base (struct glfs *fs, xlator_t *subvol, inode_t *inode,
 		       struct iatt *iatt);
 int glfs_resolve_at (struct glfs *fs, xlator_t *subvol, inode_t *at,
-                     const char *origpath, loc_t *loc, struct iatt *iatt,
-                     int follow, int reval);
-int glfs_loc_touchup (loc_t *loc);
+                          const char *origpath, loc_t *loc, struct iatt *iatt,
+                          int follow, int reval)
+        GFAPI_PRIVATE(glfs_resolve_at, 3.4.0);
+int glfs_loc_touchup (loc_t *loc)
+	GFAPI_PRIVATE(glfs_loc_touchup, 3.4.0);
 void glfs_iatt_to_stat (struct glfs *fs, struct iatt *iatt, struct stat *stat);
 int glfs_loc_link (loc_t *loc, struct iatt *iatt);
 int glfs_loc_unlink (loc_t *loc);
-dict_t * dict_for_key_value (const char *name, const char *value, size_t size);
+dict_t *dict_for_key_value (const char *name, const char *value, size_t size);
 int glfs_getxattr_process (void *value, size_t size, dict_t *xattr,
 			   const char *name);
+
+/* Sends RPC call to glusterd to fetch required volume info */
+int glfs_get_volume_info (struct glfs *fs);
+
+/*
+  SYNOPSIS
+
+       glfs_new_from_ctx: Creates a virtual mount object by taking a
+       glusterfs_ctx_t object.
+
+  DESCRIPTION
+
+       glfs_new_from_ctx() is not same as glfs_new(). It takes the
+       glusterfs_ctx_t object instead of creating one by glusterfs_ctx_new().
+       Again the usage is restricted to NFS MOUNT over UDP i.e. in
+       glfs_resolve_at() which would take fs object as input but never use
+       (purpose is not to change the ABI of glfs_resolve_at()).
+
+  PARAMETERS
+
+       @ctx: glusterfs_ctx_t object
+
+  RETURN VALUES
+
+       fs     : Pointer to the newly created glfs_t object.
+       NULL   : Otherwise.
+*/
+
+struct glfs *glfs_new_from_ctx (glusterfs_ctx_t *ctx)
+        GFAPI_PRIVATE(glfs_new_from_ctx, 3.7.0);
+
+/*
+  SYNOPSIS
+
+       glfs_free_from_ctx: Free up the memory occupied by glfs_t object
+       created by glfs_new_from_ctx().
+
+  DESCRIPTION
+
+       The glfs_t object allocated by glfs_new_from_ctx() must be released
+       by the caller using this routine. The usage is restricted to NFS
+       MOUNT over UDP i.e.
+       __mnt3udp_get_export_subdir_inode ()
+                                => glfs_resolve_at().
+
+  PARAMETERS
+
+       @fs: The glfs_t object to be deallocated.
+
+  RETURN VALUES
+
+       void
+*/
+
+void glfs_free_from_ctx (struct glfs *fs)
+         GFAPI_PRIVATE(glfs_free_from_ctx, 3.7.0);
+
 
 #endif /* !_GLFS_INTERNAL_H */

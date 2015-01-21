@@ -36,9 +36,9 @@ dht_open_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         local->op_errno = op_errno;
         if ((op_ret == -1) && !dht_inode_missing(op_errno)) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "subvolume %s returned -1 (%s)",
-                        prev->this->name, strerror (op_errno));
+                gf_msg_debug (this->name, 0,
+                              "subvolume %s returned -1 (%s)",
+                              prev->this->name, strerror (op_errno));
                 goto out;
         }
 
@@ -105,8 +105,8 @@ dht_open (call_frame_t *frame, xlator_t *this,
 
         subvol = local->cached_subvol;
         if (!subvol) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "no cached subvolume for fd=%p", fd);
+                gf_msg_debug (this->name, 0,
+                              "no cached subvolume for fd=%p", fd);
                 op_errno = EINVAL;
                 goto err;
         }
@@ -146,9 +146,9 @@ dht_file_attr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         if ((op_ret == -1) && !dht_inode_missing(op_errno)) {
                 local->op_errno = op_errno;
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "subvolume %s returned -1 (%s)",
-                        prev->this->name, strerror (op_errno));
+                gf_msg_debug (this->name, 0,
+                              "subvolume %s returned -1 (%s)",
+                              prev->this->name, strerror (op_errno));
                 goto out;
         }
 
@@ -233,9 +233,9 @@ dht_attr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         {
                 if (op_ret == -1) {
                         local->op_errno = op_errno;
-                        gf_log (this->name, GF_LOG_DEBUG,
-                                "subvolume %s returned -1 (%s)",
-                                prev->this->name, strerror (op_errno));
+                        gf_msg_debug (this->name, 0,
+                                      "subvolume %s returned -1 (%s)",
+                                      prev->this->name, strerror (op_errno));
 
                         goto unlock;
                 }
@@ -281,8 +281,8 @@ dht_stat (call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *xdata)
 
         layout = local->layout;
         if (!layout) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "no layout for path=%s", loc->path);
+                gf_msg_debug (this->name, 0,
+                              "no layout for path=%s", loc->path);
                 op_errno = EINVAL;
                 goto err;
         }
@@ -341,8 +341,8 @@ dht_fstat (call_frame_t *frame, xlator_t *this, fd_t *fd, dict_t *xdata)
 
         layout = local->layout;
         if (!layout) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "no layout for fd=%p", fd);
+                gf_msg_debug (this->name, 0,
+                              "no layout for fd=%p", fd);
                 op_errno = EINVAL;
                 goto err;
         }
@@ -475,8 +475,8 @@ dht_readv (call_frame_t *frame, xlator_t *this,
 
         subvol = local->cached_subvol;
         if (!subvol) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "no cached subvolume for fd=%p", fd);
+                gf_msg_debug (this->name, 0,
+                              "no cached subvolume for fd=%p", fd);
                 op_errno = EINVAL;
                 goto err;
         }
@@ -515,9 +515,9 @@ dht_access_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                 goto out;
         if (local->call_cnt != 1)
                 goto out;
-        if ((op_ret == -1) && (op_errno == ENOTCONN) &&
-            IA_ISDIR(local->loc.inode->ia_type)) {
-
+        if ((op_ret == -1) && ((op_errno == ENOTCONN) ||
+                dht_inode_missing(op_errno)) &&
+                IA_ISDIR(local->loc.inode->ia_type)) {
                 subvol = dht_subvol_next_available (this, prev->this);
                 if (!subvol)
                         goto out;
@@ -531,7 +531,8 @@ dht_access_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                             &local->loc, local->rebalance.flags, NULL);
                 return 0;
         }
-        if ((op_ret == -1) && dht_inode_missing(op_errno)) {
+        if ((op_ret == -1) && dht_inode_missing(op_errno) &&
+                !(IA_ISDIR(local->loc.inode->ia_type))) {
                 /* File would be migrated to other node */
                 local->op_errno = op_errno;
                 local->rebalance.target_op_fn = dht_access2;
@@ -598,8 +599,8 @@ dht_access (call_frame_t *frame, xlator_t *this, loc_t *loc, int32_t mask,
         local->call_cnt = 1;
         subvol = local->cached_subvol;
         if (!subvol) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "no cached subvolume for path=%s", loc->path);
+                gf_msg_debug (this->name, 0,
+                              "no cached subvolume for path=%s", loc->path);
                 op_errno = EINVAL;
                 goto err;
         }
@@ -686,8 +687,8 @@ dht_flush (call_frame_t *frame, xlator_t *this, fd_t *fd, dict_t *xdata)
 
         subvol = local->cached_subvol;
         if (!subvol) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "no cached subvolume for fd=%p", fd);
+                gf_msg_debug (this->name, 0,
+                              "no cached subvolume for fd=%p", fd);
                 op_errno = EINVAL;
                 goto err;
         }
@@ -723,9 +724,9 @@ dht_fsync_cbk (call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
 
         local->op_errno = op_errno;
         if (op_ret == -1 && !dht_inode_missing(op_errno)) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "subvolume %s returned -1 (%s)",
-                        prev->this->name, strerror (op_errno));
+                gf_msg_debug (this->name, 0,
+                              "subvolume %s returned -1 (%s)",
+                              prev->this->name, strerror (op_errno));
                 goto out;
         }
 
@@ -854,8 +855,8 @@ dht_lk (call_frame_t *frame, xlator_t *this,
 
         subvol = dht_subvol_get_cached (this, fd->inode);
         if (!subvol) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "no cached subvolume for fd=%p", fd);
+                gf_msg_debug (this->name, 0,
+                              "no cached subvolume for fd=%p", fd);
                 op_errno = EINVAL;
                 goto err;
         }
@@ -920,8 +921,8 @@ dht_readlink (call_frame_t *frame, xlator_t *this, loc_t *loc, size_t size,
 
         subvol = local->cached_subvol;
         if (!subvol) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "no cached subvolume for path=%s", loc->path);
+                gf_msg_debug (this->name, 0,
+                              "no cached subvolume for path=%s", loc->path);
                 op_errno = EINVAL;
                 goto err;
         }
@@ -974,8 +975,8 @@ dht_xattrop (call_frame_t *frame, xlator_t *this, loc_t *loc,
 
         subvol = local->cached_subvol;
         if (!subvol) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "no cached subvolume for path=%s", loc->path);
+                gf_msg_debug (this->name, 0,
+                              "no cached subvolume for path=%s", loc->path);
                 op_errno = EINVAL;
                 goto err;
         }
@@ -1019,8 +1020,8 @@ dht_fxattrop (call_frame_t *frame, xlator_t *this,
 
         subvol = dht_subvol_get_cached (this, fd->inode);
         if (!subvol) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "no cached subvolume for fd=%p", fd);
+                gf_msg_debug (this->name, 0,
+                              "no cached subvolume for fd=%p", fd);
                 op_errno = EINVAL;
                 goto err;
         }
@@ -1073,8 +1074,8 @@ dht_inodelk (call_frame_t *frame, xlator_t *this, const char *volume,
 
         subvol = local->cached_subvol;
         if (!subvol) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "no cached subvolume for path=%s", loc->path);
+                gf_msg_debug (this->name, 0,
+                              "no cached subvolume for path=%s", loc->path);
                 op_errno = EINVAL;
                 goto err;
         }
@@ -1119,8 +1120,8 @@ dht_finodelk (call_frame_t *frame, xlator_t *this, const char *volume,
 
         subvol = dht_subvol_get_cached (this, fd->inode);
         if (!subvol) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "no cached subvolume for fd=%p", fd);
+                gf_msg_debug (this->name, 0,
+                              "no cached subvolume for fd=%p", fd);
                 op_errno = EINVAL;
                 goto err;
         }

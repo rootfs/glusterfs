@@ -289,7 +289,7 @@ runner_start (runner_t *runner)
                                 closedir (d);
                         } else
                                 ret = -1;
-#else
+#else /* !GF_LINUX_HOST_OS */
                         struct rlimit rl;
                         ret = getrlimit (RLIMIT_NOFILE, &rl);
                         GF_ASSERT (ret == 0);
@@ -298,7 +298,7 @@ runner_start (runner_t *runner)
                                 if (i != xpi[1])
                                         close (i);
                         }
-#endif
+#endif /* !GF_LINUX_HOST_OS */
                 }
 
                 if (ret != -1) {

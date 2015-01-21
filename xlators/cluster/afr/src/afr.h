@@ -26,6 +26,7 @@
 #include "syncop.h"
 
 #include "afr-self-heald.h"
+#include "afr-messages.h"
 
 #define AFR_XATTR_PREFIX "trusted.afr"
 #define AFR_PATHINFO_HEADER "REPLICATE:"
@@ -49,6 +50,7 @@ typedef int (*afr_changelog_resume_t) (call_frame_t *frame, xlator_t *this);
 #define alloca0(size) ({void *__ptr; __ptr = alloca(size); memset(__ptr, 0, size); __ptr;})
 #define AFR_COUNT(array,max) ({int __i; int __res = 0; for (__i = 0; __i < max; __i++) if (array[__i]) __res++; __res;})
 #define AFR_INTERSECT(dst,src1,src2,max) ({int __i; for (__i = 0; __i < max; __i++) dst[__i] = src1[__i] && src2[__i];})
+#define AFR_CMP(a1,a2,len) ({int __cmp = 0; int __i; for (__i = 0; __i < len; __i++) if (a1[__i] != a2[__i]) { __cmp = 1; break;} __cmp;})
 
 typedef struct _afr_private {
         gf_lock_t lock;               /* to guard access to child_count, etc */
@@ -185,6 +187,18 @@ afr_index_for_transaction_type (afr_transaction_type type)
         return -1;  /* make gcc happy */
 }
 
+static inline int
+afr_index_from_ia_type (ia_type_t type)
+{
+        switch (type) {
+        case IA_IFDIR:
+                return afr_index_for_transaction_type (AFR_ENTRY_TRANSACTION);
+        case IA_IFREG:
+                return afr_index_for_transaction_type (AFR_DATA_TRANSACTION);
+        default: return -1;
+        }
+}
+
 typedef struct {
         loc_t                   loc;
         char                    *basename;
@@ -287,6 +301,12 @@ typedef struct {
 
 	/* list of frames currently in progress */
 	struct list_head  eager_locked;
+
+	/* the subvolume on which the latest sequence of readdirs (starting
+	   at offset 0) has begun. Till the next readdir request with 0 offset
+	   arrives, we continue to read off this subvol.
+	*/
+	int readdir_subvol;
 } afr_fd_ctx_t;
 
 
@@ -416,6 +436,11 @@ typedef struct _afr_local {
         */
 
         struct {
+                struct {
+                        gf_boolean_t needs_fresh_lookup;
+                        uuid_t gfid_req;
+                } lookup;
+
                 struct {
                         unsigned char buf_set;
                         struct statvfs buf;
@@ -597,6 +622,11 @@ typedef struct _afr_local {
                         struct iatt postbuf;
                 } zerofill;
 
+                struct {
+                        char *volume;
+                        int32_t cmd;
+                        struct gf_flock flock;
+                } inodelk;
 
         } cont;
 
@@ -757,6 +787,9 @@ int32_t
 afr_notify (xlator_t *this, int32_t event, void *data, void *data2);
 
 int
+xattr_is_equal (dict_t *this, char *key1, data_t *value1, void *data);
+
+int
 afr_init_entry_lockee (afr_entry_lockee_t *lockee, afr_local_t *local,
                        loc_t *loc, char *basename, int child_count);
 
@@ -814,7 +847,7 @@ int
 afr_replies_interpret (call_frame_t *frame, xlator_t *this, inode_t *inode);
 
 void
-afr_replies_wipe (afr_local_t *local, afr_private_t *priv);
+afr_local_replies_wipe (afr_local_t *local, afr_private_t *priv);
 
 void
 afr_local_cleanup (afr_local_t *local, xlator_t *this);
@@ -870,7 +903,21 @@ afr_cleanup_fd_ctx (xlator_t *this, fd_t *fd);
 		frame->local = NULL; };				       \
 	frame->local;})
 
-#define AFR_STACK_RESET(frame) do { int opr; STACK_RESET (frame->root); AFR_FRAME_INIT(frame, opr);} while (0)
+#define AFR_STACK_RESET(frame)                                         \
+        do {                                                           \
+                afr_local_t *__local = NULL;                           \
+                xlator_t    *__this = NULL;                            \
+                __local = frame->local;                                \
+                __this = frame->this;                                  \
+                frame->local = NULL;                                   \
+                int __opr;                                             \
+                STACK_RESET (frame->root);                             \
+                if (__local) {                                         \
+                        afr_local_cleanup (__local, __this);           \
+                        mem_put (__local);                             \
+                }                                                      \
+                AFR_FRAME_INIT (frame, __opr);                         \
+        } while (0)
 
 /* allocate and return a string that is the basename of argument */
 static inline char *
@@ -922,14 +969,15 @@ int
 afr_child_fd_ctx_set (xlator_t *this, fd_t *fd, int32_t child,
                       int flags);
 
-gf_boolean_t
-afr_have_quorum (char *logname, afr_private_t *priv);
-
 void
 afr_matrix_cleanup (int32_t **pending, unsigned int m);
 
 int32_t**
 afr_matrix_create (unsigned int m, unsigned int n);
+
+int**
+afr_mark_pending_changelog (afr_private_t *priv, unsigned char *pending,
+                            dict_t *xattr, ia_type_t iat);
 
 void
 afr_filter_xattrs (dict_t *xattr);
@@ -939,19 +987,6 @@ afr_filter_xattrs (dict_t *xattr);
  * a fixed value (including zero to turn off quorum enforcement).
  */
 #define AFR_QUORUM_AUTO INT_MAX
-
-/*
- * Having this as a macro will make debugging a bit weirder, but does reduce
- * the probability of functions handling this check inconsistently.
- */
-#define QUORUM_CHECK(_func,_label) do {                                  \
-        if (priv->quorum_count && !afr_have_quorum(this->name,priv)) { \
-                gf_log(this->name,GF_LOG_WARNING,                        \
-                       "failing "#_func" due to lack of quorum");        \
-                op_errno = EROFS;                                        \
-                goto _label;                                             \
-        }                                                                \
-} while (0);
 
 int
 afr_fd_report_unstable_write (xlator_t *this, fd_t *fd);
@@ -973,4 +1008,21 @@ afr_local_pathinfo (char *pathinfo, gf_boolean_t *is_local);
 
 void
 afr_remove_eager_lock_stub (afr_local_t *local);
+
+void
+afr_replies_wipe (struct afr_reply *replies, int count);
+
+gf_boolean_t
+afr_xattrs_are_equal (dict_t *dict1, dict_t *dict2);
+
+gf_boolean_t
+afr_is_xattr_ignorable (char *key);
+
+int
+afr_get_heal_info (call_frame_t *frame, xlator_t *this, loc_t *loc,
+                   dict_t *xdata);
+
+int
+afr_heal_splitbrain_file(call_frame_t *frame, xlator_t *this, loc_t *loc);
+
 #endif /* __AFR_H__ */

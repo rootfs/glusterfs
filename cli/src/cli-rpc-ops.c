@@ -59,9 +59,11 @@ char *cli_vol_type_str[] = {"Distribute",
                             "Stripe",
                             "Replicate",
                             "Striped-Replicate",
+                            "Disperse",
                             "Distributed-Stripe",
                             "Distributed-Replicate",
                             "Distributed-Striped-Replicate",
+                            "Distributed-Disperse",
                            };
 
 char *cli_vol_status_str[] = {"Created",
@@ -80,6 +82,9 @@ char *cli_vol_task_status_str[] = {"not started",
                                    "fix-layout failed",
                                    "unknown"
 };
+
+int32_t
+gf_cli_snapshot (call_frame_t *frame, xlator_t *this, void *data);
 
 int32_t
 gf_cli_get_volume (call_frame_t *frame, xlator_t *this,
@@ -210,6 +215,31 @@ out:
 }
 
 int
+gf_cli_output_peer_hostnames (dict_t *dict, int count, char *prefix)
+{
+        int ret = -1;
+        char key[256] = {0,};
+        int i = 0;
+        char *hostname = NULL;
+
+        cli_out ("Other names:");
+        /* Starting from friend.hostname1, as friend.hostname0 will be the same
+         * as friend.hostname
+         */
+        for (i = 1; i < count; i++) {
+                memset (key, 0, sizeof (key));
+                snprintf (key, sizeof (key), "%s.hostname%d", prefix, i);
+                ret = dict_get_str (dict, key, &hostname);
+                if (ret)
+                        break;
+                cli_out ("%s", hostname);
+                hostname = NULL;
+        }
+
+        return ret;
+}
+
+int
 gf_cli_output_peer_status (dict_t *dict, int count)
 {
         int                        ret   = -1;
@@ -220,6 +250,7 @@ gf_cli_output_peer_status (dict_t *dict, int count)
         char                       *state = NULL;
         int32_t                    connected = 0;
         char                       *connected_str = NULL;
+        int                        hostname_count = 0;
 
         cli_out ("Number of Peers: %d", count);
         i = 1;
@@ -251,6 +282,19 @@ gf_cli_output_peer_status (dict_t *dict, int count)
 
                 cli_out ("\nHostname: %s\nUuid: %s\nState: %s (%s)",
                          hostname_buf, uuid_buf, state, connected_str);
+
+                memset (key, 0, sizeof (key));
+                snprintf (key, sizeof (key), "friend%d.hostname_count", i);
+                ret = dict_get_int32 (dict, key, &hostname_count);
+                /* Print other addresses only if there are more than 1.
+                 */
+                if ((ret == 0) && (hostname_count > 1)) {
+                        memset (key, 0, sizeof (key));
+                        snprintf (key, sizeof (key), "friend%d", i);
+                        ret = gf_cli_output_peer_hostnames (dict,
+                                                            hostname_count,
+                                                            key);
+                }
                 i++;
         }
 
@@ -262,17 +306,34 @@ out:
 int
 gf_cli_output_pool_list (dict_t *dict, int count)
 {
-        int                        ret   = -1;
-        char                       *uuid_buf = NULL;
-        char                       *hostname_buf = NULL;
-        int32_t                    i = 1;
-        char                       key[256] = {0,};
-        int32_t                    connected = 0;
+        int                         ret           = -1;
+        char                       *uuid_buf      = NULL;
+        char                       *hostname_buf  = NULL;
+        int32_t                     hostname_len  = 8; /*min len 8 chars*/
+        int32_t                     i             = 1;
+        char                        key[256]      = {0,};
+        int32_t                     connected     = 0;
         char                       *connected_str = NULL;
 
-        if (count >= 1)
-                cli_out ("UUID\t\t\t\t\tHostname\tState");
+        if (count <= 0)
+                goto out;
 
+        while (i <= count) {
+                snprintf (key, 256, "friend%d.hostname", i);
+                ret = dict_get_str (dict, key, &hostname_buf);
+                if (ret)
+                        goto out;
+
+                ret = strlen(hostname_buf);
+                if (ret > hostname_len)
+                        hostname_len = ret;
+
+                i++;
+        }
+
+        cli_out ("UUID\t\t\t\t\t%-*s\tState", hostname_len, "Hostname");
+
+        i = 1;
         while ( i <= count) {
                 snprintf (key, 256, "friend%d.uuid", i);
                 ret = dict_get_str (dict, key, &uuid_buf);
@@ -293,7 +354,7 @@ gf_cli_output_pool_list (dict_t *dict, int count)
                 else
                         connected_str = "Disconnected";
 
-                cli_out ("%s\t%-9s\t%s ", uuid_buf, hostname_buf,
+                cli_out ("%s\t%-*s\t%s ", uuid_buf, hostname_len, hostname_buf,
                          connected_str);
                 i++;
         }
@@ -498,6 +559,8 @@ gf_cli_get_volume_cbk (struct rpc_req *req, struct iovec *iov,
         int32_t                    dist_count           = 0;
         int32_t                    stripe_count         = 0;
         int32_t                    replica_count        = 0;
+        int32_t                    disperse_count       = 0;
+        int32_t                    redundancy_count     = 0;
         int32_t                    vol_type             = 0;
         int32_t                    transport            = 0;
         char                      *volume_id_str        = NULL;
@@ -510,9 +573,6 @@ gf_cli_get_volume_cbk (struct rpc_req *req, struct iovec *iov,
         gf_cli_rsp                 rsp                  = {0};
         char                      *caps                 = NULL;
         int                        k __attribute__((unused)) = 0;
-        /* snap_volume variable helps in showing whether a volume is a normal
-         * volume or a volume for the snapshot */
-        int32_t                    snap_volume          = 0;
 
         if (-1 == req->rpc_status)
                 goto out;
@@ -634,11 +694,6 @@ xml_output:
                 if (ret)
                         goto out;
 
-                snprintf (key, sizeof (key), "volume%d.snap_volume", i);
-                ret = dict_get_int32 (dict, key, &snap_volume);
-                if (ret)
-                        goto out;
-
                 snprintf (key, 256, "volume%d.brick_count", i);
                 ret = dict_get_int32 (dict, key, &brick_count);
                 if (ret)
@@ -659,6 +714,16 @@ xml_output:
                 if (ret)
                         goto out;
 
+                snprintf (key, 256, "volume%d.disperse_count", i);
+                ret = dict_get_int32 (dict, key, &disperse_count);
+                if (ret)
+                        goto out;
+
+                snprintf (key, 256, "volume%d.redundancy_count", i);
+                ret = dict_get_int32 (dict, key, &redundancy_count);
+                if (ret)
+                        goto out;
+
                 snprintf (key, 256, "volume%d.transport", i);
                 ret = dict_get_int32 (dict, key, &transport);
                 if (ret)
@@ -673,16 +738,12 @@ xml_output:
 
                 // Distributed (stripe/replicate/stripe-replica) setups
                 if ((type > 0) && ( dist_count < brick_count))
-                        vol_type = type + 3;
+                        vol_type = type + 4;
 
                 cli_out ("Volume Name: %s", volname);
                 cli_out ("Type: %s", cli_vol_type_str[vol_type]);
                 cli_out ("Volume ID: %s", volume_id_str);
                 cli_out ("Status: %s", cli_vol_status_str[status]);
-                if (snap_volume)
-                        cli_out ("Snap Volume: %s", "yes");
-                else
-                        cli_out ("Snap Volume: %s", "no");
 
 #ifdef HAVE_BD_XLATOR
                 k = 0;
@@ -726,6 +787,11 @@ next:
                                  brick_count);
                 } else if (type == GF_CLUSTER_TYPE_NONE) {
                         cli_out ("Number of Bricks: %d", brick_count);
+                } else if (type == GF_CLUSTER_TYPE_DISPERSE) {
+                        cli_out ("Number of Bricks: %d x (%d + %d) = %d",
+                                 (brick_count / dist_count),
+                                 disperse_count - redundancy_count,
+                                 redundancy_count, brick_count);
                 } else {
                         /* For both replicate and stripe, dist_count is
                            good enough */
@@ -795,7 +861,7 @@ out:
 
         free (rsp.op_errstr);
 
-        gf_log ("cli", GF_LOG_INFO, "Returning: %d", ret);
+        gf_log ("cli", GF_LOG_DEBUG, "Returning: %d", ret);
         return ret;
 }
 
@@ -944,7 +1010,7 @@ out:
         cli_cmd_broadcast_response (ret);
         free (rsp.dict.dict_val);
 
-        gf_log ("", GF_LOG_INFO, "Returning with %d", ret);
+        gf_log ("", GF_LOG_DEBUG, "Returning with %d", ret);
         return ret;
 }
 
@@ -1082,7 +1148,7 @@ out:
         if (dict)
                 dict_unref (dict);
 
-        gf_log ("", GF_LOG_INFO, "Returning with %d", ret);
+        gf_log ("", GF_LOG_DEBUG, "Returning with %d", ret);
         return ret;
 }
 
@@ -1442,12 +1508,18 @@ gf_cli_defrag_volume_cbk (struct rpc_req *req, struct iovec *iov,
                 if (rsp.op_ret && strcmp (rsp.op_errstr, "")) {
                         snprintf (msg, sizeof (msg), "%s", rsp.op_errstr);
                 } else {
-                        if (!rsp.op_ret) {
+                         if (!rsp.op_ret) {
+                                /* append errstr in the cli msg for successful
+                                 * case since unlock failures can be highlighted
+                                 * event though rebalance command was successful
+                                 */
                                 snprintf (msg, sizeof (msg),
-                                          "Starting rebalance on volume %s has "
-                                          "been successful.\nID: %s", volname,
-                                          task_id_str);
-                        } else {
+                                          "Rebalance on %s has been started "
+                                          "successfully. Use rebalance status "
+                                          "command to check status of the "
+                                          "rebalance process.\nID: %s\n%s",
+                                          volname, task_id_str, rsp.op_errstr);
+                         } else {
                                 snprintf (msg, sizeof (msg),
                                           "Starting rebalance on volume %s has "
                                           "been unsuccessful.", volname);
@@ -1467,13 +1539,17 @@ gf_cli_defrag_volume_cbk (struct rpc_req *req, struct iovec *iov,
                                           volname);
                         goto done;
                 } else {
+                        /* append errstr in the cli msg for successful case
+                         * since unlock failures can be highlighted event though
+                         * rebalance command was successful */
                         snprintf (msg, sizeof (msg),
                                   "rebalance process may be in the middle of a "
                                   "file migration.\nThe process will be fully "
                                   "stopped once the migration of the file is "
                                   "complete.\nPlease check rebalance process "
                                   "for completion before doing any further "
-                                  "brick related tasks on the volume.");
+                                  "brick related tasks on the volume.\n%s",
+                                  rsp.op_errstr);
                 }
         }
         if (cmd == GF_DEFRAG_CMD_STATUS) {
@@ -1486,6 +1562,8 @@ gf_cli_defrag_volume_cbk (struct rpc_req *req, struct iovec *iov,
                                           "Failed to get the status of "
                                           "rebalance process");
                         goto done;
+                } else {
+                        snprintf (msg, sizeof (msg), "%s", rsp.op_errstr);
                 }
         }
 
@@ -1674,7 +1752,7 @@ gf_cli_set_volume_cbk (struct rpc_req *req, struct iovec *iov,
         dict_t               *dict = NULL;
         char                 *help_str = NULL;
         char                 msg[1024] = {0,};
-        char                 *debug_xlator = _gf_false;
+        char                 *debug_xlator = NULL;
         char                 tmp_str[512] = {0,};
 
         if (-1 == req->rpc_status) {
@@ -2020,6 +2098,12 @@ gf_cli_remove_brick_cbk (struct rpc_req *req, struct iovec *iov,
                 cli_out ("volume remove-brick %s: success", cmd_str);
                 if (GF_OP_CMD_START == cmd && task_id_str != NULL)
                         cli_out ("ID: %s", task_id_str);
+                if (GF_OP_CMD_COMMIT == cmd)
+                        cli_out ("Check the removed bricks to ensure all files "
+                                 "are migrated.\nIf files with data are "
+                                 "found on the brick path, copy them via a "
+                                 "gluster mount point before re-purposing the "
+                                 "removed brick. ");
         }
 
         ret = rsp.op_ret;
@@ -3923,6 +4007,7 @@ gf_cli_gsync_config_command (dict_t *dict)
         runinit (&runner);
         runner_add_args (&runner, GSYNCD_PREFIX"/gsyncd", "-c", NULL);
         runner_argprintf (&runner, "%s", confpath);
+        runner_argprintf (&runner, "--iprefix=%s", DATADIR);
         if (master)
                 runner_argprintf (&runner, ":%s", master);
         runner_add_arg (&runner, slave);
@@ -3949,6 +4034,9 @@ get_struct_variable (int mem_num, gf_gsync_status_t *sts_val)
         case 9:  return (sts_val->bytes_remaining);
         case 10: return (sts_val->purges_remaining);
         case 11: return (sts_val->total_files_skipped);
+        case 12: return (sts_val->brick_host_uuid);
+        case 13: return (sts_val->slavekey);
+        case 14: return (sts_val->session_slave);
         default:
                  goto out;
         }
@@ -4511,6 +4599,20 @@ gf_cli_gsync_set_cbk (struct rpc_req *req, struct iovec *iov,
                                  " has been successful",
                                  type == GF_GSYNC_OPTION_TYPE_START ?
                                   "Starting" : "Stopping",
+                                 master, slave);
+                break;
+
+                case GF_GSYNC_OPTION_TYPE_PAUSE:
+                case GF_GSYNC_OPTION_TYPE_RESUME:
+                        if (dict_get_str (dict, "master", &master) != 0)
+                                master = "???";
+                        if (dict_get_str (dict, "slave", &slave) != 0)
+                                slave = "???";
+
+                        cli_out ("%s " GEOREP " session between %s & %s"
+                                 " has been successful",
+                                 type == GF_GSYNC_OPTION_TYPE_PAUSE ?
+                                  "Pausing" : "Resuming",
                                  master, slave);
                 break;
 
@@ -5211,7 +5313,7 @@ gf_cli_top_volume_cbk (struct rpc_req *req, struct iovec *iov,
                                 gf_time_fmt (timestr, sizeof timestr,
                                              time_sec, gf_timefmt_FT);
                                 snprintf (timestr + strlen (timestr), sizeof timestr - strlen (timestr),
-                                  ".%"GF_PRI_SUSECONDS, time_usec);
+                                  ".%ld", time_usec);
                                 if (strlen (filename) < VOL_TOP_PERF_FILENAME_DEF_WIDTH)
                                         cli_out ("%*"PRIu64" %-*s %-*s",
                                                  VOL_TOP_PERF_SPEED_WIDTH,
@@ -6525,7 +6627,7 @@ gf_cli_status_cbk (struct rpc_req *req, struct iovec *iov,
         }
 
         if ((cmd & GF_CLI_STATUS_NFS) || (cmd & GF_CLI_STATUS_SHD) ||
-            (cmd & GF_CLI_STATUS_QUOTAD))
+            (cmd & GF_CLI_STATUS_QUOTAD) || (cmd & GF_CLI_STATUS_SNAPD))
                 notbrick = _gf_true;
 
         if (global_state->mode & GLUSTER_MODE_XML) {
@@ -6641,7 +6743,8 @@ gf_cli_status_cbk (struct rpc_req *req, struct iovec *iov,
                 memset (status.brick, 0, PATH_MAX + 255);
                 if (!strcmp (hostname, "NFS Server") ||
                     !strcmp (hostname, "Self-heal Daemon") ||
-                    !strcmp (hostname, "Quota Daemon"))
+                    !strcmp (hostname, "Quota Daemon") ||
+                    !strcmp (hostname, "Snapshot Daemon"))
                         snprintf (status.brick, PATH_MAX + 255, "%s on %s",
                                   hostname, path);
                 else
@@ -7167,6 +7270,30 @@ out:
         return;
 }
 
+int
+gf_is_cli_heal_get_command (gf_xl_afr_op_t heal_op)
+{
+        /* If the command is get command value is 1 otherwise 0, for
+           invalid commands -1 */
+        int    get_cmds[GF_AFR_OP_HEAL_DISABLE + 1] = {
+                       [GF_AFR_OP_INVALID] = -1,
+                       [GF_AFR_OP_HEAL_INDEX] = 0,
+                       [GF_AFR_OP_HEAL_FULL] = 0,
+                       [GF_AFR_OP_INDEX_SUMMARY] = 1,
+                       [GF_AFR_OP_HEALED_FILES] = 1,
+                       [GF_AFR_OP_HEAL_FAILED_FILES] = 1,
+                       [GF_AFR_OP_SPLIT_BRAIN_FILES] = 1,
+                       [GF_AFR_OP_STATISTICS] = 1,
+                       [GF_AFR_OP_STATISTICS_HEAL_COUNT] = 1,
+                       [GF_AFR_OP_STATISTICS_HEAL_COUNT_PER_REPLICA] = 1,
+                       [GF_AFR_OP_HEAL_ENABLE] = 0,
+                       [GF_AFR_OP_HEAL_DISABLE] = 0,
+                };
+
+        if (heal_op > GF_AFR_OP_INVALID && heal_op <= GF_AFR_OP_HEAL_DISABLE)
+                return get_cmds[heal_op] == 1;
+        return _gf_false;
+}
 
 int
 gf_cli_heal_volume_cbk (struct rpc_req *req, struct iovec *iov,
@@ -7227,12 +7354,20 @@ gf_cli_heal_volume_cbk (struct rpc_req *req, struct iovec *iov,
 
         gf_log ("cli", GF_LOG_INFO, "Received resp to heal volume");
 
+        operation = "Gathering ";
+        substr = "";
         switch (heal_op) {
                 case    GF_AFR_OP_HEAL_INDEX:
+                        operation   = "Launching heal operation ";
                         heal_op_str = "to perform index self heal";
+                        substr      = "\nUse heal info commands to check"
+                                      " status";
                         break;
                 case    GF_AFR_OP_HEAL_FULL:
+                        operation   = "Launching heal operation ";
                         heal_op_str = "to perform full self heal";
+                        substr      = "\nUse heal info commands to check"
+                                      " status";
                         break;
                 case    GF_AFR_OP_INDEX_SUMMARY:
                         heal_op_str = "list of entries to be healed";
@@ -7255,38 +7390,42 @@ gf_cli_heal_volume_cbk (struct rpc_req *req, struct iovec *iov,
                 case    GF_AFR_OP_STATISTICS_HEAL_COUNT_PER_REPLICA:
                         heal_op_str = "count of entries to be healed per replica";
                         break;
+                /* The below 2 cases are never hit; they're coded only to make
+                 * compiler warnings go away.*/
+                case    GF_AFR_OP_SBRAIN_HEAL_FROM_BIGGER_FILE:
+                case    GF_AFR_OP_SBRAIN_HEAL_FROM_BRICK:
+                        break;
+
                 case    GF_AFR_OP_INVALID:
                         heal_op_str = "invalid heal op";
                         break;
-        }
-
-        if ((heal_op == GF_AFR_OP_HEAL_FULL) ||
-            (heal_op == GF_AFR_OP_HEAL_INDEX)) {
-                operation = "Launching heal operation";
-                substr = "\nUse heal info commands to check status";
-        } else {
-                operation = "Gathering";
-                substr = "";
+                case    GF_AFR_OP_HEAL_ENABLE:
+                        operation   = "";
+                        heal_op_str = "Enable heal";
+                        break;
+                case    GF_AFR_OP_HEAL_DISABLE:
+                        operation   = "";
+                        heal_op_str = "Disable heal";
+                        break;
         }
 
         if (rsp.op_ret) {
                 if (strcmp (rsp.op_errstr, "")) {
                         cli_err ("%s", rsp.op_errstr);
                 } else {
-                        cli_err ("%s %s on volume %s has been unsuccessful",
+                        cli_err ("%s%s on volume %s has been unsuccessful",
                                  operation, heal_op_str, volname);
                 }
 
                 ret = rsp.op_ret;
                 goto out;
         } else {
-                cli_out ("%s %s on volume %s has been successful %s", operation,
+                cli_out ("%s%s on volume %s has been successful %s", operation,
                          heal_op_str, volname, substr);
         }
 
         ret = rsp.op_ret;
-        if ((heal_op == GF_AFR_OP_HEAL_FULL) ||
-            (heal_op == GF_AFR_OP_HEAL_INDEX))
+        if (!gf_is_cli_heal_get_command (heal_op))
                 goto out;
 
         dict = dict_new ();
@@ -7636,18 +7775,45 @@ out:
 int32_t
 cli_snapshot_remove_reply (gf_cli_rsp *rsp, dict_t *dict, call_frame_t *frame)
 {
-        int32_t       ret        = -1;
-        char         *snap_name  = NULL;
+        int32_t         ret             = -1;
+        char            *snap_name      = NULL;
+        int32_t         delete_cmd      = -1;
+        cli_local_t     *local          = NULL;
 
+        GF_ASSERT (frame);
         GF_ASSERT (rsp);
         GF_ASSERT (dict);
-        GF_ASSERT (frame);
 
         if (rsp->op_ret) {
-                cli_err("snapshot delete: failed: %s",
+                cli_err ("snapshot delete: failed: %s",
                         rsp->op_errstr ? rsp->op_errstr :
                         "Please check log file for details");
                 ret = rsp->op_ret;
+                goto out;
+        }
+
+        ret = dict_get_int32 (dict, "delete-cmd", &delete_cmd);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR, "Could not get delete-cmd");
+                goto out;
+        }
+
+        if (delete_cmd == GF_SNAP_DELETE_TYPE_ALL ||
+            delete_cmd == GF_SNAP_DELETE_TYPE_VOL) {
+                local = ((call_frame_t *) frame) -> local;
+                if (!local) {
+                        ret = -1;
+                        gf_log ("cli", GF_LOG_ERROR, "frame->local is NULL");
+                        goto out;
+                }
+
+                /* During first call back of snapshot delete of type
+                 * ALL and VOL, We will get the snapcount and snapnames.
+                 * Hence to make the subsequent rpc calls for individual
+                 * snapshot delete, We need to save it in local dictionary.
+                 */
+                dict_copy (dict, local->dict);
+                ret = 0;
                 goto out;
         }
 
@@ -7677,6 +7843,8 @@ cli_snapshot_config_display (dict_t *dict, gf_cli_rsp *rsp)
         uint64_t            soft_limit           = 0;
         uint64_t            i                    = 0;
         uint64_t            voldisplaycount      = 0;
+        char               *auto_delete          = NULL;
+        char               *snap_activate        = NULL;
 
         GF_ASSERT (dict);
         GF_ASSERT (rsp);
@@ -7706,8 +7874,13 @@ cli_snapshot_config_display (dict_t *dict, gf_cli_rsp *rsp)
         /* Ignore the error, as the key specified is optional */
         ret = dict_get_uint64 (dict, "snap-max-soft-limit", &soft_limit);
 
+        ret = dict_get_str (dict, "auto-delete", &auto_delete);
+
+        ret = dict_get_str (dict, "snap-activate-on-create", &snap_activate);
+
         if (!hard_limit && !soft_limit
-                        && config_command != GF_SNAP_CONFIG_DISPLAY) {
+                        && config_command != GF_SNAP_CONFIG_DISPLAY
+                        && !auto_delete && !snap_activate) {
                 ret = -1;
                 gf_log(THIS->name, GF_LOG_ERROR,
                        "Could not fetch config-key");
@@ -7721,13 +7894,19 @@ cli_snapshot_config_display (dict_t *dict, gf_cli_rsp *rsp)
                                 "& snap-max-soft-limit for system set "
                                  "successfully");
                 } else if (hard_limit) {
-                        cli_out ("snapshot config: %s "
-                                 "for snap-max-hard-limit set successfully",
+                        cli_out ("snapshot config: snap-max-hard-limit "
+                                 "for %s set successfully",
                                  volname);
                 } else if (soft_limit) {
-                        cli_out ("snapshot config: %s "
-                                 "for snap-max-soft-limit set successfully",
+                        cli_out ("snapshot config: snap-max-soft-limit "
+                                 "for %s set successfully",
                                  volname);
+                } else if (auto_delete) {
+                        cli_out ("snapshot config: auto-delete "
+                                 "successfully set");
+                } else if (snap_activate) {
+                        cli_out ("snapshot config: activate-on-create "
+                                 "successfully set");
                 }
                 break;
 
@@ -7751,8 +7930,12 @@ cli_snapshot_config_display (dict_t *dict, gf_cli_rsp *rsp)
                         ret = -1;
                         goto out;
                 }
-                cli_out ("snap-max-soft-limit : %"PRIu64"%%\n",
+                cli_out ("snap-max-soft-limit : %"PRIu64"%%",
                          soft_limit);
+
+                cli_out ("auto-delete : %s", auto_delete);
+
+                cli_out ("activate-on-create : %s\n", snap_activate);
 
                 cli_out ("Snapshot Volume Configuration:");
 
@@ -7766,7 +7949,7 @@ cli_snapshot_config_display (dict_t *dict, gf_cli_rsp *rsp)
                 }
 
                 for (i = 0; i < voldisplaycount; i++) {
-                        snprintf (buf, sizeof(buf), "volume%ld-volname", i);
+                        snprintf (buf, sizeof(buf), "volume%"PRIu64"-volname", i);
                         ret = dict_get_str (dict, buf, &volname);
                         if (ret) {
                                 gf_log ("cli", GF_LOG_ERROR, "Could not fetch "
@@ -7777,7 +7960,7 @@ cli_snapshot_config_display (dict_t *dict, gf_cli_rsp *rsp)
                         cli_out ("\nVolume : %s", volname);
 
                         snprintf (buf, sizeof(buf),
-                                  "volume%ld-snap-max-hard-limit", i);
+                                  "volume%"PRIu64"-snap-max-hard-limit", i);
                         ret = dict_get_uint64 (dict, buf, &value);
                         if (ret) {
                                 gf_log ("cli", GF_LOG_ERROR, "Could not fetch "
@@ -7788,7 +7971,7 @@ cli_snapshot_config_display (dict_t *dict, gf_cli_rsp *rsp)
                         cli_out ("snap-max-hard-limit : %"PRIu64, value);
 
                         snprintf (buf, sizeof(buf),
-                                  "volume%ld-active-hard-limit", i);
+                                  "volume%"PRIu64"-active-hard-limit", i);
                         ret = dict_get_uint64 (dict, buf, &value);
                         if (ret) {
                                  gf_log ("cli", GF_LOG_ERROR, "Could not fetch"
@@ -7801,7 +7984,7 @@ cli_snapshot_config_display (dict_t *dict, gf_cli_rsp *rsp)
                                  value);
 
                         snprintf (buf, sizeof(buf),
-                                      "volume%ld-snap-max-soft-limit", i);
+                                      "volume%"PRIu64"-snap-max-soft-limit", i);
                         ret = dict_get_uint64 (dict, buf, &value);
                         if (ret) {
                                 gf_log ("cli", GF_LOG_ERROR, "Could not fetch "
@@ -8053,9 +8236,9 @@ cli_call_snapshot_info (dict_t *dict, gf_boolean_t bool_snap_driven) {
 
         GF_ASSERT (dict);
 
-        ret = dict_get_int32 (dict, "snap-count", &snap_count);
+        ret = dict_get_int32 (dict, "snapcount", &snap_count);
         if (ret) {
-                gf_log ("cli", GF_LOG_ERROR, "Unable to get snap-count");
+                gf_log ("cli", GF_LOG_ERROR, "Unable to get snapcount");
                 goto out;
         }
 
@@ -8097,9 +8280,9 @@ cli_get_snaps_in_volume (dict_t *dict) {
         }
         cli_out (INDENT_MAIN_HEAD "%s", "Volume Name", ":", get_buffer);
 
-        ret = dict_get_int32 (dict, "snap-count", &avail);
+        ret = dict_get_int32 (dict, "snapcount", &avail);
         if (ret) {
-                gf_log ("cli", GF_LOG_ERROR, "Could not fetch snap-count");
+                gf_log ("cli", GF_LOG_ERROR, "Could not fetch snapcount");
                 goto out;
         }
         cli_out (INDENT_MAIN_HEAD "%d", "Snaps Taken", ":", avail);
@@ -8147,7 +8330,7 @@ cli_snapshot_list (dict_t *dict) {
 
         GF_ASSERT (dict);
 
-        ret = dict_get_int32 (dict, "snap-count", &snapcount);
+        ret = dict_get_int32 (dict, "snapcount", &snapcount);
         if (ret) {
                 gf_log ("cli", GF_LOG_ERROR, "Could not fetch snap count");
                 goto out;
@@ -8288,6 +8471,8 @@ cli_get_snap_volume_status (dict_t *dict, char *key_prefix)
                         cli_out ("\t%-17s %s   %s", "LV Size", ":", buffer);
 
         }
+
+        ret = 0;
 out:
         return ret;
 }
@@ -8358,100 +8543,192 @@ out:
         return ret;
 }
 
-int
-cli_snap_status_all (dict_t *dict) {
-        int             ret             =       -1;
-        char            key[PATH_MAX]   =       "";
-        int             snapcount       =       0;
-        int             i               =       0;
+int32_t
+cli_populate_req_dict_for_delete (dict_t *snap_dict, dict_t *dict, size_t index)
+{
+        int32_t         ret             = -1;
+        char            key[PATH_MAX]   = "";
+        char            *buffer         = NULL;
+        int             type            = 0;
+        int             snapcount       = 0;
 
+        GF_ASSERT (snap_dict);
         GF_ASSERT (dict);
 
-        ret = dict_get_int32 (dict, "status.snapcount", &snapcount);
+        ret = dict_set_int32 (snap_dict, "delete-cmd",
+                              GF_SNAP_DELETE_TYPE_SNAP);
         if (ret) {
-                gf_log ("cli", GF_LOG_ERROR, "Could not get snapcount");
+                gf_log ("cli", GF_LOG_ERROR, "Could not save command "
+                        "type in snap dictionary");
                 goto out;
         }
 
-        if (snapcount == 0) {
-                cli_out ("No snapshots present");
+        ret = snprintf (key, sizeof (key), "snapname%lu", index);
+        if (ret < 0) {
+                goto out;
         }
 
-        for (i = 0 ; i < snapcount; i++) {
-                ret = snprintf (key, sizeof (key), "status.snap%d",i);
-                if (ret < 0) {
-                        goto out;
-                }
-                ret = cli_get_single_snap_status (dict, key);
+        ret = dict_get_str (dict, key, &buffer);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR, "Failed to get snapname");
+                goto out;
+        }
+
+        ret = dict_set_dynstr_with_alloc (snap_dict, "snapname", buffer);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR, "Failed to save snapname");
+                goto out;
+        }
+
+        ret = dict_set_int32 (snap_dict, "type", GF_SNAP_OPTION_TYPE_DELETE);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR, "Failed to save command type");
+                goto out;
+        }
+
+        ret = dict_set_dynstr_with_alloc (snap_dict, "cmd-str",
+                                       "snapshot delete");
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR,
+                        "Could not save command string as delete");
+                goto out;
         }
 out:
         return ret;
 }
 
+int
+cli_populate_req_dict_for_status (dict_t *snap_dict, dict_t *dict, int index) {
+        int             ret             =       -1;
+        char            key[PATH_MAX]   =       "";
+        char            *buffer         =       NULL;
+        int             type            =       0;
+        int             snapcount       =       0;
+
+        GF_ASSERT (snap_dict);
+        GF_ASSERT (dict);
+
+        ret = dict_set_uint32 (snap_dict, "status-cmd",
+                               GF_SNAP_STATUS_TYPE_SNAP);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR, "Could not save command "
+                        "type in snap dict");
+                goto out;
+        }
+
+        ret = snprintf (key, sizeof (key), "status.snap%d.snapname", index);
+         if (ret < 0) {
+                 goto out;
+         }
+
+        ret = dict_get_str (dict, key, &buffer);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR, "Could not get snapname");
+                goto out;
+        }
+
+        ret = dict_set_str (snap_dict, "snapname", buffer);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR, "Could not save snapname "
+                        "in snap dict");
+                goto out;
+
+        }
+
+        ret = dict_set_int32 (snap_dict, "type", GF_SNAP_OPTION_TYPE_STATUS);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR,
+                        "Could not save command type");
+                goto out;
+        }
+
+        ret = dict_set_dynstr_with_alloc (snap_dict, "cmd-str",
+                                       "snapshot status");
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR,
+                        "Could not save command string as status");
+                goto out;
+        }
+
+        ret = dict_set_int32 (snap_dict, "hold_vol_locks", _gf_false);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR,
+                        "Setting volume lock flag failed");
+                goto out;
+        }
+
+out:
+        return ret;
+}
 
 int
-cli_snapshot_status_display (dict_t *dict, gf_cli_rsp *rsp)
+cli_snapshot_status (dict_t *dict, gf_cli_rsp *rsp,
+                             call_frame_t *frame)
 {
         char            key[PATH_MAX]   =       "";
         int             ret             =       -1;
         int             status_cmd      =       -1;
+        cli_local_t     *local          =       NULL;
 
         GF_ASSERT (dict);
         GF_ASSERT (rsp);
+        GF_ASSERT (frame);
+
+        local = ((call_frame_t *) frame) -> local;
+        if (!local) {
+                gf_log ("cli", GF_LOG_ERROR, "frame->local is NULL");
+                goto out;
+        }
 
         if (rsp->op_ret) {
-                cli_err ("Snapshot Status : failed: %s",
-                        rsp->op_errstr ? rsp->op_errstr :
-                        "Please check log file for details");
+                if (rsp->op_errstr) {
+                        ret = dict_set_dynstr_with_alloc (local->dict,
+                                                          "op_err_str",
+                                                          rsp->op_errstr);
+                        if (ret) {
+                                gf_log ("cli", GF_LOG_ERROR, "Failed to set "
+                                        "op_errstr in local dictionary");
+                                goto out;
+                        }
+                }
                 ret = rsp->op_ret;
                 goto out;
         }
 
-        ret = dict_get_int32 (dict, "cmd", &status_cmd);
+        ret = dict_get_int32 (dict, "status-cmd", &status_cmd);
         if (ret) {
                 gf_log ("cli", GF_LOG_ERROR, "Could not fetch status type");
                 goto out;
         }
-        switch (status_cmd) {
-                case GF_SNAP_STATUS_TYPE_ALL:
-                {
-                        ret = cli_snap_status_all (dict);
-                        if (ret) {
-                                gf_log ("cli", GF_LOG_ERROR, "Could not fetch "
-                                        "status of all snap");
-                                goto out;
-                        }
-                break;
-                }
 
-                case GF_SNAP_STATUS_TYPE_SNAP:
-                {
-                        ret = snprintf (key, sizeof (key), "status.snap0");
-                        if (ret < 0) {
-                                goto out;
-                        }
-                        ret = cli_get_single_snap_status (dict, key);
-                        if (ret) {
-                                gf_log ("cli", GF_LOG_ERROR, "Could not fetch "
-                                        "status of snap");
-                                goto out;
-                        }
-                break;
-                }
-
-                case GF_SNAP_STATUS_TYPE_VOL:
-                {
-                        ret = cli_snap_status_all (dict);
-                        if (ret) {
-                                gf_log ("cli", GF_LOG_ERROR, "Could not fetch "
-                                        "status of snap in a volume");
-                                goto out;
-                        }
-                        break;
-                }
-                default:
-                        break;
+        if (status_cmd != GF_SNAP_STATUS_TYPE_SNAP) {
+                dict_copy (dict, local->dict);
+                goto out;
         }
+
+
+        ret = snprintf (key, sizeof (key), "status.snap0");
+        if (ret < 0) {
+                goto out;
+        }
+
+        if (global_state->mode & GLUSTER_MODE_XML) {
+                ret = cli_xml_snapshot_status_single_snap (local, dict, key);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "Failed to create "
+                                "xml output for snapshot status");
+                        goto out;
+                }
+        } else {
+                ret = cli_get_single_snap_status (dict, key);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "Could not fetch "
+                                "status of snap");
+                        goto out;
+                }
+        }
+
+        ret = 0;
 out:
         return ret;
 }
@@ -8467,6 +8744,8 @@ gf_cli_snapshot_cbk (struct rpc_req *req, struct iovec *iov,
         int32_t               type                     =  0;
         call_frame_t         *frame                    = NULL;
         gf_boolean_t         snap_driven               = _gf_false;
+        int8_t               soft_limit_flag           = -1;
+        char                 *volname                  = NULL;
 
         if (req->rpc_status == -1) {
                 ret = -1;
@@ -8500,6 +8779,18 @@ gf_cli_snapshot_cbk (struct rpc_req *req, struct iovec *iov,
                 goto out;
         }
 
+        /* Snapshot status command is handled separately */
+        if (global_state->mode & GLUSTER_MODE_XML &&
+            GF_SNAP_OPTION_TYPE_STATUS != type) {
+                ret = cli_xml_output_snapshot (type, dict, rsp.op_ret,
+                                               rsp.op_errno, rsp.op_errstr);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "Error outputting to xml");
+                }
+
+                goto out;
+        }
+
         switch (type) {
         case GF_SNAP_OPTION_TYPE_CREATE:
                 if (rsp.op_ret) {
@@ -8516,8 +8807,29 @@ gf_cli_snapshot_cbk (struct rpc_req *req, struct iovec *iov,
                                 "Failed to get snap name");
                         goto out;
                 }
-                cli_out ("snapshot create: %s: snap created successfully",
-                         snap_name);
+
+                /* TODO : Instead of using volname1 directly use
+                 * volname$i in loop once snapshot of multiple
+                 * volumes are supported
+                 */
+                ret = dict_get_str (dict, "volname1", &volname);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR,
+                                "Failed to get volume name");
+                        goto out;
+                }
+
+                cli_out ("snapshot create: success: Snap %s created "
+                                        "successfully", snap_name);
+
+                ret = dict_get_int8 (dict, "soft-limit-reach",
+                                    &soft_limit_flag);
+                if (soft_limit_flag == 1) {
+                        cli_out ("Warning: Soft-limit of volume (%s) is "
+                                "reached. Snapshot creation is not possible "
+                                "once hard-limit is reached.", volname);
+                }
+                ret = 0;
                 break;
 
         case GF_SNAP_OPTION_TYPE_RESTORE:
@@ -8544,7 +8856,55 @@ gf_cli_snapshot_cbk (struct rpc_req *req, struct iovec *iov,
 
                 ret = 0;
                 break;
+        case GF_SNAP_OPTION_TYPE_ACTIVATE:
+                /* TODO: Check if rsp.op_ret needs to be checked here. Or is
+                 * it ok to check this in the start of the function where we
+                 * get rsp.*/
+                if (rsp.op_ret) {
+                        cli_err("snapshot activate: failed: %s",
+                                 rsp.op_errstr ? rsp.op_errstr :
+                                 "Please check log file for details");
+                                 ret = rsp.op_ret;
+                                 goto out;
+                }
 
+                ret = dict_get_str (dict, "snapname", &snap_name);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR,
+                                "Failed to get snap name");
+                        goto out;
+                }
+
+                cli_out ("Snapshot activate: %s: Snap activated "
+                                 "successfully", snap_name);
+
+                ret = 0;
+                break;
+
+        case GF_SNAP_OPTION_TYPE_DEACTIVATE:
+                /* TODO: Check if rsp.op_ret needs to be checked here. Or is
+                 * it ok to check this in the start of the function where we
+                 * get rsp.*/
+                if (rsp.op_ret) {
+                        cli_err("snapshot deactivate: failed: %s",
+                                 rsp.op_errstr ? rsp.op_errstr :
+                                 "Please check log file for details");
+                                 ret = rsp.op_ret;
+                                 goto out;
+                }
+
+                ret = dict_get_str (dict, "snapname", &snap_name);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR,
+                                "Failed to get snap name");
+                        goto out;
+                }
+
+                cli_out ("Snapshot deactivate: %s: Snap deactivated "
+                                 "successfully", snap_name);
+
+                ret = 0;
+                break;
         case GF_SNAP_OPTION_TYPE_INFO:
                 if (rsp.op_ret) {
                         cli_err ("Snapshot info : failed: %s",
@@ -8609,7 +8969,7 @@ gf_cli_snapshot_cbk (struct rpc_req *req, struct iovec *iov,
                 break;
 
         case GF_SNAP_OPTION_TYPE_STATUS:
-                ret = cli_snapshot_status_display (dict, &rsp);
+                ret = cli_snapshot_status (dict, &rsp, frame);
                 if (ret) {
                         gf_log ("cli", GF_LOG_ERROR, "Failed to display "
                                 "snapshot status output.");
@@ -8634,21 +8994,502 @@ out:
 }
 
 int32_t
+gf_cli_snapshot_for_delete (call_frame_t *frame, xlator_t *this,
+                            void *data)
+{
+        gf_cli_req      req                     = {{0,}};
+        dict_t          *options                = NULL;
+        int32_t         ret                     = -1;
+        int32_t         cmd                     = -1;
+        cli_local_t     *local                  = NULL;
+        dict_t          *snap_dict              = NULL;
+        int32_t         snapcount               = 0;
+        int             i                       = 0;
+        char            question[PATH_MAX]      = "";
+        char            *volname                = NULL;
+        gf_answer_t     answer                  = GF_ANSWER_NO;
+
+        GF_VALIDATE_OR_GOTO ("cli", frame,  out);
+        GF_VALIDATE_OR_GOTO ("cli", frame->local, out);
+        GF_VALIDATE_OR_GOTO ("cli", this, out);
+        GF_VALIDATE_OR_GOTO ("cli", data, out);
+
+        local = frame->local;
+
+        options = data;
+
+        ret = dict_get_int32 (local->dict, "delete-cmd", &cmd);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR, "Failed to get "
+                        "delete-cmd");
+                goto out;
+        }
+
+        /* No need multiple RPCs for individual snapshot delete*/
+        if (cmd == GF_SNAP_DELETE_TYPE_SNAP) {
+                ret = 0;
+                goto out;
+        }
+
+        ret = dict_get_int32 (local->dict, "snapcount",
+                              &snapcount);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR, "Could not get "
+                        "snapcount");
+                goto out;
+        }
+
+        if (snapcount == 0) {
+                cli_out ("No snapshots present");
+                goto out;
+        }
+
+        if (cmd == GF_SNAP_DELETE_TYPE_ALL) {
+                snprintf (question, sizeof (question), "System contains %d "
+                          "snapshot(s).\nDo you still "
+                          "want to continue and delete them? ",
+                           snapcount);
+        } else {
+                ret = dict_get_str (local->dict, "volname", &volname);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "Failed to fetch "
+                                "volname from local dictionary");
+                        goto out;
+                }
+
+                snprintf (question, sizeof (question), "Volume (%s) contains "
+                          "%d snapshot(s).\nDo you still want to "
+                           "continue and delete them? ", volname,
+                           snapcount);
+        }
+
+        answer = cli_cmd_get_confirmation (global_state, question);
+        if (GF_ANSWER_NO == answer) {
+                ret = 0;
+                gf_log ("cli", GF_LOG_DEBUG, "User cancelled "
+                        "snapshot delete operation for snap delete");
+                goto out;
+        }
+
+        for (i = 1 ; i <= snapcount ; i++) {
+                ret = -1;
+
+                snap_dict = dict_new();
+                if (!snap_dict)
+                        goto out;
+
+                ret = cli_populate_req_dict_for_delete (snap_dict,
+                                                       local->dict, i);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "Could not "
+                                "populate snap request dictionary");
+                        goto out;
+                }
+
+                ret = cli_to_glusterd (&req, frame,
+                                gf_cli_snapshot_cbk,
+                                (xdrproc_t) xdr_gf_cli_req, snap_dict,
+                                GLUSTER_CLI_SNAP, this, cli_rpc_prog,
+                                NULL);
+                if (ret) {
+                        /* Fail the operation if deleting one of the
+                         * snapshots is failed
+                         */
+                        gf_log ("cli", GF_LOG_ERROR, "cli_to_glusterd "
+                                "for snapshot delete failed");
+                        goto out;
+                }
+                dict_unref (snap_dict);
+                snap_dict = NULL;
+        }
+
+out:
+        if (snap_dict)
+                dict_unref (snap_dict);
+
+        return ret;
+}
+
+int32_t
+gf_cli_snapshot_for_status (call_frame_t *frame, xlator_t *this,
+                            void *data)
+{
+
+        gf_cli_req        req           = {{0,}};
+        dict_t           *options       = NULL;
+        int               ret           = -1;
+        int32_t           cmd           = -1;
+        cli_local_t      *local         = NULL;
+        dict_t           *snap_dict     = NULL;
+        int              snapcount      =  0;
+        int              i              =  0;
+
+        GF_VALIDATE_OR_GOTO ("cli", frame, out);
+        GF_VALIDATE_OR_GOTO ("cli", frame->local, out);
+        GF_VALIDATE_OR_GOTO ("cli", this, out);
+        GF_VALIDATE_OR_GOTO ("cli", data, out);
+
+        local = frame->local;
+        options = data;
+
+        ret = dict_get_int32 (local->dict, "status-cmd", &cmd);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR, "Failed to get status-cmd");
+                goto out;
+        }
+
+        /* Snapshot status of single snap (i.e. GF_SNAP_STATUS_TYPE_SNAP)
+         * is already handled. Therefore we can return from here.
+         * If want to get status of all snaps in the system or volume then
+         * we should get them one by one.*/
+        if (cmd == GF_SNAP_STATUS_TYPE_SNAP) {
+                ret = 0;
+                goto out;
+        }
+
+        ret = dict_get_int32 (local->dict, "status.snapcount", &snapcount);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR, "Could not get snapcount");
+                goto out;
+        }
+
+        if (snapcount == 0) {
+                cli_out ("No snapshots present");
+        }
+
+        for (i = 0 ; i < snapcount; i++) {
+                ret = -1;
+
+                snap_dict = dict_new();
+                if (!snap_dict)
+                        goto out;
+
+                ret = cli_populate_req_dict_for_status (snap_dict,
+                                local->dict, i);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "Could not "
+                                        "populate snap request dictionary");
+                        goto out;
+                }
+
+                ret = cli_to_glusterd (&req, frame,
+                                gf_cli_snapshot_cbk,
+                                (xdrproc_t) xdr_gf_cli_req, snap_dict,
+                                GLUSTER_CLI_SNAP, this, cli_rpc_prog,
+                                NULL);
+
+                /* Ignore the return value and error for snapshot
+                 * status of type "ALL" or "VOL"
+                 *
+                 * Scenario : There might be case where status command
+                 * and delete command might be issued at the same time.
+                 * In that case when status tried to fetch detail of
+                 * snap which has been deleted by concurrent command,
+                 * then it will show snapshot not present. Which will
+                 * not be appropriate.
+                 */
+                dict_unref (snap_dict);
+                snap_dict = NULL;
+        }
+
+        ret = 0;
+out:
+        if (snap_dict)
+                dict_unref (snap_dict);
+
+        return ret;
+}
+
+int32_t
 gf_cli_snapshot (call_frame_t *frame, xlator_t *this,
                  void *data)
 {
-        gf_cli_req        req     = {{0,}};
-        dict_t           *options = NULL;
-        int               ret     = -1;
+        gf_cli_req        req           = {{0,}};
+        dict_t           *options       = NULL;
+        int               ret           = -1;
+        int               tmp_ret       = -1;
+        cli_local_t      *local         = NULL;
+        char             *err_str       = NULL;
+        int              type           =  -1;
+
+        if (!frame || !this || !data)
+                goto out;
+
+        if (!frame->local)
+                goto out;
+
+        local = frame->local;
+
+        options = data;
+
+        ret = dict_get_int32 (local->dict, "type", &type);
+
+        if (GF_SNAP_OPTION_TYPE_STATUS == type &&
+            global_state->mode & GLUSTER_MODE_XML) {
+                ret = cli_xml_output_snap_status_begin (local, 0, 0, NULL);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "Error creating xml "
+                                "output");
+                        goto out;
+                }
+        }
+
+
+        ret = cli_to_glusterd (&req, frame, gf_cli_snapshot_cbk,
+                               (xdrproc_t) xdr_gf_cli_req, options,
+                               GLUSTER_CLI_SNAP, this, cli_rpc_prog,
+                               NULL);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR, "cli_to_glusterd for "
+                        "snapshot failed");
+                goto out;
+        }
+
+        if (GF_SNAP_OPTION_TYPE_STATUS == type) {
+                ret = gf_cli_snapshot_for_status (frame, this, data);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "cli to glusterd "
+                                "for snapshot status command failed");
+                        goto out;
+                }
+
+                if (global_state->mode & GLUSTER_MODE_XML) {
+                        ret = cli_xml_output_snap_status_end (local);
+                        if (ret) {
+                                gf_log ("cli", GF_LOG_ERROR, "Error creating "
+                                        "xml output");
+                                goto out;
+                        }
+                }
+        }
+
+        if (GF_SNAP_OPTION_TYPE_DELETE == type) {
+                ret = gf_cli_snapshot_for_delete (frame, this, data);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "cli to glusterd "
+                                "for snapshot delete command failed");
+                        goto out;
+                }
+        }
+
+        ret = 0;
+
+out:
+        if (ret && local && GF_SNAP_OPTION_TYPE_STATUS == type) {
+                tmp_ret = dict_get_str (local->dict, "op_err_str", &err_str);
+                if (err_str) {
+                        cli_err ("Snapshot Status : failed: %s", err_str);
+                        dict_del (local->dict, "op_err_str");
+                } else {
+                        cli_err ("Snapshot Status : failed: %s", "Please "
+                                "check log file for details");
+                }
+        }
+
+        gf_log ("cli", GF_LOG_DEBUG, "Returning %d", ret);
+
+        GF_FREE (req.dict.dict_val);
+        return ret;
+}
+
+int32_t
+gf_cli_barrier_volume_cbk (struct rpc_req *req, struct iovec *iov,
+                                  int count, void *myframe)
+{
+        gf_cli_rsp                      rsp = {0,};
+        int                             ret = -1;
+        dict_t                          *dict = NULL;
+
+        if (-1 == req->rpc_status)
+                goto out;
+        ret = xdr_to_generic (*iov, &rsp,
+                              (xdrproc_t)xdr_gf_cli_rsp);
+        if (ret < 0) {
+                gf_log (((call_frame_t *) myframe)->this->name, GF_LOG_ERROR,
+                        "Failed to decode xdr response");
+                goto out;
+        }
+        gf_log ("cli", GF_LOG_DEBUG, "Received response to barrier");
+
+        if (rsp.op_ret) {
+                if (rsp.op_errstr && (strlen (rsp.op_errstr) > 1)) {
+                        cli_err ("volume barrier: command unsuccessful : %s",
+                                 rsp.op_errstr);
+                } else {
+                        cli_err ("volume barrier: command unsuccessful");
+                }
+        } else {
+                cli_out ("volume barrier: command successful");
+        }
+        ret = rsp.op_ret;
+
+out:
+        if (dict)
+                dict_unref (dict);
+        free (rsp.op_errstr);
+        free (rsp.dict.dict_val);
+        cli_cmd_broadcast_response (ret);
+        return ret;
+}
+
+int
+gf_cli_barrier_volume (call_frame_t *frame, xlator_t *this, void *data)
+{
+        gf_cli_req                      req = {{0,}};
+        dict_t                          *options = NULL;
+        int                             ret = -1;
 
         if (!frame || !this || !data)
                 goto out;
 
         options = data;
 
-        ret = cli_to_glusterd (&req, frame, gf_cli_snapshot_cbk,
+        ret = cli_to_glusterd (&req, frame, gf_cli_barrier_volume_cbk,
                                (xdrproc_t) xdr_gf_cli_req, options,
-                               GLUSTER_CLI_SNAP, this, cli_rpc_prog,
+                               GLUSTER_CLI_BARRIER_VOLUME, this, cli_rpc_prog,
+                               NULL);
+out:
+        gf_log ("cli", GF_LOG_DEBUG, "Returning %d", ret);
+
+        GF_FREE (req.dict.dict_val);
+        return ret;
+}
+
+int32_t
+gf_cli_get_vol_opt_cbk (struct rpc_req *req, struct iovec *iov, int count,
+                        void *myframe)
+{
+        gf_cli_rsp   rsp  = {0,};
+        int          ret  = -1;
+        dict_t      *dict = NULL;
+        char        *key  = NULL;
+        char        *value = NULL;
+        char         msg[1024] = {0,};
+        int          i     = 0;
+        char         dict_key[50] = {0,};
+
+        if (-1 == req->rpc_status)
+                goto out;
+        ret = xdr_to_generic (*iov, &rsp,
+                              (xdrproc_t)xdr_gf_cli_rsp);
+        if (ret < 0) {
+                gf_log (((call_frame_t *) myframe)->this->name, GF_LOG_ERROR,
+                        "Failed to decode xdr response");
+                goto out;
+        }
+        gf_log ("cli", GF_LOG_DEBUG, "Received response to get volume option");
+
+        if (rsp.op_ret) {
+                if (strcmp (rsp.op_errstr, ""))
+                        snprintf (msg, sizeof (msg), "volume get option: "
+                                  "failed: %s", rsp.op_errstr);
+                else
+                        snprintf (msg, sizeof (msg), "volume get option: "
+                                  "failed");
+
+                if (global_state->mode & GLUSTER_MODE_XML) {
+                        ret = cli_xml_output_str ("volGetopts", msg, rsp.op_ret,
+                                          rsp.op_errno, rsp.op_errstr);
+                        if (ret) {
+                                gf_log ("cli", GF_LOG_ERROR,
+                                        "Error outputting to xml");
+                        }
+                } else {
+                        cli_err ("%s", msg);
+                }
+                ret = 0; /* setting ret to 0 ensures we do not end up displaying
+                            double error messages */
+                goto out;
+        }
+        dict = dict_new ();
+
+        if (!dict) {
+                ret = -1;
+                goto out;
+        }
+
+        ret = dict_unserialize (rsp.dict.dict_val, rsp.dict.dict_len, &dict);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR,
+                        "Failed rsp_dict unserialization");
+                goto out;
+        }
+
+        if (global_state->mode & GLUSTER_MODE_XML) {
+                ret = cli_xml_output_vol_getopts (dict, rsp.op_ret,
+                                                  rsp.op_errno,
+                                                  rsp.op_errstr);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "xml output generation "
+                                "failed");
+                        ret = 0;
+                }
+                goto out;
+        }
+
+        ret = dict_get_int32 (dict, "count", &count);
+        if (ret) {
+                gf_log ("cli", GF_LOG_ERROR, "Failed to retrieve count "
+                        "from the dictionary");
+                goto out;
+        }
+        if (count <= 0) {
+                gf_log ("cli", GF_LOG_ERROR, "Value of count :%d is "
+                        "invalid", count);
+                ret = -1;
+                goto out;
+        }
+
+        cli_out ("%-40s%-40s", "Option", "Value");
+        cli_out ("%-40s%-40s", "------", "-----");
+        for (i=1; i<=count; i++) {
+                sprintf (dict_key, "key%d", i);
+                ret = dict_get_str (dict, dict_key, &key);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "Failed to"
+                                " retrieve %s from the "
+                                "dictionary", dict_key);
+                        goto out;
+                }
+                sprintf (dict_key, "value%d", i);
+                ret = dict_get_str (dict, dict_key, &value);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "Failed to "
+                                "retrieve key value for %s from"
+                                "the dictionary", dict_key);
+                        goto out;
+                }
+                cli_out ("%-40s%-40s", key, value);
+        }
+
+out:
+        if (ret) {
+                cli_out ("volume get option failed. Check the cli/glusterd log "
+                         "file for more details");
+        }
+        if (dict)
+                dict_unref (dict);
+        free (rsp.op_errstr);
+        free (rsp.dict.dict_val);
+        cli_cmd_broadcast_response (ret);
+        return ret;
+}
+
+int
+gf_cli_get_vol_opt (call_frame_t *frame, xlator_t *this, void *data)
+{
+        gf_cli_req  req     = {{0,}};
+        dict_t     *options = NULL;
+        int         ret     = -1;
+
+        if (!frame || !this || !data)
+                goto out;
+
+        options = data;
+
+        ret = cli_to_glusterd (&req, frame, gf_cli_get_vol_opt_cbk,
+                               (xdrproc_t)xdr_gf_cli_req, options,
+                               GLUSTER_CLI_GET_VOL_OPT, this, cli_rpc_prog,
                                NULL);
 out:
         gf_log ("cli", GF_LOG_DEBUG, "Returning %d", ret);
@@ -8769,6 +9610,8 @@ struct rpc_clnt_procedure gluster_cli_actors[GLUSTER_CLI_MAXVALUE] = {
         [GLUSTER_CLI_COPY_FILE]        = {"COPY_FILE", gf_cli_copy_file},
         [GLUSTER_CLI_SYS_EXEC]         = {"SYS_EXEC", gf_cli_sys_exec},
         [GLUSTER_CLI_SNAP]             = {"SNAP", gf_cli_snapshot},
+        [GLUSTER_CLI_BARRIER_VOLUME]   = {"BARRIER VOLUME", gf_cli_barrier_volume},
+        [GLUSTER_CLI_GET_VOL_OPT]      = {"GET_VOL_OPT", gf_cli_get_vol_opt},
 };
 
 struct rpc_clnt_program cli_prog = {

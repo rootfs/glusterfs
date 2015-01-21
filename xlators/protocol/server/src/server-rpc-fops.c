@@ -18,6 +18,7 @@
 
 #include "server.h"
 #include "server-helpers.h"
+#include "rpc-common-xdr.h"
 #include "glusterfs3-xdr.h"
 #include "glusterfs3.h"
 #include "compat-errno.h"
@@ -137,8 +138,8 @@ out:
 
         if (op_ret) {
                 if (state->resolve.bname) {
-                        gf_log (this->name, ((op_errno == ENOENT) ?
-                                             GF_LOG_TRACE : GF_LOG_INFO),
+                        gf_log (this->name,
+                                fop_log_level (GF_FOP_LOOKUP, op_errno),
                                 "%"PRId64": LOOKUP %s (%s/%s) ==> "
                                 "(%s)", frame->root->unique,
                                 state->loc.path,
@@ -146,8 +147,8 @@ out:
                                 state->resolve.bname,
                                 strerror (op_errno));
                 } else {
-                        gf_log (this->name, ((op_errno == ENOENT) ?
-                                             GF_LOG_TRACE : GF_LOG_INFO),
+                        gf_log (this->name,
+                                fop_log_level (GF_FOP_LOOKUP, op_errno),
                                 "%"PRId64": LOOKUP %s (%s) ==> (%s)",
                                 frame->root->unique, state->loc.path,
                                 uuid_utoa (state->resolve.gfid),
@@ -178,15 +179,13 @@ server_lk_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                                     rsp.xdata.xdata_len, op_errno, out);
 
         if (op_ret) {
-                if ((op_errno != ENOSYS) && (op_errno != EAGAIN)) {
-                        state = CALL_STATE (frame);
-                        gf_log (this->name, GF_LOG_INFO,
-                                "%"PRId64": LK %"PRId64" (%s) ==> "
-                                "(%s)", frame->root->unique,
-                                state->resolve.fd_no,
-                                uuid_utoa (state->resolve.gfid),
-                                strerror (op_errno));
-                }
+                state = CALL_STATE (frame);
+                gf_log (this->name, fop_log_level (GF_FOP_LK, op_errno),
+                        "%"PRId64": LK %"PRId64" (%s) ==> "
+                        "(%s)", frame->root->unique,
+                        state->resolve.fd_no,
+                        uuid_utoa (state->resolve.gfid),
+                        strerror (op_errno));
                 goto out;
         }
 
@@ -236,14 +235,11 @@ server_inodelk_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         state = CALL_STATE (frame);
 
         if (op_ret < 0) {
-                if ((op_errno != ENOSYS) && (op_errno != EAGAIN)) {
-                        gf_log (this->name, (op_errno == ENOENT)?
-                                GF_LOG_DEBUG:GF_LOG_ERROR,
-                                "%"PRId64": INODELK %s (%s) ==> (%s)",
-                                frame->root->unique, state->loc.path,
-                                uuid_utoa (state->resolve.gfid),
-                                strerror (op_errno));
-                }
+                gf_log (this->name, fop_log_level (GF_FOP_INODELK, op_errno),
+                        "%"PRId64": INODELK %s (%s) ==> (%s)",
+                        frame->root->unique, state->loc.path,
+                        uuid_utoa (state->resolve.gfid),
+                        strerror (op_errno));
                 goto out;
         }
 
@@ -275,14 +271,12 @@ server_finodelk_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         state = CALL_STATE (frame);
 
         if (op_ret < 0) {
-                if ((op_errno != ENOSYS) && (op_errno != EAGAIN)) {
-                        gf_log (this->name, GF_LOG_INFO,
-                                "%"PRId64": FINODELK %"PRId64" (%s) "
-                                "==> (%s)", frame->root->unique,
-                                state->resolve.fd_no,
-                                uuid_utoa (state->resolve.gfid),
-                                strerror (op_errno));
-                }
+                gf_log (this->name, fop_log_level (GF_FOP_FINODELK, op_errno),
+                        "%"PRId64": FINODELK %"PRId64" (%s) "
+                        "==> (%s)", frame->root->unique,
+                        state->resolve.fd_no,
+                        uuid_utoa (state->resolve.gfid),
+                        strerror (op_errno));
                 goto out;
         }
 
@@ -313,13 +307,11 @@ server_entrylk_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         state = CALL_STATE (frame);
 
         if (op_ret < 0) {
-                if ((op_errno != ENOSYS) && (op_errno != EAGAIN)) {
-                        gf_log (this->name, GF_LOG_INFO,
-                                "%"PRId64": ENTRYLK %s (%s) ==> (%s)",
-                                frame->root->unique, state->loc.path,
-                                uuid_utoa (state->resolve.gfid),
-                                strerror (op_errno));
-                }
+                gf_log (this->name, fop_log_level (GF_FOP_ENTRYLK, op_errno),
+                        "%"PRId64": ENTRYLK %s (%s) ==> (%s)",
+                        frame->root->unique, state->loc.path,
+                        uuid_utoa (state->resolve.gfid),
+                        strerror (op_errno));
                 goto out;
         }
 
@@ -351,13 +343,11 @@ server_fentrylk_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         state = CALL_STATE (frame);
 
         if (op_ret < 0) {
-                if ((op_errno != ENOSYS) && (op_errno != EAGAIN)) {
-                        gf_log (this->name, GF_LOG_INFO,
-                                "%"PRId64": FENTRYLK %"PRId64" (%s) ==>(%s)",
-                                frame->root->unique, state->resolve.fd_no,
-                                uuid_utoa (state->resolve.gfid),
-                                strerror (op_errno));
-                }
+                gf_log (this->name, fop_log_level (GF_FOP_FENTRYLK, op_errno),
+                        "%"PRId64": FENTRYLK %"PRId64" (%s) ==>(%s)",
+                        frame->root->unique, state->resolve.fd_no,
+                        uuid_utoa (state->resolve.gfid),
+                        strerror (op_errno));
                 goto out;
         }
 
@@ -652,8 +642,7 @@ server_opendir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         if (op_ret < 0) {
                 state = CALL_STATE (frame);
-                gf_log (this->name, (op_errno == ENOENT)?
-                        GF_LOG_DEBUG:GF_LOG_ERROR,
+                gf_log (this->name, fop_log_level (GF_FOP_OPENDIR, op_errno),
                         "%"PRId64": OPENDIR %s (%s) ==> (%s)",
                         frame->root->unique, state->loc.path,
                         uuid_utoa (state->resolve.gfid), strerror (op_errno));
@@ -691,13 +680,19 @@ server_removexattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         gf_common_rsp        rsp   = {0,};
         rpcsvc_request_t    *req   = NULL;
         server_state_t      *state = NULL;
+        gf_loglevel_t        loglevel = GF_LOG_NONE;
 
         GF_PROTOCOL_DICT_SERIALIZE (this, xdata, &rsp.xdata.xdata_val,
                                     rsp.xdata.xdata_len, op_errno, out);
 
         if (op_ret == -1) {
                 state = CALL_STATE (frame);
-                gf_log (this->name, GF_LOG_INFO,
+                if (ENODATA == op_errno || ENOATTR == op_errno)
+                        loglevel = GF_LOG_DEBUG;
+                else
+                        loglevel = GF_LOG_INFO;
+
+                gf_log (this->name, loglevel,
                         "%"PRId64": REMOVEXATTR %s (%s) of key %s ==> (%s)",
                         frame->root->unique, state->loc.path,
                         uuid_utoa (state->resolve.gfid),
@@ -766,10 +761,7 @@ server_getxattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         if (op_ret == -1) {
                 state = CALL_STATE (frame);
-                gf_log (this->name, (((op_errno == ENOTSUP) ||
-                                      (op_errno == ENODATA) ||
-                                      (op_errno == ENOENT)) ?
-                                     GF_LOG_DEBUG : GF_LOG_INFO),
+                gf_log (this->name, fop_log_level (GF_FOP_GETXATTR, op_errno),
                         "%"PRId64": GETXATTR %s (%s) (%s) ==> (%s)",
                         frame->root->unique, state->loc.path,
                         uuid_utoa (state->resolve.gfid),
@@ -810,10 +802,7 @@ server_fgetxattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         if (op_ret == -1) {
                 state = CALL_STATE (frame);
-                gf_log (this->name, (((op_errno == ENOTSUP) ||
-                                      (op_errno == ENODATA) ||
-                                      (op_errno == ENOENT)) ?
-                                     GF_LOG_DEBUG : GF_LOG_INFO),
+                gf_log (this->name, fop_log_level (GF_FOP_FGETXATTR, op_errno),
                         "%"PRId64": FGETXATTR %"PRId64" (%s) (%s) ==> (%s)",
                         frame->root->unique, state->resolve.fd_no,
                         uuid_utoa (state->resolve.gfid),
@@ -1052,8 +1041,7 @@ server_unlink_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         state = CALL_STATE (frame);
 
         if (op_ret) {
-                gf_log (this->name, (op_errno == ENOENT)?
-                        GF_LOG_DEBUG:GF_LOG_ERROR,
+                gf_log (this->name, fop_log_level (GF_FOP_UNLINK, op_errno),
                         "%"PRId64": UNLINK %s (%s/%s) ==> (%s)",
                         frame->root->unique, state->loc.path,
                         uuid_utoa (state->resolve.pargfid),
@@ -1313,8 +1301,7 @@ server_flush_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         if (op_ret < 0) {
                 state = CALL_STATE (frame);
-                gf_log (this->name, (op_errno == ENOENT)?
-                        GF_LOG_DEBUG:GF_LOG_ERROR,
+                gf_log (this->name, fop_log_level (GF_FOP_FLUSH, op_errno),
                         "%"PRId64": FLUSH %"PRId64" (%s) ==> (%s)",
                         frame->root->unique, state->resolve.fd_no,
                         uuid_utoa (state->resolve.gfid), strerror (op_errno));
@@ -1513,8 +1500,7 @@ server_open_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         if (op_ret < 0) {
                 state = CALL_STATE (frame);
-                gf_log (this->name, (op_errno == ENOENT)?
-                        GF_LOG_DEBUG:GF_LOG_ERROR,
+                gf_log (this->name, fop_log_level (GF_FOP_OPEN, op_errno),
                         "%"PRId64": OPEN %s (%s) ==> (%s)",
                         frame->root->unique, state->loc.path,
                         uuid_utoa (state->resolve.gfid),
@@ -1611,8 +1597,8 @@ server_create_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         fd_no = gf_fd_unused_get (serv_ctx->fdtable, fd);
         fd_ref (fd);
 
-        if ((fd_no < 0) || (fd == 0)) {
-                op_ret = fd_no;
+        if ((fd_no > UINT64_MAX) || (fd == 0)) {
+                op_ret = -1;
                 op_errno = errno;
         }
 
@@ -1689,8 +1675,7 @@ server_stat_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         if (op_ret) {
                 state  = CALL_STATE (frame);
-                gf_log (this->name, (op_errno == ENOENT)?
-                        GF_LOG_DEBUG:GF_LOG_ERROR,
+                gf_log (this->name, fop_log_level (GF_FOP_STAT, op_errno),
                         "%"PRId64": STAT %s (%s) ==> (%s)",
                         frame->root->unique, state->loc.path,
                         uuid_utoa (state->resolve.gfid),
@@ -1883,6 +1868,8 @@ server_readdirp_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         rpcsvc_request_t    *req   = NULL;
         int                  ret   = 0;
 
+        state = CALL_STATE (frame);
+
         GF_PROTOCOL_DICT_SERIALIZE (this, xdata, &rsp.xdata.xdata_val,
                                     rsp.xdata.xdata_len, op_errno, out);
 
@@ -1906,8 +1893,7 @@ server_readdirp_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                 }
         }
 
-        /* TODO: need more clear thoughts before calling this function. */
-        /* gf_link_inodes_from_dirent (this, state->fd->inode, entries); */
+        gf_link_inodes_from_dirent (this, state->fd->inode, entries);
 
 out:
         rsp.op_ret    = op_ret;
@@ -3766,7 +3752,7 @@ server3_3_writev (rpcsvc_request_t *req)
                                       op_errno, out);
 
 #ifdef GF_TESTING_IO_XDATA
-        dict_dump (state->xdata);
+        dict_dump_to_log (state->xdata);
 #endif
 
         ret = 0;
@@ -4335,7 +4321,9 @@ server3_3_setxattr (rpcsvc_request_t *req)
         ret = 0;
         resolve_and_resume (frame, server_setxattr_resume);
 
-        return ret;
+        /* 'dict' will be destroyed later when 'state' is not needed anymore */
+        dict = NULL;
+
 out:
         free (args.xdata.xdata_val);
 
@@ -4409,7 +4397,9 @@ server3_3_fsetxattr (rpcsvc_request_t *req)
         ret = 0;
         resolve_and_resume (frame, server_fsetxattr_resume);
 
-        return ret;
+        /* 'dict' will be destroyed later when 'state' is not needed anymore */
+        dict = NULL;
+
 out:
         free (args.xdata.xdata_val);
 
@@ -4483,7 +4473,8 @@ server3_3_fxattrop (rpcsvc_request_t *req)
         ret = 0;
         resolve_and_resume (frame, server_fxattrop_resume);
 
-        return ret;
+        /* 'dict' will be destroyed later when 'state' is not needed anymore */
+        dict = NULL;
 
 out:
         free (args.xdata.xdata_val);
@@ -4558,7 +4549,9 @@ server3_3_xattrop (rpcsvc_request_t *req)
         ret = 0;
         resolve_and_resume (frame, server_xattrop_resume);
 
-        return ret;
+        /* 'dict' will be destroyed later when 'state' is not needed anymore */
+        dict = NULL;
+
 out:
         free (args.xdata.xdata_val);
 
@@ -6115,6 +6108,8 @@ server3_3_statfs (rpcsvc_request_t *req)
         ret = 0;
         resolve_and_resume (frame, server_statfs_resume);
 out:
+        free (args.xdata.xdata_val);
+
         if (op_errno)
                 SERVER_REQ_SET_ERROR (req, ret);
 
@@ -6122,7 +6117,7 @@ out:
 }
 
 
-rpcsvc_actor_t glusterfs3_3_fop_actors[] = {
+rpcsvc_actor_t glusterfs3_3_fop_actors[GLUSTER_FOP_PROCCNT] = {
         [GFS3_OP_NULL]         = {"NULL",         GFS3_OP_NULL,         server_null,            NULL, 0, DRC_NA},
         [GFS3_OP_STAT]         = {"STAT",         GFS3_OP_STAT,         server3_3_stat,         NULL, 0, DRC_NA},
         [GFS3_OP_READLINK]     = {"READLINK",     GFS3_OP_READLINK,     server3_3_readlink,     NULL, 0, DRC_NA},

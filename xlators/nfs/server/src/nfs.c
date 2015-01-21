@@ -35,16 +35,15 @@
 #include "options.h"
 #include "acl3.h"
 #include "rpc-drc.h"
-
-#define STRINGIFY(val) #val
-#define TOSTRING(val) STRINGIFY(val)
+#include "syscall.h"
 
 #define OPT_SERVER_AUX_GIDS             "nfs.server-aux-gids"
 #define OPT_SERVER_GID_CACHE_TIMEOUT    "nfs.server.aux-gid-timeout"
+#define OPT_SERVER_RPC_STATD             "nfs.rpc-statd"
+#define OPT_SERVER_RPC_STATD_PIDFILE     "nfs.rpc-statd-pidfile"
+#define OPT_SERVER_RPC_STATD_NOTIFY_PIDFILE "nfs.rpc-statd-notify-pidfile"
 
-/* TODO: DATADIR should be based on configure's $(localstatedir) */
-#define DATADIR                         "/var/lib/glusterd"
-#define NFS_DATADIR                     DATADIR "/nfs"
+#define NFS_DATADIR                     GLUSTERD_DEFAULT_WORKDIR "/nfs"
 
 /* Forward declaration */
 int nfs_add_initer (struct list_head *list, nfs_version_initer_t init);
@@ -847,12 +846,13 @@ nfs_init_state (xlator_t *this)
                 }
         }
 
-        if (dict_get(this->options, "transport-type") == NULL) {
-                ret = dict_set_str (this->options, "transport-type", "socket");
-                if (ret == -1) {
-                        gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
-                        goto free_foppool;
-                }
+        /* Right only socket support exists between nfs client and
+         * gluster nfs, so we can set default value as socket
+         */
+        ret = dict_set_str (this->options, "transport-type", "socket");
+        if (ret == -1) {
+                gf_log (GF_NFS, GF_LOG_ERROR, "dict_set_str error");
+                goto free_foppool;
         }
 
         nfs->mount_udp = 0;
@@ -942,10 +942,14 @@ nfs_init_state (xlator_t *this)
                         goto free_foppool;
                 }
         }
+	GF_OPTION_INIT (OPT_SERVER_RPC_STATD, nfs->rpc_statd, path, free_foppool);
+
+	GF_OPTION_INIT (OPT_SERVER_RPC_STATD_PIDFILE, nfs->rpc_statd_pid_file, path, free_foppool);
 
         GF_OPTION_INIT (OPT_SERVER_AUX_GIDS, nfs->server_aux_gids,
                         bool, free_foppool);
-        GF_OPTION_INIT (OPT_SERVER_GID_CACHE_TIMEOUT, nfs->server_aux_gids_max_age,
+        GF_OPTION_INIT (OPT_SERVER_GID_CACHE_TIMEOUT,
+                        nfs->server_aux_gids_max_age,
                         uint32, free_foppool);
 
         if (gid_cache_init(&nfs->gid_cache, nfs->server_aux_gids_max_age) < 0) {
@@ -953,9 +957,17 @@ nfs_init_state (xlator_t *this)
                 goto free_foppool;
         }
 
-        if (stat("/sbin/rpc.statd", &stbuf) == -1) {
-                gf_log (GF_NFS, GF_LOG_WARNING, "/sbin/rpc.statd not found. "
-                        "Disabling NLM");
+        ret = sys_access (nfs->rpc_statd, X_OK);
+        if (ret) {
+                gf_log (GF_NFS, GF_LOG_WARNING, "%s not enough permissions to"
+                        " access. Disabling NLM", nfs->rpc_statd);
+                nfs->enable_nlm = _gf_false;
+        }
+
+        ret = sys_stat (nfs->rpc_statd, &stbuf);
+        if (ret || !S_ISREG (stbuf.st_mode)) {
+                gf_log (GF_NFS, GF_LOG_WARNING, "%s not a regular file."
+                        " Disabling NLM", nfs->rpc_statd);
                 nfs->enable_nlm = _gf_false;
         }
 
@@ -968,8 +980,8 @@ nfs_init_state (xlator_t *this)
         }
 
         ret = rpcsvc_set_outstanding_rpc_limit (nfs->rpcsvc,
-                                  this->options,
-                                  RPCSVC_DEF_NFS_OUTSTANDING_RPC_LIMIT);
+                                                this->options,
+                                                RPCSVC_DEF_NFS_OUTSTANDING_RPC_LIMIT);
         if (ret < 0) {
                 gf_log (GF_NFS, GF_LOG_ERROR,
                         "Failed to configure outstanding-rpc-limit");
@@ -1023,7 +1035,8 @@ nfs_reconfigure_state (xlator_t *this, dict_t *options)
 {
         int                 ret = 0;
         int                 keyindx = 0;
-        char                *optstr = NULL;
+        char                *rmtab = NULL;
+        char                *rpc_statd = NULL;
         gf_boolean_t        optbool;
         uint32_t            optuint32;
         struct nfs_state    *nfs = NULL;
@@ -1068,19 +1081,36 @@ nfs_reconfigure_state (xlator_t *this, dict_t *options)
                 goto out;
         }
 
+        /* reconfig nfs.rpc-statd...  */
+        rpc_statd = GF_RPC_STATD_PROG;
+        if (dict_get (options, OPT_SERVER_RPC_STATD_PIDFILE)) {
+                ret = dict_get_str (options, "nfs.rpc-statd", &rpc_statd);
+                if (ret < 0) {
+                        gf_log (GF_NFS, GF_LOG_ERROR, "Failed to read "
+                                "reconfigured option: nfs.rpc-statd");
+                        goto out;
+                }
+        }
+
+        if (strcmp(nfs->rpc_statd, rpc_statd) != 0) {
+                gf_log (GF_NFS, GF_LOG_INFO,
+                        "Reconfiguring nfs.rpc-statd needs NFS restart");
+                goto out;
+        }
+
         /* reconfig nfs.mount-rmtab */
-        optstr = NFS_DATADIR "/rmtab";
+        rmtab = NFS_DATADIR "/rmtab";
         if (dict_get (options, "nfs.mount-rmtab")) {
-                ret = dict_get_str (options, "nfs.mount-rmtab", &optstr);
+                ret = dict_get_str (options, "nfs.mount-rmtab", &rmtab);
                 if (ret < 0) {
                         gf_log (GF_NFS, GF_LOG_ERROR, "Failed to read "
                                 "reconfigured option: nfs.mount-rmtab");
                         goto out;
                 }
-                gf_path_strip_trailing_slashes (optstr);
+                gf_path_strip_trailing_slashes (rmtab);
         }
-        if (strcmp (nfs->rmtab, optstr) != 0) {
-                mount_rewrite_rmtab (nfs->mstate, optstr);
+        if (strcmp (nfs->rmtab, rmtab) != 0) {
+                mount_rewrite_rmtab (nfs->mstate, rmtab);
                 gf_log (GF_NFS, GF_LOG_INFO,
                                 "Reconfigured nfs.mount-rmtab path: %s",
                                 nfs->rmtab);
@@ -1503,10 +1533,10 @@ struct xlator_dumpops dumpops = {
 };
 
 /* TODO: If needed, per-volume options below can be extended to be export
-+ * specific also because after export-dir is introduced, a volume is not
-+ * neccessarily an export whereas different subdirectories within that volume
-+ * can be and may need these options to be specified separately.
-+ */
+ * specific also because after export-dir is introduced, a volume is not
+ * necessarily an export whereas different subdirectories within that volume
+ * can be and may need these options to be specified separately.
+*/
 struct volume_options options[] = {
         { .key  = {"nfs3.read-size"},
           .type = GF_OPTION_TYPE_SIZET,
@@ -1665,7 +1695,7 @@ struct volume_options options[] = {
                          "unrecognized option warnings."
         },
         { .key  = {"rpc-auth.addr.allow"},
-          .type = GF_OPTION_TYPE_INTERNET_ADDRESS_LIST,
+          .type = GF_OPTION_TYPE_CLIENT_AUTH_ADDR,
           .default_value = "all",
           .description = "Allow a comma separated list of addresses and/or"
                          " hostnames to connect to the server. By default, all"
@@ -1673,7 +1703,7 @@ struct volume_options options[] = {
                          "define a general rule for all exported volumes."
         },
         { .key  = {"rpc-auth.addr.reject"},
-          .type = GF_OPTION_TYPE_INTERNET_ADDRESS_LIST,
+          .type = GF_OPTION_TYPE_CLIENT_AUTH_ADDR,
           .default_value = "none",
           .description = "Reject a comma separated list of addresses and/or"
                          " hostnames from connecting to the server. By default,"
@@ -1681,7 +1711,7 @@ struct volume_options options[] = {
                          "define a general rule for all exported volumes."
         },
         { .key  = {"rpc-auth.addr.*.allow"},
-          .type = GF_OPTION_TYPE_INTERNET_ADDRESS_LIST,
+          .type = GF_OPTION_TYPE_CLIENT_AUTH_ADDR,
           .default_value = "all",
           .description = "Allow a comma separated list of addresses and/or"
                          " hostnames to connect to the server. By default, all"
@@ -1689,7 +1719,7 @@ struct volume_options options[] = {
                          "define a rule for a specific exported volume."
         },
         { .key  = {"rpc-auth.addr.*.reject"},
-          .type = GF_OPTION_TYPE_INTERNET_ADDRESS_LIST,
+          .type = GF_OPTION_TYPE_CLIENT_AUTH_ADDR,
           .default_value = "none",
           .description = "Reject a comma separated list of addresses and/or"
                          " hostnames from connecting to the server. By default,"
@@ -1793,6 +1823,16 @@ struct volume_options options[] = {
           .description = "This option is used to start or stop the NFS server "
                          "for individual volumes."
         },
+        { .key  = {"nfs-ganesha.*.host"},
+          .type = GF_OPTION_TYPE_INTERNET_ADDRESS_LIST,
+          .default_value = "none",
+          .description = "Set nfs-ganesha host IP"
+        },
+        { .key  = {"nfs-ganesha.*.enable"},
+          .type = GF_OPTION_TYPE_BOOL,
+          .default_value = "off",
+          .description = "This option, if set to 'on', enables exports via nfs-ganesha "
+        },
 
         { .key  = {"nfs.nlm"},
           .type = GF_OPTION_TYPE_BOOL,
@@ -1812,12 +1852,24 @@ struct volume_options options[] = {
         },
         { .key = {"nfs.mount-rmtab"},
           .type = GF_OPTION_TYPE_PATH,
-          .default_value = DATADIR "/rmtab",
+          .default_value = NFS_DATADIR "/rmtab",
           .description = "Set the location of the cache file that is used to "
                          "list all the NFS-clients that have connected "
                          "through the MOUNT protocol. If this is on shared "
                          "storage, all GlusterFS servers will update and "
                          "output (with 'showmount') the same list."
+        },
+        { .key = {OPT_SERVER_RPC_STATD},
+          .type = GF_OPTION_TYPE_PATH,
+          .default_value = GF_RPC_STATD_PROG,
+          .description = "The executable of RPC statd utility. "
+                         "Defaults to " GF_RPC_STATD_PROG
+        },
+        { .key = {OPT_SERVER_RPC_STATD_PIDFILE},
+          .type = GF_OPTION_TYPE_PATH,
+          .default_value = GF_RPC_STATD_PIDFILE,
+          .description = "The pid file of RPC statd utility. "
+                         "Defaults to " GF_RPC_STATD_PIDFILE
         },
         { .key = {OPT_SERVER_AUX_GIDS},
           .type = GF_OPTION_TYPE_BOOL,
@@ -1844,7 +1896,7 @@ struct volume_options options[] = {
         },
         { .key  = {"nfs.drc"},
           .type = GF_OPTION_TYPE_STR,
-          .default_value = "on",
+          .default_value = "off",
           .description = "Enable Duplicate Request Cache in gNFS server to "
                          "improve correctness of non-idempotent operations like "
                          "write, delete, link, et al"

@@ -291,8 +291,10 @@ synctask_yield (struct synctask *task)
         task->proc->sched.uc_flags &= ~_UC_TLSBASE;
 #endif
 
-        if (task->state != SYNCTASK_DONE)
+        if (task->state != SYNCTASK_DONE) {
                 task->state = SYNCTASK_SUSPEND;
+                (void) gf_backtrace_save (task->btbuf);
+        }
         if (swapcontext (&task->ctx, &task->proc->sched) < 0) {
                 gf_log ("syncop", GF_LOG_ERROR,
                         "swapcontext failed (%s)", strerror (errno));
@@ -1386,12 +1388,13 @@ syncop_listxattr (xlator_t *subvol, loc_t *loc, dict_t **dict)
 }
 
 int
-syncop_getxattr (xlator_t *subvol, loc_t *loc, dict_t **dict, const char *key)
+syncop_getxattr (xlator_t *subvol, loc_t *loc, dict_t **dict, const char *key,
+                 dict_t *xdata)
 {
         struct syncargs args = {0, };
 
         SYNCOP (subvol, (&args), syncop_getxattr_cbk, subvol->fops->getxattr,
-                loc, key, NULL);
+                loc, key, xdata);
 
         if (dict)
                 *dict = args.xattr;
@@ -1404,12 +1407,13 @@ syncop_getxattr (xlator_t *subvol, loc_t *loc, dict_t **dict, const char *key)
 }
 
 int
-syncop_fgetxattr (xlator_t *subvol, fd_t *fd, dict_t **dict, const char *key)
+syncop_fgetxattr (xlator_t *subvol, fd_t *fd, dict_t **dict, const char *key,
+                  dict_t *xdata)
 {
         struct syncargs args = {0, };
 
         SYNCOP (subvol, (&args), syncop_getxattr_cbk, subvol->fops->fgetxattr,
-                fd, key, NULL);
+                fd, key, xdata);
 
         if (dict)
                 *dict = args.xattr;
@@ -1436,6 +1440,8 @@ syncop_statfs_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         if (op_ret == 0) {
                 args->statvfs_buf  = *buf;
+                if (xdata)
+                        args->xdata  = dict_ref (xdata);
         }
 
         __wake (args);
@@ -1445,16 +1451,21 @@ syncop_statfs_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
 
 int
-syncop_statfs (xlator_t *subvol, loc_t *loc, struct statvfs *buf)
+syncop_statfs (xlator_t *subvol, loc_t *loc, dict_t *xdata_req,
+               struct statvfs *buf, dict_t **xdata_rsp)
 
 {
         struct syncargs args = {0, };
 
         SYNCOP (subvol, (&args), syncop_statfs_cbk, subvol->fops->statfs,
-                loc, NULL);
+                loc, xdata_req);
 
         if (buf)
                 *buf = args.statvfs_buf;
+        if (xdata_rsp)
+                *xdata_rsp = args.xdata;
+        else if (args.xdata)
+                dict_unref (args.xdata);
 
         if (args.op_ret < 0)
                 return -args.op_errno;
@@ -2174,6 +2185,21 @@ syncop_access_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         return 0;
 }
 
+/* posix_acl xlator will respond in different ways for access calls from
+   fuse and access calls from nfs. For fuse, checking op_ret is sufficient
+   to check whether the access call is successful or not. But for nfs the
+   mode of the access that is permitted is put into op_errno before unwind.
+   With syncop, the caller of syncop_access will not be able to get the
+   mode of the access despite call being successul (since syncop_access
+   returns only the op_ret collected in args).
+   Now, if access call is failed, then args.op_ret is returned to recognise
+   the failure. But if op_ret is zero, then the mode of access which is
+   set in args.op_errno is returned. Thus the caller of syncop_access
+   has to check whether the return value is less than zero or not. If the
+   return value it got is less than zero, then access call is failed.
+   If it is not, then the access call is successful and the value the caller
+   got is the mode of the access.
+*/
 int
 syncop_access (xlator_t *subvol, loc_t *loc, int32_t mask)
 {
@@ -2184,7 +2210,7 @@ syncop_access (xlator_t *subvol, loc_t *loc, int32_t mask)
 
         if (args.op_ret < 0)
                 return -args.op_errno;
-        return args.op_ret;
+        return args.op_errno;
 }
 
 
@@ -2312,5 +2338,47 @@ syncop_lk (xlator_t *subvol, fd_t *fd, int cmd, struct gf_flock *flock)
 
         if (args.op_ret < 0)
                 return -args.op_errno;
+        return args.op_ret;
+}
+
+int32_t
+syncop_inodelk_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                    int32_t op_ret, int32_t op_errno, dict_t *xdata)
+{
+        struct syncargs *args = NULL;
+
+        args = cookie;
+
+        args->op_ret   = op_ret;
+        args->op_errno = op_errno;
+
+        if (xdata)
+                args->xdata = dict_ref (xdata);
+
+        __wake (args);
+
+        return 0;
+
+}
+
+int
+syncop_inodelk (xlator_t *subvol, const char *volume, loc_t *loc, int32_t cmd,
+                struct gf_flock *lock, dict_t *xdata_req, dict_t **xdata_rsp)
+{
+        struct syncargs args = {0, };
+
+        SYNCOP (subvol, (&args), syncop_inodelk_cbk, subvol->fops->inodelk,
+                volume, loc, cmd, lock, xdata_req);
+
+        if (xdata_rsp)
+                *xdata_rsp = args.xdata;
+        else {
+                if (args.xdata)
+                        dict_unref (args.xdata);
+        }
+
+        if (args.op_ret < 0)
+                return -args.op_errno;
+
         return args.op_ret;
 }

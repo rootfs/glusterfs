@@ -26,6 +26,8 @@
 #include "xlator.h"
 #include "syscall.h"
 
+#include "compat-errno.h"
+
 inode_t *
 posix_resolve (xlator_t *this, inode_table_t *itable, inode_t *parent,
                char *bname, struct iatt *iabuf)
@@ -160,7 +162,6 @@ posix_make_ancestryfromgfid (xlator_t *this, char *path, int pathsize,
 
         pgfidstr = strtok_r (linkname + SLEN("../../00/00/"), "/", &saveptr);
         dir_name = strtok_r (NULL, "/", &saveptr);
-        strcat (dir_name, "/");
 
         uuid_parse (pgfidstr, tmp_gfid);
 
@@ -176,6 +177,7 @@ posix_make_ancestryfromgfid (xlator_t *this, char *path, int pathsize,
 
         inode = posix_resolve (this, itable, *parent, dir_name, &iabuf);
 
+        strcat (dir_name, "/");
         ret = posix_make_ancestral_node (priv_base_path, path, pathsize, head,
                                          dir_name, &iabuf, inode, type, xdata);
         if (*parent != NULL) {
@@ -293,13 +295,16 @@ posix_handle_pump (xlator_t *this, char *buf, int len, int maxlen,
         }
 
         blen = link_len - 48;
+
+        if(len + blen >= maxlen)
+                goto err;
+
         memmove (buf + base_len + blen, buf + base_len,
                  (strlen (buf) - base_len) + 1);
 
         strncpy (base_str + pfx_len, linkname + 6, 42);
 
-        if (len + blen < maxlen)
-                strncpy (buf + pfx_len, linkname + 6, link_len - 6);
+        strncpy (buf + pfx_len, linkname + 6, link_len - 6);
 out:
         return len + blen;
 err:
@@ -438,7 +443,6 @@ posix_handle_init (xlator_t *this)
         struct posix_private *priv = NULL;
         char                 *handle_pfx = NULL;
         int                   ret = 0;
-        int                   len = 0;
         struct stat           stbuf;
         struct stat           rootbuf;
         struct stat           exportbuf;
@@ -491,9 +495,7 @@ posix_handle_init (xlator_t *this)
 
         stat (handle_pfx, &priv->handledir);
 
-        len = posix_handle_path (this, gfid, NULL, NULL, 0);
-        rootstr = alloca (len);
-        posix_handle_path (this, gfid, NULL, rootstr, len);
+        MAKE_HANDLE_ABSPATH(rootstr, this, gfid);
 
         ret = stat (rootstr, &rootbuf);
         switch (ret) {
@@ -550,7 +552,7 @@ posix_does_old_trash_exists (char *old_trash)
         ret = lstat (old_trash, &stbuf);
         if ((ret == 0) && S_ISDIR (stbuf.st_mode)) {
                 ret = sys_lgetxattr (old_trash, "trusted.gfid", gfid, 16);
-                if ((ret < 0) && (errno == ENODATA))
+                if ((ret < 0) && (errno == ENODATA || errno == ENOATTR) )
                         exists = _gf_true;
         }
         return exists;
@@ -683,7 +685,7 @@ posix_handle_hard (xlator_t *this, const char *oldpath, uuid_t gfid, struct stat
         int          ret = -1;
 
 
-        MAKE_HANDLE_PATH (newpath, this, gfid, NULL);
+        MAKE_HANDLE_ABSPATH (newpath, this, gfid);
 
         ret = lstat (newpath, &newbuf);
         if (ret == -1 && errno != ENOENT) {
@@ -742,10 +744,8 @@ posix_handle_soft (xlator_t *this, const char *real_path, loc_t *loc,
         struct stat  newbuf;
         int          ret = -1;
 
-
-        MAKE_HANDLE_PATH (newpath, this, gfid, NULL);
+        MAKE_HANDLE_ABSPATH (newpath, this, gfid);
         MAKE_HANDLE_RELPATH (oldpath, this, loc->pargfid, loc->name);
-
 
         ret = lstat (newpath, &newbuf);
         if (ret == -1 && errno != ENOENT) {
@@ -804,7 +804,7 @@ posix_handle_soft (xlator_t *this, const char *real_path, loc_t *loc,
 }
 
 
-static int
+int
 posix_handle_unset_gfid (xlator_t *this, uuid_t gfid)
 {
         char        *path = NULL;

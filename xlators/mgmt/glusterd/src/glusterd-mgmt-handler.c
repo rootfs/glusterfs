@@ -122,7 +122,6 @@ glusterd_handle_mgmt_v3_lock_fn (rpcsvc_request_t *req)
 {
         gd1_mgmt_v3_lock_req    lock_req        = {{0},};
         int32_t                 ret             = -1;
-        glusterd_peerinfo_t    *peerinfo        = NULL;
         glusterd_op_lock_ctx_t *ctx             = NULL;
         xlator_t               *this            = NULL;
         gf_boolean_t            is_synctasked   = _gf_false;
@@ -144,7 +143,7 @@ glusterd_handle_mgmt_v3_lock_fn (rpcsvc_request_t *req)
         gf_log (this->name, GF_LOG_DEBUG, "Received mgmt_v3 lock req "
                 "from uuid: %s", uuid_utoa (lock_req.uuid));
 
-        if (glusterd_friend_find_by_uuid (lock_req.uuid, &peerinfo)) {
+        if (glusterd_peerinfo_find_by_uuid (lock_req.uuid) == NULL) {
                 gf_log (this->name, GF_LOG_WARNING, "%s doesn't "
                         "belong to the cluster. Ignoring request.",
                         uuid_utoa (lock_req.uuid));
@@ -179,22 +178,39 @@ glusterd_handle_mgmt_v3_lock_fn (rpcsvc_request_t *req)
                                               "is_synctasked", _gf_false);
         if (is_synctasked) {
                 ret = glusterd_synctasked_mgmt_v3_lock (req, &lock_req, ctx);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "Failed to acquire mgmt_v3_locks");
+                        /* Ignore the return code, as it shouldn't be propagated
+                         * from the handler function so as to avoid double
+                         * deletion of the req
+                         */
+                        ret = 0;
+                }
+
                 /* The above function does not take ownership of ctx.
                  * Therefore we need to free the ctx explicitly. */
                 free_ctx = _gf_true;
         }
         else {
+                /* Shouldn't ignore the return code here, and it should
+                 * be propagated from the handler function as in failure
+                 * case it doesn't delete the req object
+                 */
                 ret = glusterd_op_state_machine_mgmt_v3_lock (req, &lock_req,
                                                               ctx);
+                if (ret)
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "Failed to acquire mgmt_v3_locks");
         }
 
 out:
 
-        if (ret || free_ctx) {
+        if (ctx && (ret || free_ctx)) {
                 if (ctx->dict)
                         dict_unref (ctx->dict);
-                if (ctx)
-                        GF_FREE (ctx);
+
+                GF_FREE (ctx);
         }
 
         free (lock_req.dict.dict_val);
@@ -247,7 +263,6 @@ glusterd_handle_pre_validate_fn (rpcsvc_request_t *req)
 {
         int32_t                         ret       = -1;
         gd1_mgmt_v3_pre_val_req          op_req    = {{0},};
-        glusterd_peerinfo_t            *peerinfo  = NULL;
         xlator_t                       *this      = NULL;
         char                           *op_errstr = NULL;
         dict_t                         *dict      = NULL;
@@ -267,7 +282,7 @@ glusterd_handle_pre_validate_fn (rpcsvc_request_t *req)
                 goto out;
         }
 
-        if (glusterd_friend_find_by_uuid (op_req.uuid, &peerinfo)) {
+        if (glusterd_peerinfo_find_by_uuid (op_req.uuid) == NULL) {
                 gf_log (this->name, GF_LOG_WARNING, "%s doesn't "
                         "belong to the cluster. Ignoring request.",
                         uuid_utoa (op_req.uuid));
@@ -326,8 +341,8 @@ out:
         if (rsp_dict)
                 dict_unref (rsp_dict);
 
-        gf_log (this->name, GF_LOG_TRACE, "Returning %d", ret);
-        return ret;
+        /* Return 0 from handler to avoid double deletion of req obj */
+        return 0;
 }
 
 static int
@@ -374,7 +389,6 @@ glusterd_handle_brick_op_fn (rpcsvc_request_t *req)
 {
         int32_t                         ret       = -1;
         gd1_mgmt_v3_brick_op_req         op_req    = {{0},};
-        glusterd_peerinfo_t            *peerinfo  = NULL;
         xlator_t                       *this      = NULL;
         char                           *op_errstr = NULL;
         dict_t                         *dict      = NULL;
@@ -393,7 +407,7 @@ glusterd_handle_brick_op_fn (rpcsvc_request_t *req)
                 goto out;
         }
 
-        if (glusterd_friend_find_by_uuid (op_req.uuid, &peerinfo)) {
+        if (glusterd_peerinfo_find_by_uuid (op_req.uuid) == NULL) {
                 gf_log (this->name, GF_LOG_WARNING, "%s doesn't "
                         "belong to the cluster. Ignoring request.",
                         uuid_utoa (op_req.uuid));
@@ -452,8 +466,8 @@ out:
         if (rsp_dict)
                 dict_unref (rsp_dict);
 
-        gf_log (this->name, GF_LOG_TRACE, "Returning %d", ret);
-        return ret;
+        /* Return 0 from handler to avoid double deletion of req obj */
+        return 0;
 }
 
 static int
@@ -499,7 +513,6 @@ glusterd_handle_commit_fn (rpcsvc_request_t *req)
 {
         int32_t                         ret       = -1;
         gd1_mgmt_v3_commit_req           op_req    = {{0},};
-        glusterd_peerinfo_t            *peerinfo  = NULL;
         xlator_t                       *this      = NULL;
         char                           *op_errstr = NULL;
         dict_t                         *dict      = NULL;
@@ -518,7 +531,7 @@ glusterd_handle_commit_fn (rpcsvc_request_t *req)
                 goto out;
         }
 
-        if (glusterd_friend_find_by_uuid (op_req.uuid, &peerinfo)) {
+        if (glusterd_peerinfo_find_by_uuid (op_req.uuid) == NULL) {
                 gf_log (this->name, GF_LOG_WARNING, "%s doesn't "
                         "belong to the cluster. Ignoring request.",
                         uuid_utoa (op_req.uuid));
@@ -577,8 +590,8 @@ out:
         if (rsp_dict)
                 dict_unref (rsp_dict);
 
-        gf_log (this->name, GF_LOG_TRACE, "Returning %d", ret);
-        return ret;
+        /* Return 0 from handler to avoid double deletion of req obj */
+        return 0;
 }
 
 static int
@@ -625,7 +638,6 @@ glusterd_handle_post_validate_fn (rpcsvc_request_t *req)
 {
         int32_t                         ret       = -1;
         gd1_mgmt_v3_post_val_req         op_req    = {{0},};
-        glusterd_peerinfo_t            *peerinfo  = NULL;
         xlator_t                       *this      = NULL;
         char                           *op_errstr = NULL;
         dict_t                         *dict      = NULL;
@@ -645,7 +657,7 @@ glusterd_handle_post_validate_fn (rpcsvc_request_t *req)
                 goto out;
         }
 
-        if (glusterd_friend_find_by_uuid (op_req.uuid, &peerinfo)) {
+        if (glusterd_peerinfo_find_by_uuid (op_req.uuid) == NULL) {
                 gf_log (this->name, GF_LOG_WARNING, "%s doesn't "
                         "belong to the cluster. Ignoring request.",
                         uuid_utoa (op_req.uuid));
@@ -704,8 +716,8 @@ out:
         if (rsp_dict)
                 dict_unref (rsp_dict);
 
-        gf_log (this->name, GF_LOG_TRACE, "Returning %d", ret);
-        return ret;
+        /* Return 0 from handler to avoid double deletion of req obj */
+        return 0;
 }
 
 static int
@@ -794,7 +806,6 @@ glusterd_handle_mgmt_v3_unlock_fn (rpcsvc_request_t *req)
         gd1_mgmt_v3_unlock_req  lock_req        = {{0},};
         int32_t                 ret             = -1;
         glusterd_op_lock_ctx_t *ctx             = NULL;
-        glusterd_peerinfo_t    *peerinfo        = NULL;
         xlator_t               *this            = NULL;
         gf_boolean_t            is_synctasked   = _gf_false;
         gf_boolean_t            free_ctx        = _gf_false;
@@ -815,7 +826,7 @@ glusterd_handle_mgmt_v3_unlock_fn (rpcsvc_request_t *req)
         gf_log (this->name, GF_LOG_DEBUG, "Received volume unlock req "
                 "from uuid: %s", uuid_utoa (lock_req.uuid));
 
-        if (glusterd_friend_find_by_uuid (lock_req.uuid, &peerinfo)) {
+        if (glusterd_peerinfo_find_by_uuid (lock_req.uuid) == NULL) {
                 gf_log (this->name, GF_LOG_WARNING, "%s doesn't "
                         "belong to the cluster. Ignoring request.",
                         uuid_utoa (lock_req.uuid));
@@ -850,22 +861,39 @@ glusterd_handle_mgmt_v3_unlock_fn (rpcsvc_request_t *req)
                                               "is_synctasked", _gf_false);
         if (is_synctasked) {
                 ret = glusterd_syctasked_mgmt_v3_unlock (req, &lock_req, ctx);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "Failed to release mgmt_v3_locks");
+                        /* Ignore the return code, as it shouldn't be propagated
+                         * from the handler function so as to avoid double
+                         * deletion of the req
+                         */
+                        ret = 0;
+                }
+
                 /* The above function does not take ownership of ctx.
                  * Therefore we need to free the ctx explicitly. */
                 free_ctx = _gf_true;
         }
         else {
+                /* Shouldn't ignore the return code here, and it should
+                 * be propagated from the handler function as in failure
+                 * case it doesn't delete the req object
+                 */
                 ret = glusterd_op_state_machine_mgmt_v3_unlock (req, &lock_req,
                                                                 ctx);
+                if (ret)
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "Failed to release mgmt_v3_locks");
         }
 
 out:
 
-        if (ret || free_ctx) {
+        if (ctx && (ret || free_ctx)) {
                 if (ctx->dict)
                         dict_unref (ctx->dict);
-                if (ctx)
-                        GF_FREE (ctx);
+
+                GF_FREE (ctx);
         }
 
         free (lock_req.dict.dict_val);
@@ -916,7 +944,7 @@ glusterd_handle_mgmt_v3_unlock (rpcsvc_request_t *req)
                                             glusterd_handle_mgmt_v3_unlock_fn);
 }
 
-rpcsvc_actor_t gd_svc_mgmt_v3_actors[] = {
+rpcsvc_actor_t gd_svc_mgmt_v3_actors[GLUSTERD_MGMT_V3_MAXVALUE] = {
         [GLUSTERD_MGMT_V3_NULL]          = { "NULL",           GLUSTERD_MGMT_V3_NULL,          glusterd_mgmt_v3_null,         NULL, 0, DRC_NA},
         [GLUSTERD_MGMT_V3_LOCK]          = { "MGMT_V3_LOCK",   GLUSTERD_MGMT_V3_LOCK,          glusterd_handle_mgmt_v3_lock,   NULL, 0, DRC_NA},
         [GLUSTERD_MGMT_V3_PRE_VALIDATE]  = { "PRE_VAL",        GLUSTERD_MGMT_V3_PRE_VALIDATE,  glusterd_handle_pre_validate,  NULL, 0, DRC_NA},

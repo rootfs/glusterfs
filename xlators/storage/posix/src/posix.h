@@ -53,6 +53,8 @@
 #define VECTOR_SIZE 64 * 1024 /* vector size 64KB*/
 #define MAX_NO_VECT 1024
 
+#define LINKTO "trusted.glusterfs.dht.linkto"
+
 #define POSIX_GFID_HANDLE_SIZE(base_path_len) (base_path_len + SLEN("/") \
                                                + SLEN(GF_HIDDEN_PATH) + SLEN("/") \
                                                + SLEN("00/")            \
@@ -66,6 +68,7 @@ struct posix_fd {
 	int     fd;      /* fd returned by the kernel */
 	int32_t flags;   /* flags for open/creat      */
 	DIR *   dir;     /* handle returned by the kernel */
+	off_t   dir_eof; /* offset at dir EOF */
         int     odirect;
         struct list_head list; /* to add to the janitor list */
 };
@@ -74,6 +77,7 @@ struct posix_fd {
 struct posix_private {
 	char   *base_path;
 	int32_t base_path_length;
+	int32_t path_max;
 
         gf_lock_t lock;
 
@@ -158,6 +162,16 @@ struct posix_private {
         uint32_t        health_check_interval;
         pthread_t       health_check;
         gf_boolean_t    health_check_active;
+
+#ifdef GF_DARWIN_HOST_OS
+        enum {
+                XATTR_NONE = 0,
+                XATTR_STRIP,
+                XATTR_APPEND,
+                XATTR_BOTH,
+        } xattr_user_namespace;
+#endif
+
 };
 
 typedef struct {
@@ -176,6 +190,8 @@ typedef struct {
 #define POSIX_BASE_PATH(this) (((struct posix_private *)this->private)->base_path)
 
 #define POSIX_BASE_PATH_LEN(this) (((struct posix_private *)this->private)->base_path_length)
+
+#define POSIX_PATH_MAX(this) (((struct posix_private *)this->private)->path_max)
 
 /* Helper functions */
 int posix_gfid_set (xlator_t *this, const char *path, loc_t *loc,
@@ -216,4 +232,8 @@ int
 posix_get_ancestry (xlator_t *this, inode_t *leaf_inode,
                     gf_dirent_t *head, char **path, int type, int32_t *op_errno,
                     dict_t *xdata);
+
+void
+posix_gfid_unset (xlator_t *this, dict_t *xdata);
+
 #endif /* _POSIX_H */

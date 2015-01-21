@@ -13,7 +13,6 @@
 #endif
 #include <inttypes.h>
 
-
 #include "globals.h"
 #include "glusterfs.h"
 #include "compat.h"
@@ -34,6 +33,7 @@
 #include "glusterd-utils.h"
 #include "glusterd-store.h"
 #include "glusterd-locks.h"
+#include "glusterd-snapshot-utils.h"
 
 #include "glusterd1-xdr.h"
 #include "cli1-xdr.h"
@@ -41,6 +41,7 @@
 #include "rpc-clnt.h"
 #include "glusterd-volgen.h"
 #include "glusterd-mountbroker.h"
+#include "glusterd-messages.h"
 
 #include <sys/resource.h>
 #include <inttypes.h>
@@ -50,6 +51,7 @@
 
 #include "globals.h"
 #include "glusterd-syncop.h"
+#include "glusterd-messages.h"
 
 #ifdef HAVE_BD_XLATOR
 #include <lvm2app.h>
@@ -99,9 +101,9 @@ glusterd_handle_friend_req (rpcsvc_request_t *req, uuid_t  uuid,
                 port = GF_DEFAULT_BASE_PORT;
 
         ret = glusterd_remote_hostname_get (req, rhost, sizeof (rhost));
-        ret = glusterd_friend_find (uuid, rhost, &peerinfo);
+        peerinfo = glusterd_peerinfo_find (uuid, rhost);
 
-        if (ret) {
+        if (peerinfo == NULL) {
                 ret = glusterd_xfer_friend_add_resp (req, hostname, rhost, port,
                                                      -1, GF_PROBE_UNKNOWN_PEER);
                 if (friend_req->vols.vols_val) {
@@ -194,9 +196,9 @@ glusterd_handle_unfriend_req (rpcsvc_request_t *req, uuid_t  uuid,
         if (!port)
                 port = GF_DEFAULT_BASE_PORT;
 
-        ret = glusterd_friend_find (uuid, hostname, &peerinfo);
+        peerinfo = glusterd_peerinfo_find (uuid, hostname);
 
-        if (ret) {
+        if (peerinfo == NULL) {
                 gf_log ("glusterd", GF_LOG_CRITICAL,
                         "Received remove-friend from unknown peer %s",
                         hostname);
@@ -247,54 +249,6 @@ out:
                 GF_FREE (ctx);
         }
 
-        return ret;
-}
-
-static int
-glusterd_add_peer_detail_to_dict (glusterd_peerinfo_t   *peerinfo,
-                                  dict_t  *friends, int   count)
-{
-
-        int             ret = -1;
-        char            key[256] = {0, };
-        char           *peer_uuid_str = NULL;
-
-        GF_ASSERT (peerinfo);
-        GF_ASSERT (friends);
-
-        snprintf (key, 256, "friend%d.uuid", count);
-        peer_uuid_str = gd_peer_uuid_str (peerinfo);
-        ret = dict_set_str (friends, key, peer_uuid_str);
-        if (ret)
-                goto out;
-
-        snprintf (key, 256, "friend%d.hostname", count);
-        ret = dict_set_str (friends, key, peerinfo->hostname);
-        if (ret)
-                goto out;
-
-        snprintf (key, 256, "friend%d.port", count);
-        ret = dict_set_int32 (friends, key, peerinfo->port);
-        if (ret)
-                goto out;
-
-        snprintf (key, 256, "friend%d.stateId", count);
-        ret = dict_set_int32 (friends, key, peerinfo->state.state);
-        if (ret)
-                goto out;
-
-        snprintf (key, 256, "friend%d.state", count);
-        ret = dict_set_str (friends, key,
-                    glusterd_friend_sm_state_name_get(peerinfo->state.state));
-        if (ret)
-                goto out;
-
-        snprintf (key, 256, "friend%d.connected", count);
-        ret = dict_set_int32 (friends, key, (int32_t)peerinfo->connected);
-        if (ret)
-                goto out;
-
-out:
         return ret;
 }
 
@@ -376,21 +330,6 @@ glusterd_add_volume_detail_to_dict (glusterd_volinfo_t *volinfo,
         if (ret)
                 goto out;
 
-        /* As of now, the snap volumes are also displayed as part of
-           volume info command. So this change is to display whether
-           the volume is original volume or the snap_volume. If
-           displaying of snap volumes in volume info o/p is not needed
-           this should be removed.
-        */
-        snprintf (key, 256, "volume%d.snap_volume", count);
-        ret = dict_set_int32 (volumes, key, volinfo->is_snap_volume);
-        if (ret) {
-                gf_log (this->name, GF_LOG_WARNING, "failed to set whether "
-                        "the volume is a snap volume or actual volume (%s)",
-                        volinfo->volname);
-                goto out;
-        }
-
         snprintf (key, 256, "volume%d.brick_count", count);
         ret = dict_set_int32 (volumes, key, volinfo->brick_count);
         if (ret)
@@ -408,6 +347,16 @@ glusterd_add_volume_detail_to_dict (glusterd_volinfo_t *volinfo,
 
         snprintf (key, 256, "volume%d.replica_count", count);
         ret = dict_set_int32 (volumes, key, volinfo->replica_count);
+        if (ret)
+                goto out;
+
+        snprintf (key, 256, "volume%d.disperse_count", count);
+        ret = dict_set_int32 (volumes, key, volinfo->disperse_count);
+        if (ret)
+                goto out;
+
+        snprintf (key, 256, "volume%d.redundancy_count", count);
+        ret = dict_set_int32 (volumes, key, volinfo->redundancy_count);
         if (ret)
                 goto out;
 
@@ -564,49 +513,12 @@ out:
         return ret;
 }
 
-int
-glusterd_friend_find (uuid_t uuid, char *hostname,
-                      glusterd_peerinfo_t **peerinfo)
-{
-        int     ret = -1;
-        xlator_t *this = NULL;
-
-        this = THIS;
-        GF_ASSERT (this);
-
-        if (uuid) {
-                ret = glusterd_friend_find_by_uuid (uuid, peerinfo);
-
-                if (ret) {
-                        gf_log (this->name, GF_LOG_DEBUG,
-                                 "Unable to find peer by uuid: %s",
-                                 uuid_utoa (uuid));
-                } else {
-                        goto out;
-                }
-
-        }
-
-        if (hostname) {
-                ret = glusterd_friend_find_by_hostname (hostname, peerinfo);
-
-                if (ret) {
-                        gf_log (this->name, GF_LOG_DEBUG,
-                                "Unable to find hostname: %s", hostname);
-                } else {
-                        goto out;
-                }
-        }
-
-out:
-        return ret;
-}
-
 int32_t
 glusterd_op_txn_begin (rpcsvc_request_t *req, glusterd_op_t op, void *ctx,
                        char *err_str, size_t err_len)
 {
         int32_t                     ret             = -1;
+        int                         npeers          = 0;
         dict_t                     *dict            = NULL;
         xlator_t                   *this            = NULL;
         glusterd_conf_t            *priv            = NULL;
@@ -650,7 +562,7 @@ glusterd_op_txn_begin (rpcsvc_request_t *req, glusterd_op_t op, void *ctx,
         }
 
         /* Based on the op_version, acquire a cluster or mgmt_v3 lock */
-        if (priv->op_version < GD_OP_VERSION_4) {
+        if (priv->op_version < GD_OP_VERSION_3_6_0) {
                 ret = glusterd_lock (MY_UUID);
                 if (ret) {
                         gf_log (this->name, GF_LOG_ERROR,
@@ -695,9 +607,13 @@ glusterd_op_txn_begin (rpcsvc_request_t *req, glusterd_op_t op, void *ctx,
 
 local_locking_done:
 
+        INIT_LIST_HEAD (&priv->xaction_peers);
+
+        npeers = gd_build_peers_list (&priv->peers, &priv->xaction_peers, op);
+
         /* If no volname is given as a part of the command, locks will
          * not be held, hence sending stage event. */
-        if (volname || (priv->op_version < GD_OP_VERSION_4))
+        if (volname || (priv->op_version < GD_OP_VERSION_3_6_0))
                 event_type = GD_OP_EVENT_START_LOCK;
         else {
                 txn_op_info.state.state = GD_OP_STATE_LOCK_SENT;
@@ -727,7 +643,7 @@ out:
         if (locked && ret) {
                 /* Based on the op-version, we release the
                  * cluster or mgmt_v3 lock */
-                if (priv->op_version < GD_OP_VERSION_4)
+                if (priv->op_version < GD_OP_VERSION_3_6_0)
                         glusterd_unlock (MY_UUID);
                 else {
                         ret = glusterd_mgmt_v3_unlock (volname, MY_UUID,
@@ -755,7 +671,6 @@ __glusterd_handle_cluster_lock (rpcsvc_request_t *req)
         gd1_mgmt_cluster_lock_req       lock_req    = {{0},};
         glusterd_op_lock_ctx_t         *ctx         = NULL;
         glusterd_op_t                   op          = GD_OP_EVENT_LOCK;
-        glusterd_peerinfo_t            *peerinfo    = NULL;
         glusterd_op_info_t              txn_op_info = {{0},};
         glusterd_conf_t                *priv        = NULL;
         uuid_t                         *txn_id      = NULL;
@@ -781,7 +696,7 @@ __glusterd_handle_cluster_lock (rpcsvc_request_t *req)
         gf_log (this->name, GF_LOG_DEBUG, "Received LOCK from uuid: %s",
                 uuid_utoa (lock_req.uuid));
 
-        if (glusterd_friend_find_by_uuid (lock_req.uuid, &peerinfo)) {
+        if (glusterd_peerinfo_find_by_uuid (lock_req.uuid) == NULL) {
                 gf_log (this->name, GF_LOG_WARNING, "%s doesn't "
                         "belong to the cluster. Ignoring request.",
                         uuid_utoa (lock_req.uuid));
@@ -894,7 +809,6 @@ __glusterd_handle_stage_op (rpcsvc_request_t *req)
         int32_t                         ret = -1;
         glusterd_req_ctx_t              *req_ctx = NULL;
         gd1_mgmt_stage_op_req           op_req = {{0},};
-        glusterd_peerinfo_t             *peerinfo = NULL;
         xlator_t                        *this = NULL;
         uuid_t                          *txn_id = NULL;
         glusterd_op_info_t              txn_op_info = {{0},};
@@ -918,23 +832,25 @@ __glusterd_handle_stage_op (rpcsvc_request_t *req)
                 goto out;
         }
 
-        if (glusterd_friend_find_by_uuid (op_req.uuid, &peerinfo)) {
+        ret = glusterd_req_ctx_create (req, op_req.op, op_req.uuid,
+                                       op_req.buf.buf_val, op_req.buf.buf_len,
+                                       gf_gld_mt_op_stage_ctx_t, &req_ctx);
+        if (ret) {
+                gf_log (this->name, GF_LOG_ERROR, "Failed to create req_ctx");
+                goto out;
+        }
+
+        ret = dict_get_bin (req_ctx->dict, "transaction_id", (void **)&txn_id);
+        gf_log (this->name, GF_LOG_DEBUG, "transaction ID = %s",
+                uuid_utoa (*txn_id));
+
+        if (glusterd_peerinfo_find_by_uuid (op_req.uuid) == NULL) {
                 gf_log (this->name, GF_LOG_WARNING, "%s doesn't "
                         "belong to the cluster. Ignoring request.",
                         uuid_utoa (op_req.uuid));
                 ret = -1;
                 goto out;
         }
-
-        ret = glusterd_req_ctx_create (req, op_req.op, op_req.uuid,
-                                       op_req.buf.buf_val, op_req.buf.buf_len,
-                                       gf_gld_mt_op_stage_ctx_t, &req_ctx);
-        if (ret)
-                goto out;
-
-        ret = dict_get_bin (req_ctx->dict, "transaction_id", (void **)&txn_id);
-
-        gf_log ("", GF_LOG_DEBUG, "transaction ID = %s", uuid_utoa (*txn_id));
 
         /* In cases where there is no volname, the receivers won't have a
          * transaction opinfo created, as for those operations, the locking
@@ -983,7 +899,6 @@ __glusterd_handle_commit_op (rpcsvc_request_t *req)
         int32_t                         ret = -1;
         glusterd_req_ctx_t              *req_ctx = NULL;
         gd1_mgmt_commit_op_req          op_req = {{0},};
-        glusterd_peerinfo_t             *peerinfo = NULL;
         xlator_t                        *this = NULL;
         uuid_t                          *txn_id = NULL;
         glusterd_conf_t                 *priv = NULL;
@@ -1005,7 +920,7 @@ __glusterd_handle_commit_op (rpcsvc_request_t *req)
                 goto out;
         }
 
-        if (glusterd_friend_find_by_uuid (op_req.uuid, &peerinfo)) {
+        if (glusterd_peerinfo_find_by_uuid (op_req.uuid) == NULL) {
                 gf_log (this->name, GF_LOG_WARNING, "%s doesn't "
                         "belong to the cluster. Ignoring request.",
                         uuid_utoa (op_req.uuid));
@@ -1022,8 +937,8 @@ __glusterd_handle_commit_op (rpcsvc_request_t *req)
                 goto out;
 
         ret = dict_get_bin (req_ctx->dict, "transaction_id", (void **)&txn_id);
-
-        gf_log ("", GF_LOG_DEBUG, "transaction ID = %s", uuid_utoa (*txn_id));
+        gf_log (this->name, GF_LOG_DEBUG, "transaction ID = %s",
+                uuid_utoa (*txn_id));
 
         ret = glusterd_op_sm_inject_event (GD_OP_EVENT_COMMIT_OP,
                                            txn_id, req_ctx);
@@ -1053,6 +968,7 @@ __glusterd_handle_cli_probe (rpcsvc_request_t *req)
         dict_t                        *dict = NULL;
         char                      *hostname = NULL;
         int                            port = 0;
+        int                        op_errno = 0;
 
         GF_ASSERT (req);
         this = THIS;
@@ -1090,11 +1006,12 @@ __glusterd_handle_cli_probe (rpcsvc_request_t *req)
         }
 
         if (glusterd_is_any_volume_in_server_quorum (this) &&
-            !does_gd_meet_server_quorum (this)) {
+            !does_gd_meet_server_quorum (this, NULL, _gf_false)) {
                 glusterd_xfer_cli_probe_resp (req, -1, GF_PROBE_QUORUM_NOT_MET,
                                               NULL, hostname, port, dict);
-                gf_log (this->name, GF_LOG_ERROR, "Quorum does not meet, "
-                        "rejecting operation");
+                gf_msg (this->name, GF_LOG_CRITICAL, 0,
+                        GD_MSG_SERVER_QUORUM_NOT_MET,
+                        "Server quorum not met. Rejecting operation.");
                 ret = 0;
                 goto out;
         }
@@ -1118,23 +1035,25 @@ __glusterd_handle_cli_probe (rpcsvc_request_t *req)
                 goto out;
         }
 
-        if (!(ret = glusterd_friend_find_by_hostname (hostname, &peerinfo))) {
-                if (strcmp (peerinfo->hostname, hostname) == 0) {
-
-                        gf_log ("glusterd", GF_LOG_DEBUG, "Probe host %s port "
-                                "%d already a peer", hostname, port);
-                        glusterd_xfer_cli_probe_resp (req, 0, GF_PROBE_FRIEND,
-                                                      NULL, hostname, port,
-                                                      dict);
-                        goto out;
-                }
+        peerinfo = glusterd_peerinfo_find_by_hostname (hostname);
+        if (peerinfo && gd_peer_has_address (peerinfo, hostname)) {
+                gf_log ("glusterd", GF_LOG_DEBUG, "Probe host %s port %d "
+                        "already a peer", hostname, port);
+                glusterd_xfer_cli_probe_resp (req, 0, GF_PROBE_FRIEND, NULL,
+                                              hostname, port, dict);
+                goto out;
         }
-        ret = glusterd_probe_begin (req, hostname, port, dict);
+        ret = glusterd_probe_begin (req, hostname, port, dict, &op_errno);
 
         if (ret == GLUSTERD_CONNECTION_AWAITED) {
                 //fsm should be run after connection establishes
                 run_fsm = _gf_false;
                 ret = 0;
+
+        } else if (ret == -1) {
+                glusterd_xfer_cli_probe_resp (req, -1, op_errno,
+                                              NULL, hostname, port, dict);
+                goto out;
         }
 
 out:
@@ -1253,9 +1172,10 @@ __glusterd_handle_cli_deprobe (rpcsvc_request_t *req)
 
         if (!(flags & GF_CLI_FLAG_OP_FORCE)) {
                 if (glusterd_is_any_volume_in_server_quorum (this) &&
-                    !does_gd_meet_server_quorum (this)) {
-                        gf_log (this->name, GF_LOG_ERROR, "Quorum does not "
-                                "meet, rejecting operation");
+                    !does_gd_meet_server_quorum (this, NULL, _gf_false)) {
+                        gf_msg (this->name, GF_LOG_CRITICAL, 0,
+                                GD_MSG_SERVER_QUORUM_NOT_MET,
+                                "Server quorum not met. Rejecting operation.");
                         ret = -1;
                         op_errno = GF_DEPROBE_QUORUM_NOT_MET;
                         goto out;
@@ -1263,9 +1183,11 @@ __glusterd_handle_cli_deprobe (rpcsvc_request_t *req)
         }
 
         if (!uuid_is_null (uuid)) {
-                ret = glusterd_deprobe_begin (req, hostname, port, uuid, dict);
+                ret = glusterd_deprobe_begin (req, hostname, port, uuid, dict,
+                                              &op_errno);
         } else {
-                ret = glusterd_deprobe_begin (req, hostname, port, NULL, dict);
+                ret = glusterd_deprobe_begin (req, hostname, port, NULL, dict,
+                                              &op_errno);
         }
 
 out:
@@ -2012,9 +1934,8 @@ __glusterd_handle_fsm_log (rpcsvc_request_t *req)
                 conf = this->private;
                 log = &conf->op_sm_log;
         } else {
-                ret = glusterd_friend_find_by_hostname (cli_req.name,
-                                                        &peerinfo);
-                if (ret) {
+                peerinfo = glusterd_peerinfo_find_by_hostname (cli_req.name);
+                if (!peerinfo) {
                         snprintf (msg, sizeof (msg), "%s is not a peer",
                                   cli_req.name);
                         goto out;
@@ -2141,7 +2062,6 @@ __glusterd_handle_cluster_unlock (rpcsvc_request_t *req)
         gd1_mgmt_cluster_unlock_req     unlock_req = {{0}, };
         int32_t                         ret = -1;
         glusterd_op_lock_ctx_t          *ctx = NULL;
-        glusterd_peerinfo_t             *peerinfo = NULL;
         xlator_t                        *this = NULL;
         uuid_t                          *txn_id = NULL;
         glusterd_conf_t                 *priv = NULL;
@@ -2167,7 +2087,7 @@ __glusterd_handle_cluster_unlock (rpcsvc_request_t *req)
         gf_log (this->name, GF_LOG_DEBUG,
                 "Received UNLOCK from uuid: %s", uuid_utoa (unlock_req.uuid));
 
-        if (glusterd_friend_find_by_uuid (unlock_req.uuid, &peerinfo)) {
+        if (glusterd_peerinfo_find_by_uuid (unlock_req.uuid) == NULL) {
                 gf_log (this->name, GF_LOG_WARNING, "%s doesn't "
                         "belong to the cluster. Ignoring request.",
                         uuid_utoa (unlock_req.uuid));
@@ -2393,24 +2313,21 @@ out:
 }
 
 int
-glusterd_friend_hostname_update (glusterd_peerinfo_t *peerinfo,
-                                char *hostname,
-                                gf_boolean_t store_update)
+glusterd_peer_hostname_update (glusterd_peerinfo_t *peerinfo,
+                               const char *hostname, gf_boolean_t store_update)
 {
-        char                    *new_hostname = NULL;
         int                     ret = 0;
 
         GF_ASSERT (peerinfo);
         GF_ASSERT (hostname);
 
-        new_hostname = gf_strdup (hostname);
-        if (!new_hostname) {
-                ret = -1;
+        ret = gd_add_address_to_peer (peerinfo, hostname);
+        if (ret) {
+                gf_log (THIS->name, GF_LOG_ERROR,
+                        "Couldn't add address to the peer info");
                 goto out;
         }
 
-        GF_FREE (peerinfo->hostname);
-        peerinfo->hostname = new_hostname;
         if (store_update)
                 ret = glusterd_store_peerinfo (peerinfo);
 out:
@@ -2426,12 +2343,10 @@ __glusterd_handle_friend_update (rpcsvc_request_t *req)
         glusterd_peerinfo_t     *peerinfo = NULL;
         glusterd_conf_t         *priv = NULL;
         xlator_t                *this = NULL;
-        glusterd_peerinfo_t     *tmp = NULL;
         gd1_mgmt_friend_update_rsp rsp = {{0},};
         dict_t                  *dict = NULL;
         char                    key[100] = {0,};
         char                    *uuid_buf = NULL;
-        char                    *hostname = NULL;
         int                     i = 1;
         int                     count = 0;
         uuid_t                  uuid = {0,};
@@ -2453,8 +2368,8 @@ __glusterd_handle_friend_update (rpcsvc_request_t *req)
                 goto out;
         }
 
-        ret = glusterd_friend_find (friend_req.uuid, NULL, &tmp);
-        if (ret) {
+        if (glusterd_peerinfo_find (friend_req.uuid, NULL) == NULL) {
+                ret = -1;
                 gf_log ("", GF_LOG_CRITICAL, "Received friend update request "
                         "from unknown peer %s", uuid_utoa (friend_req.uuid));
                 goto out;
@@ -2494,46 +2409,59 @@ __glusterd_handle_friend_update (rpcsvc_request_t *req)
 
         args.mode = GD_MODE_ON;
         while ( i <= count) {
+                memset (key, 0, sizeof (key));
                 snprintf (key, sizeof (key), "friend%d.uuid", i);
                 ret = dict_get_str (dict, key, &uuid_buf);
                 if (ret)
                         goto out;
                 uuid_parse (uuid_buf, uuid);
-                snprintf (key, sizeof (key), "friend%d.hostname", i);
-                ret = dict_get_str (dict, key, &hostname);
-                if (ret)
-                        goto out;
-
-                gf_log ("", GF_LOG_INFO, "Received uuid: %s, hostname:%s",
-                                uuid_buf, hostname);
-
-                if (uuid_is_null (uuid)) {
-                        gf_log (this->name, GF_LOG_WARNING, "Updates mustn't "
-                                "contain peer with 'null' uuid");
-                        continue;
-                }
 
                 if (!uuid_compare (uuid, MY_UUID)) {
-                        gf_log ("", GF_LOG_INFO, "Received my uuid as Friend");
+                        gf_log (this->name, GF_LOG_INFO,
+                                "Received my uuid as Friend");
                         i++;
                         continue;
                 }
 
-                ret = glusterd_friend_find (uuid, hostname, &tmp);
+                memset (key, 0, sizeof (key));
+                snprintf (key, sizeof (key), "friend%d", i);
 
-                if (!ret) {
-                        if (strcmp (hostname, tmp->hostname) != 0) {
-                                glusterd_friend_hostname_update (tmp, hostname,
-                                                                 _gf_true);
+                peerinfo = glusterd_peerinfo_find (uuid, NULL);
+                if (peerinfo == NULL) {
+                        /* Create a new peer and add it to the list as there is
+                         * no existing peer with the uuid
+                         */
+                        peerinfo = gd_peerinfo_from_dict (dict, key);
+                        if (peerinfo == NULL) {
+                                ret = -1;
+                                gf_log (this->name, GF_LOG_ERROR,
+                                        "Could not create peerinfo from dict "
+                                        "for prefix %s", key);
+                                goto out;
                         }
-                        i++;
-                        continue;
+
+                        /* As this is a new peer, it should be added as a
+                         * friend.  The friend state machine will take care of
+                         * correcting the state as required
+                         */
+                        peerinfo->state.state = GD_FRIEND_STATE_BEFRIENDED;
+
+                        ret = glusterd_friend_add_from_peerinfo (peerinfo, 0,
+                                                                 &args);
+                } else {
+                        /* As an existing peer was found, update it with the new
+                         * information
+                         */
+                        ret = gd_update_peerinfo_from_dict (peerinfo, dict,
+                                                            key);
+                        if (ret) {
+                                gf_log (this->name, GF_LOG_ERROR, "Failed to "
+                                        "update peer %s", peerinfo->hostname);
+                                goto out;
+                        }
                 }
 
-                ret = glusterd_friend_add (hostname, friend_req.port,
-                                           GD_FRIEND_STATE_BEFRIENDED,
-                                           &uuid, &peerinfo, 0, &args);
-
+                peerinfo = NULL;
                 i++;
         }
 
@@ -2548,6 +2476,9 @@ out:
         } else {
                 free (friend_req.friends.friends_val);//malloced by xdr
         }
+
+        if (peerinfo)
+                glusterd_peerinfo_cleanup (peerinfo);
 
         glusterd_friend_sm ();
         glusterd_op_sm ();
@@ -2616,11 +2547,11 @@ __glusterd_handle_probe_query (rpcsvc_request_t *req)
                 gf_log ("", GF_LOG_ERROR, "Unable to get the remote hostname");
                 goto out;
         }
-        ret = glusterd_friend_find (probe_req.uuid, remote_hostname, &peerinfo);
-        if ((ret != 0 ) && (!list_empty (&conf->peers))) {
+        peerinfo = glusterd_peerinfo_find (probe_req.uuid, remote_hostname);
+        if ((peerinfo == NULL) && (!list_empty (&conf->peers))) {
                 rsp.op_ret = -1;
                 rsp.op_errno = GF_PROBE_ANOTHER_CLUSTER;
-        } else if (ret) {
+        } else if (peerinfo == NULL) {
                 gf_log ("glusterd", GF_LOG_INFO, "Unable to find peerinfo"
                         " for host: %s (%d)", remote_hostname, port);
                 args.mode = GD_MODE_ON;
@@ -2899,12 +2830,16 @@ __glusterd_handle_umount (rpcsvc_request_t *req)
                 goto out;
         }
 
-        runinit (&runner);
-        runner_add_args (&runner, "umount", umnt_req.path, NULL);
-        if (umnt_req.lazy)
-                runner_add_arg (&runner, "-l");
         synclock_unlock (&priv->big_lock);
-        rsp.op_ret = runner_run (&runner);
+
+        if (umnt_req.lazy) {
+                rsp.op_ret = gf_umount_lazy (this->name, umnt_req.path, 0);
+        } else {
+                runinit (&runner);
+                runner_add_args (&runner, _PATH_UMOUNT, umnt_req.path, NULL);
+                rsp.op_ret = runner_run (&runner);
+        }
+
         synclock_lock (&priv->big_lock);
         if (rsp.op_ret == 0) {
                 if (realpath (umnt_req.path, mntp))
@@ -2942,17 +2877,17 @@ glusterd_handle_umount (rpcsvc_request_t *req)
 int
 glusterd_friend_remove (uuid_t uuid, char *hostname)
 {
-        int                           ret = 0;
+        int                           ret = -1;
         glusterd_peerinfo_t           *peerinfo = NULL;
 
-        ret = glusterd_friend_find (uuid, hostname, &peerinfo);
-        if (ret)
+        peerinfo = glusterd_peerinfo_find (uuid, hostname);
+        if (peerinfo == NULL)
                 goto out;
 
         ret = glusterd_friend_remove_cleanup_vols (peerinfo->uuid);
         if (ret)
                 gf_log (THIS->name, GF_LOG_WARNING, "Volumes cleanup failed");
-        ret = glusterd_friend_cleanup (peerinfo);
+        ret = glusterd_peerinfo_cleanup (peerinfo);
 out:
         gf_log ("", GF_LOG_DEBUG, "returning %d", ret);
         return ret;
@@ -3059,10 +2994,10 @@ int
 glusterd_friend_rpc_create (xlator_t *this, glusterd_peerinfo_t *peerinfo,
                             glusterd_peerctx_args_t *args)
 {
-        dict_t                 *options = NULL;
-        int                    ret = -1;
-        glusterd_peerctx_t     *peerctx = NULL;
-        data_t                 *data = NULL;
+        dict_t                   *options = NULL;
+        int                       ret     = -1;
+        glusterd_peerctx_t       *peerctx = NULL;
+        data_t                   *data    = NULL;
 
         peerctx = GF_CALLOC (1, sizeof (*peerctx), gf_gld_mt_peerctx_t);
         if (!peerctx)
@@ -3089,6 +3024,11 @@ glusterd_friend_rpc_create (xlator_t *this, glusterd_peerinfo_t *peerinfo,
                 if (data) {
                         ret = dict_set(options,
                                        "transport.socket.source-addr",data);
+                }
+                data = dict_get(this->options,"ping-timeout");
+                if (data) {
+                        ret = dict_set(options,
+                                       "ping-timeout",data);
                 }
         }
 
@@ -3122,9 +3062,11 @@ glusterd_friend_add (const char *hoststr, int port,
         conf = this->private;
         GF_ASSERT (conf);
         GF_ASSERT (hoststr);
+        GF_ASSERT (friend);
 
-        ret = glusterd_peerinfo_new (friend, state, uuid, hoststr, port);
-        if (ret) {
+        *friend = glusterd_peerinfo_new (state, uuid, hoststr, port);
+        if (*friend == NULL) {
+                ret = -1;
                 goto out;
         }
 
@@ -3144,9 +3086,7 @@ glusterd_friend_add (const char *hoststr, int port,
         if (!restore) {
                 ret = glusterd_store_peerinfo (*friend);
                 if (ret == 0) {
-                        synclock_unlock (&conf->big_lock);
                         ret = glusterd_friend_rpc_create (this, *friend, args);
-                        synclock_lock (&conf->big_lock);
                 }
                 else {
                         gf_log (this->name, GF_LOG_ERROR,
@@ -3155,8 +3095,56 @@ glusterd_friend_add (const char *hoststr, int port,
         }
 
         if (ret) {
-                (void) glusterd_friend_cleanup (*friend);
+                (void) glusterd_peerinfo_cleanup (*friend);
                 *friend = NULL;
+        }
+
+out:
+        gf_log (this->name, GF_LOG_INFO, "connect returned %d", ret);
+        return ret;
+}
+
+/* glusterd_friend_add_from_peerinfo() adds a new peer into the local friends
+ * list from a pre created @peerinfo object. It otherwise works similarly to
+ * glusterd_friend_add()
+ */
+int
+glusterd_friend_add_from_peerinfo (glusterd_peerinfo_t *friend,
+                                   gf_boolean_t restore,
+                                   glusterd_peerctx_args_t *args)
+{
+        int                     ret = 0;
+        xlator_t               *this = NULL;
+        glusterd_conf_t        *conf = NULL;
+
+        this = THIS;
+        conf = this->private;
+        GF_ASSERT (conf);
+
+        GF_VALIDATE_OR_GOTO (this->name, (friend != NULL), out);
+
+        /*
+         * We can't add to the list after calling glusterd_friend_rpc_create,
+         * even if it succeeds, because by then the callback to take it back
+         * off and free might have happened already (notably in the case of an
+         * invalid peer name).  That would mean we're adding something that had
+         * just been free, and we're likely to crash later.
+         */
+        list_add_tail (&friend->uuid_list, &conf->peers);
+
+        //restore needs to first create the list of peers, then create rpcs
+        //to keep track of quorum in race-free manner. In restore for each peer
+        //rpc-create calls rpc_notify when the friend-list is partially
+        //constructed, leading to wrong quorum calculations.
+        if (!restore) {
+                ret = glusterd_store_peerinfo (friend);
+                if (ret == 0) {
+                        ret = glusterd_friend_rpc_create (this, friend, args);
+                }
+                else {
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "Failed to store peerinfo");
+                }
         }
 
 out:
@@ -3166,7 +3154,7 @@ out:
 
 int
 glusterd_probe_begin (rpcsvc_request_t *req, const char *hoststr, int port,
-                      dict_t *dict)
+                      dict_t *dict, int *op_errno)
 {
         int                             ret = -1;
         glusterd_peerinfo_t             *peerinfo = NULL;
@@ -3175,15 +3163,15 @@ glusterd_probe_begin (rpcsvc_request_t *req, const char *hoststr, int port,
 
         GF_ASSERT (hoststr);
 
-        ret = glusterd_friend_find (NULL, (char *)hoststr, &peerinfo);
+        peerinfo = glusterd_peerinfo_find (NULL, hoststr);
 
-        if (ret) {
+        if (peerinfo == NULL) {
                 gf_log ("glusterd", GF_LOG_INFO, "Unable to find peerinfo"
                         " for host: %s (%d)", hoststr, port);
                 args.mode = GD_MODE_ON;
                 args.req  = req;
                 args.dict = dict;
-                ret = glusterd_friend_add ((char *)hoststr, port,
+                ret = glusterd_friend_add (hoststr, port,
                                            GD_FRIEND_STATE_DEFAULT,
                                            NULL, &peerinfo, 0, &args);
                 if ((!ret) && (!peerinfo->connected)) {
@@ -3192,8 +3180,14 @@ glusterd_probe_begin (rpcsvc_request_t *req, const char *hoststr, int port,
 
         } else if (peerinfo->connected &&
                    (GD_FRIEND_STATE_BEFRIENDED == peerinfo->state.state)) {
-                ret = glusterd_friend_hostname_update (peerinfo, (char*)hoststr,
-                                                       _gf_false);
+                if (peerinfo->detaching) {
+                        ret = -1;
+                        if (op_errno)
+                                *op_errno = GF_PROBE_FRIEND_DETACHING;
+                        goto out;
+                }
+                ret = glusterd_peer_hostname_update (peerinfo, hoststr,
+                                                     _gf_false);
                 if (ret)
                         goto out;
                 //this is just to rename so inject local acc for cluster update
@@ -3218,7 +3212,7 @@ out:
 
 int
 glusterd_deprobe_begin (rpcsvc_request_t *req, const char *hoststr, int port,
-                        uuid_t uuid, dict_t *dict)
+                        uuid_t uuid, dict_t *dict, int *op_errno)
 {
         int                             ret = -1;
         glusterd_peerinfo_t             *peerinfo = NULL;
@@ -3228,9 +3222,10 @@ glusterd_deprobe_begin (rpcsvc_request_t *req, const char *hoststr, int port,
         GF_ASSERT (hoststr);
         GF_ASSERT (req);
 
-        ret = glusterd_friend_find (uuid, (char *)hoststr, &peerinfo);
+        peerinfo = glusterd_peerinfo_find (uuid, hoststr);
 
-        if (ret) {
+        if (peerinfo == NULL) {
+                ret = -1;
                 gf_log ("glusterd", GF_LOG_INFO, "Unable to find peerinfo"
                         " for host: %s %d", hoststr, port);
                 goto out;
@@ -3238,6 +3233,13 @@ glusterd_deprobe_begin (rpcsvc_request_t *req, const char *hoststr, int port,
 
         if (!peerinfo->rpc) {
                 //handle this case
+                goto out;
+        }
+
+        if (peerinfo->detaching) {
+                ret = -1;
+                if (op_errno)
+                        *op_errno = GF_DEPROBE_FRIEND_DETACHING;
                 goto out;
         }
 
@@ -3272,6 +3274,7 @@ glusterd_deprobe_begin (rpcsvc_request_t *req, const char *hoststr, int port,
                         "ret = %d", event->event, ret);
                 goto out;
         }
+        peerinfo->detaching = _gf_true;
 
 out:
         return ret;
@@ -3359,6 +3362,12 @@ set_probe_error_str (int op_ret, int op_errno, char *op_errstr, char *errstr,
                                           " in peer list", hostname, port);
                                 break;
 
+                        case GF_PROBE_FRIEND_DETACHING:
+                                snprintf (errstr, len, "Peer is already being "
+                                          "detached from cluster.\n"
+                                          "Check peer status by running "
+                                          "gluster peer status");
+                                break;
                         default:
                                 if (op_errno != 0)
                                         snprintf (errstr, len, "Probe returned "
@@ -3401,6 +3410,18 @@ set_probe_error_str (int op_ret, int op_errno, char *op_errstr, char *errstr,
                                 snprintf (errstr, len, "Cluster quorum is not "
                                           "met. Changing peers is not allowed "
                                           "in this state");
+                                break;
+
+                        case GF_PROBE_MISSED_SNAP_CONFLICT:
+                                snprintf (errstr, len, "Failed to update "
+                                          "list of missed snapshots from "
+                                          "peer %s", hostname);
+                                break;
+
+                        case GF_PROBE_SNAP_CONFLICT:
+                                snprintf (errstr, len, "Conflict in comparing "
+                                          "list of snapshots from "
+                                          "peer %s", hostname);
                                 break;
 
                         default:
@@ -3492,6 +3513,12 @@ set_deprobe_error_str (int op_ret, int op_errno, char *op_errstr, char *errstr,
                                           "in this state");
                                 break;
 
+                        case GF_DEPROBE_FRIEND_DETACHING:
+                                snprintf (errstr, len, "Peer is already being "
+                                          "detached from cluster.\n"
+                                          "Check peer status by running "
+                                          "gluster peer status");
+                                break;
                         default:
                                 snprintf (errstr, len, "Detach returned with "
                                           "unknown errno %d", op_errno);
@@ -3564,7 +3591,7 @@ glusterd_list_friends (rpcsvc_request_t *req, dict_t *dict, int32_t flags)
         if (!list_empty (&priv->peers)) {
                 list_for_each_entry (entry, &priv->peers, uuid_list) {
                         count++;
-                        ret = glusterd_add_peer_detail_to_dict (entry,
+                        ret = gd_add_peer_detail_to_dict (entry,
                                                                 friends, count);
                         if (ret)
                                 goto out;
@@ -3790,6 +3817,16 @@ __glusterd_handle_status_volume (rpcsvc_request_t *req)
                 goto out;
         }
 
+        if ((cmd & GF_CLI_STATUS_SNAPD) &&
+            (conf->op_version < GD_OP_VERSION_3_6_0)) {
+                snprintf (err_str, sizeof (err_str), "The cluster is operating "
+                          "at a lesser version than %d. Getting the status of "
+                          "snapd is not allowed in this state",
+                          GD_OP_VERSION_3_6_0);
+                ret = -1;
+                goto out;
+        }
+
         ret = glusterd_op_begin_synctask (req, GD_OP_STATUS_VOLUME, dict);
 
 out:
@@ -3890,6 +3927,353 @@ glusterd_handle_cli_clearlocks_volume (rpcsvc_request_t *req)
 }
 
 static int
+get_volinfo_from_brickid (char *brickid, glusterd_volinfo_t **volinfo)
+{
+        int             ret         = -1;
+        char           *volid_str  = NULL;
+        char           *brick      = NULL;
+        char           *brickid_dup = NULL;
+        uuid_t          volid       = {0};
+        xlator_t       *this        = NULL;
+
+        this = THIS;
+        GF_ASSERT (this);
+        GF_ASSERT (brickid);
+
+        brickid_dup = gf_strdup (brickid);
+        if (!brickid_dup)
+                goto out;
+
+        volid_str = brickid_dup;
+        brick = strchr (brickid_dup, ':');
+        if (!brick) {
+                gf_log (this->name, GF_LOG_ERROR,
+                        "Invalid brickid");
+                goto out;
+        }
+
+        *brick = '\0';
+        brick++;
+        uuid_parse (volid_str, volid);
+        ret = glusterd_volinfo_find_by_volume_id (volid, volinfo);
+        if (ret) {
+                /* Check if it is a snapshot volume */
+                ret = glusterd_snap_volinfo_find_by_volume_id (volid, volinfo);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_WARNING,
+                                "Failed to find volinfo");
+                        goto out;
+                }
+        }
+
+        ret = 0;
+out:
+        GF_FREE (brickid_dup);
+        return ret;
+}
+
+static int
+__glusterd_handle_barrier (rpcsvc_request_t *req)
+{
+        int          ret     = -1;
+        xlator_t     *this   = NULL;
+        gf_cli_req   cli_req = {{0,}};
+        dict_t       *dict   = NULL;
+        char *volname = NULL;
+
+        GF_ASSERT (req);
+        this = THIS;
+        GF_ASSERT(this);
+
+        ret = xdr_to_generic (req->msg[0], &cli_req, (xdrproc_t)xdr_gf_cli_req);
+        if (ret < 0) {
+                req->rpc_err = GARBAGE_ARGS;
+                goto out;
+        }
+
+        if (!cli_req.dict.dict_len) {
+                ret = -1;
+                goto out;
+        }
+
+        dict = dict_new();
+        if (!dict) {
+                ret = -1;
+                goto out;
+        }
+        ret = dict_unserialize (cli_req.dict.dict_val, cli_req.dict.dict_len,
+                                &dict);
+        if (ret < 0) {
+                gf_log (this->name, GF_LOG_ERROR, "Failed to unserialize "
+                        "request dictionary.");
+                goto out;
+        }
+
+        ret = dict_get_str (dict, "volname", &volname);
+        if (ret) {
+                gf_log (this->name, GF_LOG_ERROR, "Volname not present in "
+                        "dict");
+                goto out;
+        }
+        gf_log (this->name, GF_LOG_INFO, "Received barrier volume request for "
+                "volume %s", volname);
+
+        ret = glusterd_op_begin_synctask (req, GD_OP_BARRIER, dict);
+
+out:
+        if (ret) {
+                ret = glusterd_op_send_cli_response (GD_OP_BARRIER, ret, 0, req,
+                                                     dict, "Operation failed");
+        }
+        free (cli_req.dict.dict_val);
+        return ret;
+}
+
+int
+glusterd_handle_barrier (rpcsvc_request_t *req)
+{
+        return glusterd_big_locked_handler (req, __glusterd_handle_barrier);
+}
+
+int32_t
+glusterd_get_volume_opts (rpcsvc_request_t *req, dict_t *dict)
+{
+        int32_t                   ret = -1;
+        int32_t                   count = 1;
+        int                       exists = 0;
+        char                      *key = NULL;
+        char                      *orig_key = NULL;
+        char                      *key_fixed = NULL;
+        char                      *volname = NULL;
+        char                      err_str[2048] = {0,};
+        char                      dict_key[50] = {0,};
+        xlator_t                  *this = NULL;
+        glusterd_conf_t           *priv = NULL;
+        glusterd_volinfo_t        *volinfo = NULL;
+        gf_cli_rsp                rsp = {0,};
+        char                      op_version_buff[10] = {0,};
+
+        this = THIS;
+        GF_ASSERT (this);
+
+        priv = this->private;
+        GF_ASSERT (priv);
+
+        GF_ASSERT (req);
+        GF_ASSERT (dict);
+
+        ret = dict_get_str (dict, "volname", &volname);
+        if (ret) {
+                snprintf (err_str, sizeof (err_str), "Failed to get volume "
+                          "name while handling get volume option command");
+                gf_log (this->name, GF_LOG_ERROR, "%s", err_str);
+                goto out;
+        }
+
+        ret = dict_get_str (dict, "key", &key);
+        if (ret) {
+                snprintf (err_str, sizeof (err_str), "Failed to get key "
+                          "while handling get volume option for %s", volname);
+                gf_log (this->name, GF_LOG_ERROR, "%s", err_str);
+                goto out;
+        }
+        gf_log (this->name, GF_LOG_DEBUG, "Received get volume opt request for "
+                "volume %s", volname);
+
+        ret = glusterd_volinfo_find (volname, &volinfo);
+        if (ret) {
+                snprintf (err_str, sizeof(err_str),
+                          FMTSTR_CHECK_VOL_EXISTS, volname);
+                gf_log (this->name, GF_LOG_ERROR, FMTSTR_CHECK_VOL_EXISTS,
+                        volname);
+                goto out;
+        }
+        if (strcmp(key, "all")) {
+                exists = glusterd_check_option_exists (key, &key_fixed);
+                if (!exists) {
+                        snprintf (err_str, sizeof (err_str), "Option "
+                                  "with name: %s does not exist", key);
+                        gf_log (this->name, GF_LOG_ERROR, "%s",
+                                err_str);
+                        if (key_fixed)
+                                snprintf (err_str + ret,
+                                          sizeof (err_str) - ret,
+                                          "Did you mean %s?",
+                                          key_fixed);
+                        ret = -1;
+                        goto out;
+                }
+                if (key_fixed) {
+                        orig_key = key;
+                        key = key_fixed;
+                }
+                if (strcmp (key, "cluster.op-version") == 0) {
+                        sprintf (dict_key, "key%d", count);
+                        ret = dict_set_str(dict, dict_key, key);
+                        if (ret) {
+                                gf_log (this->name, GF_LOG_ERROR, "Failed to "
+                                       "set %s in dictionary", key);
+                                goto out;
+                        }
+                        sprintf (dict_key, "value%d", count);
+                        sprintf (op_version_buff, "%d", priv->op_version);
+                        ret = dict_set_str (dict, dict_key, op_version_buff);
+                        if (ret) {
+                                gf_log (this->name, GF_LOG_ERROR, "Failed to "
+                                        "set value for key %s in dictionary",
+                                        key);
+                                goto out;
+                        }
+                }
+                else if (strcmp (key, "config.memory-accounting") == 0) {
+                        sprintf (dict_key, "key%d", count);
+                        ret = dict_set_str(dict, dict_key, key);
+                        if (ret) {
+                                gf_log (this->name, GF_LOG_ERROR, "Failed to "
+                                       "set %s in dictionary", key);
+                                goto out;
+                        }
+                        sprintf (dict_key, "value%d", count);
+
+                        if (volinfo->memory_accounting)
+                                ret = dict_set_str(dict, dict_key,"Enabled");
+                        else
+                                ret = dict_set_str(dict, dict_key,"Disabled");
+                        if (ret) {
+                                gf_log (this->name, GF_LOG_ERROR, "Failed to "
+                                        "set value for key %s in dictionary",
+                                        key);
+                                goto out;
+                        }
+                }
+                else if (strcmp (key, "config.transport") == 0) {
+                        sprintf (dict_key, "key%d", count);
+                        ret = dict_set_str(dict, dict_key, key);
+                        if (ret) {
+                                gf_log (this->name, GF_LOG_ERROR, "Failed to "
+                                        "set %s in dictionary", key);
+                                goto out;
+                        }
+                        sprintf (dict_key, "value%d", count);
+
+                        if (volinfo->transport_type == GF_TRANSPORT_RDMA)
+                                ret = dict_set_str(dict, dict_key,"rdma");
+                        else if (volinfo->transport_type == GF_TRANSPORT_TCP)
+                                ret = dict_set_str(dict, dict_key,"tcp");
+                        else if (volinfo->transport_type ==
+                                 GF_TRANSPORT_BOTH_TCP_RDMA)
+                                ret = dict_set_str(dict, dict_key,"tcp,rdma");
+                        else
+                                ret = dict_set_str(dict, dict_key,"none");
+
+                        if (ret) {
+                                gf_log (this->name, GF_LOG_ERROR, "Failed to "
+                                        "set value for key %s in dictionary",
+                                        key);
+                                goto out;
+                        }
+                }
+                else {
+                        ret = glusterd_get_default_val_for_volopt (dict,
+                                                                  _gf_false,
+                                                                  key, orig_key,
+                                                                  volinfo->dict,
+                                                                  &rsp.op_errstr);
+                        if (ret && !rsp.op_errstr) {
+                                snprintf (err_str, sizeof(err_str),
+                                          "Failed to fetch the value of"
+                                          " %s, check log file for more"
+                                          " details", key);
+                        }
+                }
+        } else {
+                /* Handle the "all" volume option request */
+                ret = glusterd_get_default_val_for_volopt (dict, _gf_true, NULL,
+                                                           NULL, volinfo->dict,
+                                                           &rsp.op_errstr);
+                if (ret && !rsp.op_errstr) {
+                        snprintf (err_str, sizeof(err_str),
+                                  "Failed to fetch the value of all volume "
+                                  "options, check log file for more details");
+                }
+
+        }
+
+out:
+        if (ret) {
+                if (!rsp.op_errstr)
+                        rsp.op_errstr = err_str;
+                rsp.op_ret =  ret;
+        }
+        else {
+                rsp.op_errstr = "";
+                rsp.op_ret = 0;
+        }
+
+        ret = dict_allocate_and_serialize (dict, &rsp.dict.dict_val,
+                                           &rsp.dict.dict_len);
+
+        glusterd_submit_reply (req, &rsp, NULL, 0, NULL,
+                               (xdrproc_t)xdr_gf_cli_rsp);
+        return ret;
+}
+
+int
+__glusterd_handle_get_vol_opt (rpcsvc_request_t *req)
+{
+        int32_t                         ret = -1;
+        gf_cli_req                      cli_req = {{0,}};
+        dict_t                          *dict = NULL;
+        char                            err_str[2048] = {0,};
+        xlator_t                        *this = NULL;
+
+        this = THIS;
+        GF_ASSERT (this);
+
+        GF_ASSERT (req);
+
+        ret = xdr_to_generic (req->msg[0], &cli_req, (xdrproc_t)xdr_gf_cli_req);
+        if (ret < 0) {
+                snprintf (err_str, sizeof (err_str), "Failed to decode "
+                          "request received from cli");
+                gf_log (this->name, GF_LOG_ERROR, "%s", err_str);
+                req->rpc_err = GARBAGE_ARGS;
+                goto out;
+        }
+
+        if (cli_req.dict.dict_len) {
+                /* Unserialize the dictionary */
+                dict  = dict_new ();
+
+                ret = dict_unserialize (cli_req.dict.dict_val,
+                                        cli_req.dict.dict_len,
+                                        &dict);
+                if (ret < 0) {
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "failed to "
+                                "unserialize req-buffer to dictionary");
+                        snprintf (err_str, sizeof (err_str), "Unable to decode "
+                                  "the command");
+                        goto out;
+                } else {
+                        dict->extra_stdfree = cli_req.dict.dict_val;
+                }
+        }
+        ret = glusterd_get_volume_opts (req, dict);
+
+out:
+        if (dict)
+                dict_unref (dict);
+
+        return ret;
+}
+
+int
+glusterd_handle_get_vol_opt (rpcsvc_request_t *req)
+{
+        return glusterd_big_locked_handler (req, __glusterd_handle_get_vol_opt);
+}
+static int
 get_brickinfo_from_brickid (char *brickid, glusterd_brickinfo_t **brickinfo)
 {
         glusterd_volinfo_t      *volinfo    = NULL;
@@ -3932,13 +4316,14 @@ out:
 
 int
 __glusterd_brick_rpc_notify (struct rpc_clnt *rpc, void *mydata,
-                          rpc_clnt_event_t event, void *data)
+                             rpc_clnt_event_t event, void *data)
 {
-        xlator_t                *this = NULL;
-        glusterd_conf_t         *conf = NULL;
-        int                     ret = 0;
-        char                    *brickid = NULL;
-        glusterd_brickinfo_t    *brickinfo = NULL;
+        char                    *brickid           = NULL;
+        int                      ret               = 0;
+        glusterd_conf_t         *conf              = NULL;
+        glusterd_brickinfo_t    *brickinfo         = NULL;
+        glusterd_volinfo_t      *volinfo           = NULL;
+        xlator_t                *this              = NULL;
 
         brickid = mydata;
         if (!brickid)
@@ -3955,6 +4340,37 @@ __glusterd_brick_rpc_notify (struct rpc_clnt *rpc, void *mydata,
 
         switch (event) {
         case RPC_CLNT_CONNECT:
+                /* If a node on coming back up, already starts a brick
+                 * before the handshake, and the notification comes after
+                 * the handshake is done, then we need to check if this
+                 * is a restored brick with a snapshot pending. If so, we
+                 * need to stop the brick
+                 */
+                if (brickinfo->snap_status == -1) {
+                        gf_log (this->name, GF_LOG_INFO,
+                                "Snapshot is pending on %s:%s. "
+                                "Hence not starting the brick",
+                                brickinfo->hostname,
+                                brickinfo->path);
+                        ret = get_volinfo_from_brickid (brickid, &volinfo);
+                        if (ret) {
+                                gf_log (this->name, GF_LOG_ERROR,
+                                        "Failed to get volinfo from "
+                                        "brickid(%s)", brickid);
+                                goto out;
+                        }
+
+                        ret = glusterd_brick_stop (volinfo, brickinfo,
+                                                   _gf_false);
+                        if (ret) {
+                                gf_log (THIS->name, GF_LOG_ERROR,
+                                        "Unable to stop %s:%s",
+                                        brickinfo->hostname, brickinfo->path);
+                                goto out;
+                        }
+
+                        break;
+                }
                 gf_log (this->name, GF_LOG_DEBUG, "Connected to %s:%s",
                         brickinfo->hostname, brickinfo->path);
                 glusterd_set_brick_status (brickinfo, GF_BRICK_STARTED);
@@ -3963,9 +4379,11 @@ __glusterd_brick_rpc_notify (struct rpc_clnt *rpc, void *mydata,
                 break;
 
         case RPC_CLNT_DISCONNECT:
-                if (GF_BRICK_STARTED == brickinfo->status)
-                        gf_log (this->name, GF_LOG_INFO, "Disconnected from "
-                                "%s:%s", brickinfo->hostname, brickinfo->path);
+                if (glusterd_is_brick_started (brickinfo))
+                        gf_msg (this->name, GF_LOG_INFO, 0,
+                                GD_MSG_BRICK_DISCONNECTED,
+                                "Brick %s:%s has disconnected from glusterd.",
+                                brickinfo->hostname, brickinfo->path);
 
                 glusterd_set_brick_status (brickinfo, GF_BRICK_STOPPED);
                 break;
@@ -3980,6 +4398,7 @@ __glusterd_brick_rpc_notify (struct rpc_clnt *rpc, void *mydata,
                 break;
         }
 
+out:
         return ret;
 }
 
@@ -3989,6 +4408,65 @@ glusterd_brick_rpc_notify (struct rpc_clnt *rpc, void *mydata,
 {
         return glusterd_big_locked_notify (rpc, mydata, event, data,
                                            __glusterd_brick_rpc_notify);
+}
+
+int
+__glusterd_snapd_rpc_notify (struct rpc_clnt *rpc, void *mydata,
+                             rpc_clnt_event_t event, void *data)
+{
+        xlator_t                *this           = NULL;
+        glusterd_conf_t         *conf           = NULL;
+        glusterd_volinfo_t      *volinfo        = NULL;
+        int                     ret             = 0;
+
+        this = THIS;
+        GF_ASSERT (this);
+        conf = this->private;
+        GF_ASSERT (conf);
+
+        volinfo = mydata;
+        if (!volinfo)
+                return 0;
+
+        switch (event) {
+        case RPC_CLNT_CONNECT:
+                gf_log (this->name, GF_LOG_DEBUG, "got RPC_CLNT_CONNECT");
+
+                (void) glusterd_snapd_set_online_status (volinfo, _gf_true);
+
+                break;
+
+        case RPC_CLNT_DISCONNECT:
+                if (glusterd_is_snapd_online (volinfo)) {
+                        gf_msg (this->name, GF_LOG_INFO, 0,
+                                GD_MSG_NODE_DISCONNECTED,
+                                "snapd for volume %s has disconnected from "
+                                "glusterd.", volinfo->volname);
+
+                        (void) glusterd_snapd_set_online_status
+                                                          (volinfo, _gf_false);
+                }
+                break;
+
+        case RPC_CLNT_DESTROY:
+                glusterd_volinfo_unref (volinfo);
+                break;
+
+        default:
+                gf_log (this->name, GF_LOG_TRACE,
+                        "got some other RPC event %d", event);
+                break;
+        }
+
+        return ret;
+}
+
+int
+glusterd_snapd_rpc_notify (struct rpc_clnt *rpc, void *mydata,
+                             rpc_clnt_event_t event, void *data)
+{
+        return glusterd_big_locked_notify (rpc, mydata, event, data,
+                                           __glusterd_snapd_rpc_notify);
 }
 
 int
@@ -4018,8 +4496,11 @@ __glusterd_nodesvc_rpc_notify (struct rpc_clnt *rpc, void *mydata,
                 break;
 
         case RPC_CLNT_DISCONNECT:
-                gf_log (this->name, GF_LOG_DEBUG, "got RPC_CLNT_DISCONNECT");
+                if (glusterd_is_nodesvc_online (server)) {
+                gf_msg (this->name, GF_LOG_INFO, 0, GD_MSG_NODE_DISCONNECTED,
+                        "%s has disconnected from glusterd.", server);
                 (void) glusterd_nodesvc_set_online_status (server, _gf_false);
+                }
                 break;
 
         default:
@@ -4107,6 +4588,7 @@ __glusterd_peer_rpc_notify (struct rpc_clnt *rpc, void *mydata,
         switch (event) {
         case RPC_CLNT_CONNECT:
         {
+                rpc_clnt_set_connected (&rpc->conn);
                 gf_log (this->name, GF_LOG_DEBUG, "got RPC_CLNT_CONNECT");
                 peerinfo->connected = 1;
                 peerinfo->quorum_action = _gf_true;
@@ -4119,11 +4601,16 @@ __glusterd_peer_rpc_notify (struct rpc_clnt *rpc, void *mydata,
 
         case RPC_CLNT_DISCONNECT:
         {
-                gf_log (this->name, GF_LOG_DEBUG, "got RPC_CLNT_DISCONNECT %d",
-                        peerinfo->state.state);
+                rpc_clnt_unset_connected (&rpc->conn);
+                gf_msg (this->name, GF_LOG_INFO, 0,
+                        GD_MSG_PEER_DISCONNECTED,
+                        "Peer <%s> (<%s>), in state <%s>, has disconnected "
+                        "from glusterd.",
+                        peerinfo->hostname, uuid_utoa (peerinfo->uuid),
+                        glusterd_friend_sm_state_name_get (peerinfo->state.state));
 
                 if (peerinfo->connected) {
-                        if (conf->op_version < GD_OP_VERSION_4) {
+                        if (conf->op_version < GD_OP_VERSION_3_6_0) {
                                 glusterd_get_lock_owner (&uuid);
                                 if (!uuid_is_null (uuid) &&
                                     !uuid_compare (peerinfo->uuid, uuid))
@@ -4195,7 +4682,7 @@ glusterd_null (rpcsvc_request_t *req)
         return 0;
 }
 
-rpcsvc_actor_t gd_svc_mgmt_actors[] = {
+rpcsvc_actor_t gd_svc_mgmt_actors[GLUSTERD_MGMT_MAXVALUE] = {
         [GLUSTERD_MGMT_NULL]           = { "NULL",           GLUSTERD_MGMT_NULL,           glusterd_null,                  NULL, 0, DRC_NA},
         [GLUSTERD_MGMT_CLUSTER_LOCK]   = { "CLUSTER_LOCK",   GLUSTERD_MGMT_CLUSTER_LOCK,   glusterd_handle_cluster_lock,   NULL, 0, DRC_NA},
         [GLUSTERD_MGMT_CLUSTER_UNLOCK] = { "CLUSTER_UNLOCK", GLUSTERD_MGMT_CLUSTER_UNLOCK, glusterd_handle_cluster_unlock, NULL, 0, DRC_NA},
@@ -4212,7 +4699,7 @@ struct rpcsvc_program gd_svc_mgmt_prog = {
 	.synctask  = _gf_true,
 };
 
-rpcsvc_actor_t gd_svc_peer_actors[] = {
+rpcsvc_actor_t gd_svc_peer_actors[GLUSTERD_FRIEND_MAXVALUE] = {
         [GLUSTERD_FRIEND_NULL]    = { "NULL",          GLUSTERD_MGMT_NULL,     glusterd_null,                         NULL, 0, DRC_NA},
         [GLUSTERD_PROBE_QUERY]    = { "PROBE_QUERY",   GLUSTERD_PROBE_QUERY,   glusterd_handle_probe_query,           NULL, 0, DRC_NA},
         [GLUSTERD_FRIEND_ADD]     = { "FRIEND_ADD",    GLUSTERD_FRIEND_ADD,    glusterd_handle_incoming_friend_req,   NULL, 0, DRC_NA},
@@ -4231,7 +4718,7 @@ struct rpcsvc_program gd_svc_peer_prog = {
 
 
 
-rpcsvc_actor_t gd_svc_cli_actors[] = {
+rpcsvc_actor_t gd_svc_cli_actors[GLUSTER_CLI_MAXVALUE] = {
         [GLUSTER_CLI_PROBE]              = { "CLI_PROBE",         GLUSTER_CLI_PROBE,            glusterd_handle_cli_probe,             NULL, 0, DRC_NA},
         [GLUSTER_CLI_CREATE_VOLUME]      = { "CLI_CREATE_VOLUME", GLUSTER_CLI_CREATE_VOLUME,    glusterd_handle_create_volume,         NULL, 0, DRC_NA},
         [GLUSTER_CLI_DEFRAG_VOLUME]      = { "CLI_DEFRAG_VOLUME", GLUSTER_CLI_DEFRAG_VOLUME,    glusterd_handle_defrag_volume,         NULL, 0, DRC_NA},
@@ -4265,6 +4752,8 @@ rpcsvc_actor_t gd_svc_cli_actors[] = {
         [GLUSTER_CLI_COPY_FILE]          = {"COPY_FILE",          GLUSTER_CLI_COPY_FILE,        glusterd_handle_copy_file,             NULL, 0, DRC_NA},
         [GLUSTER_CLI_SYS_EXEC]           = {"SYS_EXEC",           GLUSTER_CLI_SYS_EXEC,         glusterd_handle_sys_exec,              NULL, 0, DRC_NA},
         [GLUSTER_CLI_SNAP]               = {"SNAP",               GLUSTER_CLI_SNAP,             glusterd_handle_snapshot,              NULL, 0, DRC_NA},
+        [GLUSTER_CLI_BARRIER_VOLUME]     = {"BARRIER_VOLUME",     GLUSTER_CLI_BARRIER_VOLUME,   glusterd_handle_barrier,               NULL, 0, DRC_NA},
+        [GLUSTER_CLI_GET_VOL_OPT]        = {"GET_VOL_OPT",        GLUSTER_CLI_GET_VOL_OPT,      glusterd_handle_get_vol_opt,           NULL, 0, DRC_NA},
 };
 
 struct rpcsvc_program gd_svc_cli_prog = {
@@ -4276,23 +4765,27 @@ struct rpcsvc_program gd_svc_cli_prog = {
 	.synctask  = _gf_true,
 };
 
-/* This is a minimal RPC prog, which contains only the readonly RPC procs from
- * the cli rpcsvc
+/**
+ * This set of RPC progs are deemed to be trusted. Most of the actors support
+ * read only queries, the only exception being MOUNT/UMOUNT which is required
+ * by geo-replication to supprt unprivileged master -> slave sessions.
  */
-rpcsvc_actor_t gd_svc_cli_actors_ro[] = {
+rpcsvc_actor_t gd_svc_cli_trusted_actors[GLUSTER_CLI_MAXVALUE] = {
         [GLUSTER_CLI_LIST_FRIENDS]       = { "LIST_FRIENDS",      GLUSTER_CLI_LIST_FRIENDS,     glusterd_handle_cli_list_friends,      NULL, 0, DRC_NA},
         [GLUSTER_CLI_UUID_GET]           = { "UUID_GET",          GLUSTER_CLI_UUID_GET,         glusterd_handle_cli_uuid_get,          NULL, 0, DRC_NA},
         [GLUSTER_CLI_GET_VOLUME]         = { "GET_VOLUME",        GLUSTER_CLI_GET_VOLUME,       glusterd_handle_cli_get_volume,        NULL, 0, DRC_NA},
         [GLUSTER_CLI_GETWD]              = { "GETWD",             GLUSTER_CLI_GETWD,            glusterd_handle_getwd,                 NULL, 1, DRC_NA},
         [GLUSTER_CLI_STATUS_VOLUME]      = {"STATUS_VOLUME",      GLUSTER_CLI_STATUS_VOLUME,    glusterd_handle_status_volume,         NULL, 0, DRC_NA},
         [GLUSTER_CLI_LIST_VOLUME]        = {"LIST_VOLUME",        GLUSTER_CLI_LIST_VOLUME,      glusterd_handle_cli_list_volume,       NULL, 0, DRC_NA},
+        [GLUSTER_CLI_MOUNT]              = { "MOUNT",             GLUSTER_CLI_MOUNT,            glusterd_handle_mount,                 NULL, 1, DRC_NA},
+        [GLUSTER_CLI_UMOUNT]             = { "UMOUNT",            GLUSTER_CLI_UMOUNT,           glusterd_handle_umount,                NULL, 1, DRC_NA},
 };
 
-struct rpcsvc_program gd_svc_cli_prog_ro = {
+struct rpcsvc_program gd_svc_cli_trusted_progs = {
         .progname  = "GlusterD svc cli read-only",
         .prognum   = GLUSTER_CLI_PROGRAM,
         .progver   = GLUSTER_CLI_VERSION,
         .numactors = GLUSTER_CLI_MAXVALUE,
-        .actors    = gd_svc_cli_actors_ro,
+        .actors    = gd_svc_cli_trusted_actors,
 	.synctask  = _gf_true,
 };

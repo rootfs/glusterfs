@@ -186,14 +186,15 @@ stripe_lookup_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                 callcnt = --local->call_count;
 
                 if (op_ret == -1) {
-                        if (op_errno != ENOENT)
+                        if ((op_errno != ENOENT) || (op_errno != ESTALE))
                                 gf_log (this->name, GF_LOG_DEBUG,
                                         "%s returned error %s",
                                         prev->this->name,
                                         strerror (op_errno));
                         if (local->op_errno != ESTALE)
                                 local->op_errno = op_errno;
-                        if (((op_errno != ENOENT) && (op_errno != ENOTCONN)) ||
+                        if (((op_errno != ENOENT) && (op_errno != ENOTCONN)
+                              && (op_errno != ESTALE)) ||
                             (prev->this == FIRST_CHILD (this)))
                                 local->failed = 1;
                         if (op_errno == ENOENT)
@@ -297,7 +298,6 @@ stripe_lookup (call_frame_t *frame, xlator_t *this, loc_t *loc,
         VALIDATE_OR_GOTO (frame, err);
         VALIDATE_OR_GOTO (this, err);
         VALIDATE_OR_GOTO (loc, err);
-        VALIDATE_OR_GOTO (loc->path, err);
         VALIDATE_OR_GOTO (loc->inode, err);
 
         priv = this->private;
@@ -4459,7 +4459,7 @@ stripe_is_bd (dict_t *this, char *key, data_t *value, void *data)
         return 0;
 }
 
-inline gf_boolean_t
+static inline gf_boolean_t
 stripe_setxattr_is_bd (dict_t *dict)
 {
         gf_boolean_t is_bd = _gf_false;
@@ -4628,7 +4628,7 @@ out:
         return ret;
 }
 
-inline gf_boolean_t
+static inline gf_boolean_t
 stripe_fsetxattr_is_special (dict_t *dict)
 {
         gf_boolean_t is_spl = _gf_false;
@@ -4856,26 +4856,23 @@ stripe_readdirp_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         LOCK (&frame->lock);
         {
-                if (op_ret == -1) {
-                        gf_log (this->name, GF_LOG_WARNING,
-                                "%s returned error %s",
-                                prev->this->name, strerror (op_errno));
-                        local->op_errno = op_errno;
-                        local->op_ret = op_ret;
-                        goto unlock;
-                } else {
-                        local->op_ret = op_ret;
+                local->op_errno = op_errno;
+                local->op_ret = op_ret;
+
+                if (op_ret != -1) {
                         list_splice_init (&orig_entries->list,
                                           &local->entries.list);
                         local->wind_count = op_ret;
                 }
 
         }
-unlock:
         UNLOCK (&frame->lock);
 
-        if (op_ret == -1)
+        if (op_ret == -1) {
+                gf_log (this->name, GF_LOG_WARNING, "%s returned error %s",
+                        prev->this->name, strerror (op_errno));
                 goto out;
+        }
 
         xattrs = dict_new ();
         if (xattrs)
@@ -4936,8 +4933,11 @@ out:
         if (!count) {
                 /* all entries are directories */
                 frame->local = NULL;
-                STRIPE_STACK_UNWIND (readdir, frame, local->op_ret,
-                                     local->op_errno, &local->entries, NULL);
+                STRIPE_STACK_UNWIND (readdir, frame,
+                                     local ? local->op_ret : -1,
+                                     local ? local->op_errno : EINVAL,
+                                     local ? &local->entries : NULL,
+                                     NULL);
                 gf_dirent_free (&local->entries);
                 stripe_local_wipe (local);
                 mem_put (local);
@@ -5080,7 +5080,7 @@ reconfigure (xlator_t *this, dict_t *options)
                                 goto unlock;
                         }
 
-                        if (gf_string2bytesize (opt->default_value, &priv->block_size)){
+                        if (gf_string2bytesize_uint64 (opt->default_value, &priv->block_size)){
                                 gf_log (this->name, GF_LOG_ERROR,
                                         "Unable to set default block-size ");
                                 ret = -1;
@@ -5187,7 +5187,7 @@ init (xlator_t *this)
                         ret = -1;
                         goto unlock;
                 }
-                if (gf_string2bytesize (opt->default_value, &priv->block_size)){
+                if (gf_string2bytesize_uint64 (opt->default_value, &priv->block_size)){
                         gf_log (this->name, GF_LOG_ERROR,
                                 "Unable to set default block-size ");
                         ret = -1;
@@ -5601,7 +5601,7 @@ err:
         return 0;
 }
 
-inline gf_boolean_t
+static inline gf_boolean_t
 stripe_is_special_xattr (const char *name)
 {
         gf_boolean_t    is_spl = _gf_false;

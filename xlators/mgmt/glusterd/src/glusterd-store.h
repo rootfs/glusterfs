@@ -44,16 +44,19 @@ typedef enum glusterd_store_ver_ac_{
 #define GLUSTERD_STORE_KEY_VOL_SUB_COUNT        "sub_count"
 #define GLUSTERD_STORE_KEY_VOL_STRIPE_CNT       "stripe_count"
 #define GLUSTERD_STORE_KEY_VOL_REPLICA_CNT      "replica_count"
+#define GLUSTERD_STORE_KEY_VOL_DISPERSE_CNT     "disperse_count"
+#define GLUSTERD_STORE_KEY_VOL_REDUNDANCY_CNT   "redundancy_count"
 #define GLUSTERD_STORE_KEY_VOL_BRICK            "brick"
 #define GLUSTERD_STORE_KEY_VOL_VERSION          "version"
 #define GLUSTERD_STORE_KEY_VOL_TRANSPORT        "transport-type"
 #define GLUSTERD_STORE_KEY_VOL_ID               "volume-id"
-#define GLUSTERD_STORE_KEY_VOL_IS_RESTORED      "is-volume-restored"
+#define GLUSTERD_STORE_KEY_VOL_RESTORED_SNAP    "restored_from_snap"
 #define GLUSTERD_STORE_KEY_RB_STATUS            "rb_status"
 #define GLUSTERD_STORE_KEY_RB_SRC_BRICK         "rb_src"
 #define GLUSTERD_STORE_KEY_RB_DST_BRICK         "rb_dst"
 #define GLUSTERD_STORE_KEY_RB_DST_PORT          "rb_port"
 #define GLUSTERD_STORE_KEY_VOL_DEFRAG           "rebalance_status"
+#define GLUSTERD_STORE_KEY_VOL_DEFRAG_STATUS    "status"
 #define GLUSTERD_STORE_KEY_DEFRAG_OP            "rebalance_op"
 #define GLUSTERD_STORE_KEY_USERNAME             "username"
 #define GLUSTERD_STORE_KEY_PASSWORD             "password"
@@ -68,7 +71,10 @@ typedef enum glusterd_store_ver_ac_{
 #define GLUSTERD_STORE_KEY_SNAP_STATUS          "status"
 #define GLUSTERD_STORE_KEY_SNAP_RESTORED        "snap-restored"
 #define GLUSTERD_STORE_KEY_SNAP_MAX_HARD_LIMIT  "snap-max-hard-limit"
+#define GLUSTERD_STORE_KEY_SNAP_AUTO_DELETE     "auto-delete"
 #define GLUSTERD_STORE_KEY_SNAP_MAX_SOFT_LIMIT  "snap-max-soft-limit"
+#define GLUSTERD_STORE_KEY_SNAPD_PORT           "snapd-port"
+#define GLUSTERD_STORE_KEY_SNAP_ACTIVATE        "snap-activate-on-create"
 
 #define GLUSTERD_STORE_KEY_BRICK_HOSTNAME       "hostname"
 #define GLUSTERD_STORE_KEY_BRICK_PATH           "path"
@@ -77,7 +83,10 @@ typedef enum glusterd_store_ver_ac_{
 #define GLUSTERD_STORE_KEY_BRICK_DECOMMISSIONED "decommissioned"
 #define GLUSTERD_STORE_KEY_BRICK_VGNAME         "vg"
 #define GLUSTERD_STORE_KEY_BRICK_DEVICE_PATH    "device_path"
+#define GLUSTERD_STORE_KEY_BRICK_MOUNT_DIR      "mount_dir"
 #define GLUSTERD_STORE_KEY_BRICK_SNAP_STATUS    "snap-status"
+#define GLUSTERD_STORE_KEY_BRICK_FSTYPE         "fs-type"
+#define GLUSTERD_STORE_KEY_BRICK_MNTOPTS        "mnt-opts"
 #define GLUSTERD_STORE_KEY_BRICK_ID             "brick-id"
 
 #define GLUSTERD_STORE_KEY_PEER_UUID            "uuid"
@@ -85,20 +94,6 @@ typedef enum glusterd_store_ver_ac_{
 #define GLUSTERD_STORE_KEY_PEER_STATE           "state"
 
 #define GLUSTERD_STORE_KEY_VOL_CAPS             "caps"
-
-#define glusterd_for_each_entry(entry, dir) \
-        do {\
-                entry = NULL;\
-                if (dir) {\
-                        entry = readdir (dir);\
-                        while (entry && (!strcmp (entry->d_name, ".") ||\
-                            !fnmatch ("*.tmp", entry->d_name, 0) ||\
-                            !strcmp (entry->d_name, ".."))) {\
-                                entry = readdir (dir);\
-                        }\
-                }\
-        } while (0); \
-
 
 int32_t
 glusterd_store_volinfo (glusterd_volinfo_t *volinfo, glusterd_volinfo_ver_ac_t ac);
@@ -168,7 +163,8 @@ int32_t
 glusterd_store_snap (glusterd_snap_t *snap);
 
 int32_t
-glusterd_store_update_missed_snaps (dict_t *dict,
-                                    int32_t missed_snap_count);
+glusterd_store_update_missed_snaps ();
 
+glusterd_volinfo_t*
+glusterd_store_retrieve_volume (char *volname, glusterd_snap_t *snap);
 #endif

@@ -43,17 +43,17 @@ function remove_brick_status_completed_field {
 
 function get_mount_process_pid {
         local vol=$1
-        ps aux | grep glusterfs | grep -E "volfile-id[ =]/?$vol " | awk '{print $2}' | head -1
+        ps auxww | grep glusterfs | grep -E "volfile-id[ =]/?$vol " | awk '{print $2}' | head -1
 }
 
 function get_nfs_pid ()
 {
-        ps aux | grep "volfile-id\ gluster\/nfs" | awk '{print $2}' | head -1
+        ps auxww | grep "volfile-id\ gluster\/nfs" | awk '{print $2}' | head -1
 }
 
 function read_nfs_pidfile ()
 {
-        echo `cat /var/lib/glusterd/nfs/run/nfs.pid`
+        echo `cat $GLUSTERD_WORKDIR/nfs/run/nfs.pid`
 }
 
 function cleanup_statedump {
@@ -84,6 +84,14 @@ function cleanup_mount_statedump {
         cleanup_statedump $(get_mount_process_pid $vol)
 }
 
+function snap_client_connected_status {
+         local vol=$1
+         local fpath=$(generate_mount_statedump $vol)
+         up=$(grep -A2 xlator.protocol.client.$vol-snapd-client.priv $fpath | tail -1 | cut -f 2 -d'=')
+         rm -f $fpath
+         echo "$up"
+}
+
 function _afr_child_up_status {
         local vol=$1
         #brick_id is (brick-num in volume info - 1)
@@ -102,19 +110,40 @@ function afr_child_up_status {
         _afr_child_up_status $vol $brick_id generate_mount_statedump
 }
 
-function get_shd_process_pid {
+function ec_get_info {
         local vol=$1
-        ps aux | grep glusterfs | grep -E "glustershd/run/glustershd.pid" | awk '{print $2}' | head -1
+        local dist_id=$2
+        local key=$3
+        local fpath=$(generate_mount_statedump $vol)
+        local value=$(sed -n "/^\[cluster\/disperse\.$vol-disperse-$dist_id\]/,/^\[/{s/^$key=\(.*\)/\1/p;}" $fpath | head -1)
+        rm -f $fpath
+        echo "$value"
+}
+
+function ec_child_up_status {
+        local vol=$1
+        local dist_id=$2
+        local brick_id=$(($3 + 1))
+        local mask=$(ec_get_info $vol $dist_id "childs_up_mask")
+        echo "${mask: -$brick_id:1}"
+}
+
+function ec_child_up_count {
+        local vol=$1
+        local dist_id=$2
+        ec_get_info $vol $dist_id "childs_up"
+}
+
+function get_shd_process_pid {
+        ps auxww | grep glusterfs | grep -E "glustershd/run/glustershd.pid" | awk '{print $2}' | head -1
 }
 
 function generate_shd_statedump {
-        local vol=$1
-        generate_statedump $(get_shd_process_pid $vol)
+        generate_statedump $(get_shd_process_pid)
 }
 
 function generate_nfs_statedump {
-        local vol=$1
-        generate_statedump $(get_nfs_pid $vol)
+        generate_statedump $(get_nfs_pid)
 }
 
 function generate_brick_statedump {
@@ -146,12 +175,16 @@ function glustershd_up_status {
         gluster volume status | grep "Self-heal Daemon" | awk '{print $6}'
 }
 
+function quotad_up_status {
+        gluster volume status | grep "Quota Daemon" | awk '{print $6}'
+}
+
 function get_brick_pid {
         local vol=$1
         local host=$2
         local brick=$3
         local brick_hiphenated=$(echo $brick | tr '/' '-')
-        echo `cat /var/lib/glusterd/vols/$vol/run/${host}${brick_hiphenated}.pid`
+        echo `cat $GLUSTERD_WORKDIR/vols/$vol/run/${host}${brick_hiphenated}.pid`
 }
 
 function kill_brick {
@@ -240,8 +273,8 @@ function gd_is_replace_brick_completed {
 }
 
 function dht_get_layout {
-	local my_xa=trusted.glusterfs.dht
-	getfattr -d -e hex -n $my_xa $1 2> /dev/null | grep "$my_xa=" | cut -d= -f2
+        local my_xa=trusted.glusterfs.dht
+        getfattr -d -e hex -n $my_xa $1 2> /dev/null | grep "$my_xa=" | cut -d= -f2
 }
 
 function afr_get_specific_changelog_xattr ()
@@ -301,7 +334,7 @@ function data_written_count {
 }
 
 function has_holes {
-        if [ $((`stat -c '%b*%B-%s' -- $1`)) -lt 0 ];
+        if [ $((`stat -c '%b*%B-%s' $1`)) -lt 0 ];
         then
                 echo "1"
         else
@@ -358,4 +391,57 @@ function volume_exists() {
         else
                 return 0
         fi
+}
+
+function afr_get_index_count {
+        local brick=$1
+        ls $1/.glusterfs/indices/xattrop | grep -v xattrop | wc -l
+}
+
+function landfill_entry_count {
+        local brick=$1
+        ls $brick/.glusterfs/landfill | wc -l
+}
+
+function path_exists {
+        stat $1
+        if [ $? -eq 0 ]; then echo "Y"; else echo "N"; fi
+}
+
+function force_umount {
+        umount -f $*
+        if [ $? -eq 0 ]; then echo "Y"; else echo "N"; fi
+}
+
+function assign_gfid {
+        local gfid=$1
+        local file=$2
+        setfattr -n trusted.gfid -v $1 $2
+}
+
+function get_random_gfid {
+        echo "0x"$(uuidgen | awk -F '-' 'BEGIN {OFS=""} {print $1,$2,$3,$4,$5}')
+}
+
+function volgen_volume_exists {
+        local volfile="$1"
+        local xl_vol="$2"
+        local xl_type="$3"
+        local xl_feature="$4"
+        xl=$(sed -e "/./{H;\$!d;}" -e "x;/volume $xl_vol/!d;/type $xl_type\/$xl_feature/!d" $volfile)
+        if [ -z "$xl" ];
+        then
+                echo "N"
+        else
+                echo "Y"
+        fi
+}
+
+function volgen_volume_option {
+        local volfile="$1"
+        local xl_vol="$2"
+        local xl_type="$3"
+        local xl_feature="$4"
+        local xl_option="$5"
+        sed -e "/./{H;\$!d;}" -e "x;/volume $xl_vol/!d;/type $xl_type\/$xl_feature/!d;/option $xl_option/!d" $volfile | grep " $xl_option " | awk '{print $3}'
 }

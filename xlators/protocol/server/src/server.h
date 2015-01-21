@@ -22,39 +22,12 @@
 #include "glusterfs3.h"
 #include "timer.h"
 #include "client_t.h"
+#include "gidcache.h"
 
 #define DEFAULT_BLOCK_SIZE         4194304   /* 4MB */
 #define DEFAULT_VOLUME_FILE_PATH   CONFDIR "/glusterfs.vol"
 #define GF_MAX_SOCKET_WINDOW_SIZE  (1 * GF_UNIT_MB)
 #define GF_MIN_SOCKET_WINDOW_SIZE  (0)
-
-struct _gf_barrier_payload {
-        rpcsvc_request_t        *req;
-        struct iovec            rsp;
-        call_frame_t            *frame;
-        struct iovec            *payload;
-        struct iobref           *iobref;
-        struct iobuf            *iob;
-        int                      payload_count;
-        gf_boolean_t             free_iobref;
-        struct list_head         list;
-};
-
-typedef struct _gf_barrier_payload gf_barrier_payload_t;
-
-struct _gf_barrier {
-        gf_lock_t               lock;
-        gf_boolean_t            on;
-        gf_boolean_t            force;
-        size_t                  cur_size;
-        int64_t                 max_size;
-        uint64_t                fops;
-        gf_timer_t             *timer;
-        uint64_t                time_out;
-        struct list_head        queue;
-};
-
-typedef struct _gf_barrier gf_barrier_t;
 
 typedef enum {
         INTERNAL_LOCKS = 1,
@@ -84,9 +57,12 @@ struct server_conf {
         struct timespec         grace_ts;
         dict_t                 *auth_modules;
         pthread_mutex_t         mutex;
-        gf_barrier_t           *barrier;
         struct list_head        xprt_list;
         pthread_t               barrier_th;
+
+        gf_boolean_t            server_manage_gids; /* resolve gids on brick */
+        gid_cache_t             gid_cache;
+        int32_t                 gid_cache_timeout;
 };
 typedef struct server_conf server_conf_t;
 
@@ -174,8 +150,6 @@ struct _server_state {
 
 extern struct rpcsvc_program gluster_handshake_prog;
 extern struct rpcsvc_program glusterfs3_3_fop_prog;
-extern struct rpcsvc_program gluster_ping_prog;
-
 
 typedef struct _server_ctx {
         gf_lock_t            fdtable_lock;

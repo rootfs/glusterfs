@@ -18,13 +18,14 @@
 
 
 PROGNAME="Ssamba-set"
-OPTSPEC="volname:"
+OPTSPEC="volname:,gd-workdir:"
 VOL=
 CONFIGFILE=
 LOGFILEBASE=
 PIDDIR=
-
-enable_smb=""
+GLUSTERD_WORKDIR=
+USERSMB_SET=""
+USERCIFS_SET=""
 
 function parse_args () {
         ARGS=$(getopt -l $OPTSPEC  -o "o" -name $PROGNAME $@)
@@ -32,29 +33,32 @@ function parse_args () {
 
         while true; do
             case $1 in
-            --volname)
-                shift
-                VOL=$1
-                ;;
-            *)
-                shift
-                for pair in $@; do
+                --volname)
+                    shift
+                    VOL=$1
+                    ;;
+                --gd-workdir)
+                    shift
+                    GLUSTERD_WORKDIR=$1
+                    ;;
+                *)
+                    shift
+                    for pair in $@; do
                         read key value < <(echo "$pair" | tr "=" " ")
                         case "$key" in
                             "user.cifs")
-                                    enable_smb=$value
-                                    ;;
+                                USERCIFS_SET="YES"
+                                ;;
                             "user.smb")
-                                    enable_smb=$value
-                                    ;;
+                                USERSMB_SET="YES"
+                                ;;
                             *)
-                                    ;;
+                                ;;
                         esac
-                done
-
-                shift
-                break
-                ;;
+                    done
+                    shift
+                    break
+                    ;;
             esac
             shift
         done
@@ -79,7 +83,7 @@ function add_samba_share () {
         STRING+="glusterfs:volume = $volname\n"
         STRING+="glusterfs:logfile = $LOGFILEBASE/glusterfs-$volname.%%M.log\n"
         STRING+="glusterfs:loglevel = 7\n"
-        STRING+="path = %%P/\n"
+        STRING+="path = /\n"
         STRING+="read only = no\n"
         STRING+="guest ok = yes\n"
         printf "$STRING"  >> ${CONFIGFILE}
@@ -91,19 +95,34 @@ function sighup_samba () {
         then
                 kill -HUP "$pid";
         else
-                /etc/init.d/smb start
+                /etc/init.d/smb condrestart
         fi
 }
 
 function del_samba_share () {
         volname=$1
-        sed -i "/\[gluster-$volname\]/,/^$/d" /etc/samba/smb.conf
+        sed -i "/\[gluster-$volname\]/,/^$/d" ${CONFIGFILE}
 }
 
 function is_volume_started () {
         volname=$1
-        echo "$(grep status /var/lib/glusterd/vols/"$volname"/info |\
+        echo "$(grep status $GLUSTERD_WORKDIR/vols/"$volname"/info |\
                 cut -d"=" -f2)"
+}
+
+function get_smb () {
+        volname=$1
+        uservalue=
+
+        usercifsvalue=$(grep user.cifs $GLUSTERD_WORKDIR/vols/"$volname"/info |\
+                        cut -d"=" -f2)
+        usersmbvalue=$(grep user.smb $GLUSTERD_WORKDIR/vols/"$volname"/info |\
+                       cut -d"=" -f2)
+
+        if [[ $usercifsvalue = "disable" || $usersmbvalue = "disable" ]]; then
+                uservalue="disable"
+        fi
+        echo "$uservalue"
 }
 
 parse_args $@
@@ -111,16 +130,18 @@ if [ "0" = $(is_volume_started "$VOL") ]; then
     exit 0
 fi
 
-#Find smb.conf, smbd pid directory and smbd logfile path
-find_config_info
 
-if [ "$enable_smb" = "enable" ]; then
-    if ! grep --quiet "\[gluster-$VOL\]" /etc/samba/smb.conf ; then
+if [[ "$USERCIFS_SET" = "YES" || "$USERSMB_SET" = "YES" ]]; then
+    #Find smb.conf, smbd pid directory and smbd logfile path
+    find_config_info
+
+    if [ $(get_smb "$VOL") = "disable" ]; then
+        del_samba_share $VOL
+        sighup_samba
+    else
+        if ! grep --quiet "\[gluster-$VOL\]" ${CONFIGFILE} ; then
             add_samba_share $VOL
             sighup_samba
+        fi
     fi
-
-elif [ "$enable_smb" = "disable" ]; then
-    del_samba_share $VOL
-    sighup_samba
 fi

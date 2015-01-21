@@ -28,7 +28,7 @@
 
 
 int
-glfs_graph_setup (struct glfs *fs, glusterfs_graph_t *graph)
+graph_setup (struct glfs *fs, glusterfs_graph_t *graph)
 {
 	xlator_t      *new_subvol = NULL;
 	xlator_t      *old_subvol = NULL;
@@ -93,11 +93,22 @@ notify (xlator_t *this, int event, void *data, ...)
 			graph->id);
 		break;
 	case GF_EVENT_CHILD_UP:
-		glfs_graph_setup (fs, graph);
+                pthread_mutex_lock (&fs->mutex);
+                {
+                        graph->used = 1;
+                }
+                pthread_mutex_unlock (&fs->mutex);
+		graph_setup (fs, graph);
 		glfs_init_done (fs, 0);
 		break;
 	case GF_EVENT_CHILD_DOWN:
-		glfs_graph_setup (fs, graph);
+                pthread_mutex_lock (&fs->mutex);
+                {
+                        graph->used = 0;
+                        pthread_cond_broadcast (&fs->child_down_cond);
+                }
+                pthread_mutex_unlock (&fs->mutex);
+		graph_setup (fs, graph);
 		glfs_init_done (fs, 1);
 		break;
 	case GF_EVENT_CHILD_CONNECTING:

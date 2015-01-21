@@ -163,9 +163,9 @@ fuse_resolve_gfid_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                 goto out;
         }
 
-        loc_wipe (&resolve->resolve_loc);
-
         link_inode = inode_link (inode, NULL, NULL, buf);
+
+        loc_wipe (&resolve->resolve_loc);
 
         if (!link_inode)
                 goto out;
@@ -654,19 +654,12 @@ fuse_resolve (fuse_state_t *state)
         return 0;
 }
 
-
 static int
 fuse_resolve_done (fuse_state_t *state)
 {
-        fuse_resume_fn_t fn = NULL;
-
-        fn = state->resume_fn;
-
-	fn (state);
-
+        fuse_fop_resume (state);
         return 0;
 }
-
 
 /*
  * This function is called multiple times, once per resolving one location/fd.
@@ -711,7 +704,6 @@ fuse_resolve_continue (fuse_state_t *state)
 
         return 0;
 }
-
 
 int
 fuse_resolve_and_resume (fuse_state_t *state, fuse_resume_fn_t fn)

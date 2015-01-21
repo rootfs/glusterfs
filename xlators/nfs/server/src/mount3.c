@@ -31,27 +31,13 @@
 #include "nfs.h"
 #include "common-utils.h"
 #include "store.h"
+#include "glfs-internal.h"
+#include "glfs.h"
 
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 
-
-#define IPv4_ADDR_SIZE  32
-
-/* Macro to typecast the parameter to struct sockaddr_in
- */
-#define SA(addr) ((struct sockaddr_in*)(addr))
-
-/* Macro will mask the ip address with netmask.
- */
-#define MASKED_IP(ipv4addr, netmask)                    \
-                (ntohl(SA(ipv4addr)->sin_addr.s_addr) & (netmask))
-
-/* Macro will compare two IP address after applying the mask
- */
-#define COMPARE_IPv4_ADDRS(ip1, ip2, netmask)           \
-                ((MASKED_IP(ip1, netmask)) == (MASKED_IP(ip2, netmask)))
 
 /* This macro will assist in freeing up entire link list
  * of host_auth_spec structure.
@@ -227,7 +213,10 @@ mnt3svc_set_mountres3 (mountstat3 stat, struct nfs3_fh *fh, int *authflavor,
         uint32_t        fhlen = 0;
 
         res.fhs_status = stat;
-        fhlen = nfs3_fh_compute_size (fh);
+
+        if (fh)
+                fhlen = nfs3_fh_compute_size ();
+
         res.mountres3_u.mountinfo.fhandle.fhandle3_len = fhlen;
         res.mountres3_u.mountinfo.fhandle.fhandle3_val = (char *)fh;
         res.mountres3_u.mountinfo.auth_flavors.auth_flavors_val = authflavor;
@@ -356,7 +345,6 @@ __mount_rewrite_rmtab(struct mount3_state *ms, gf_store_handle_t *sh)
 
         gf_log (GF_MNT, GF_LOG_DEBUG, "Updated rmtab with %d entries", idx);
 
-        close (fd);
         if (gf_store_rename_tmppath (sh))
                 gf_log (GF_MNT, GF_LOG_ERROR, "Failed to overwrite rwtab %s",
                         sh->path);
@@ -365,7 +353,6 @@ __mount_rewrite_rmtab(struct mount3_state *ms, gf_store_handle_t *sh)
 
 fail:
         gf_log (GF_MNT, GF_LOG_ERROR, "Failed to update %s", sh->path);
-        close (fd);
         gf_store_unlink_tmppath (sh);
 }
 
@@ -495,7 +482,7 @@ free_sh:
  * to unmount cleanly. In this case, a duplicate entry would be added to the
  * ms->mountlist, which is wrong and we should prevent.
  *
- * It is fully acceptible that the ms->mountlist is not 100% correct, this is a
+ * It is fully acceptable that the ms->mountlist is not 100% correct, this is a
  * common issue for all(?) NFS-servers.
  */
 int
@@ -858,6 +845,15 @@ mnt3_resolve_subdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                          struct iatt *buf, dict_t *xattr,
                          struct iatt *postparent);
 
+int
+mnt3_parse_dir_exports (rpcsvc_request_t *req, struct mount3_state *ms,
+                        char *subdir);
+
+int32_t
+mnt3_readlink_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                   int32_t op_ret, int32_t op_errno, const char *path,
+                   struct iatt *buf, dict_t *xdata);
+
 /* There are multiple components in the directory export path and each one
  * needs to be looked up one after the other.
  */
@@ -893,6 +889,13 @@ __mnt3_resolve_export_subdir_comp (mnt3_resolve_t *mres)
         }
 
         nfs_request_user_init (&nfu, mres->req);
+        if (IA_ISLNK (mres->resolveloc.inode->ia_type)) {
+                ret = nfs_readlink (mres->mstate->nfsx, mres->exp->vol, &nfu,
+                                    &mres->resolveloc, mnt3_readlink_cbk, mres);
+                gf_log (GF_MNT, GF_LOG_DEBUG, "Symlink found , need to resolve"
+                                              " into directory handle");
+                goto err;
+        }
         ret = nfs_lookup (mres->mstate->nfsx, mres->exp->vol, &nfu,
                           &mres->resolveloc, mnt3_resolve_subdir_cbk, mres);
 
@@ -967,7 +970,128 @@ err:
         return 0;
 }
 
+/* This function resolves symbolic link into directory path from
+ * the mount and restart the parsing process from the begining
+ *
+ * Note : Path specified in the symlink should be relative to the
+ *        symlink, because that is the one which is consistent throught
+ *        out the file system.
+ *        If the symlink resolves into another symlink ,then same process
+ *        will be repeated.
+ *        If symbolic links points outside the file system are not considered
+ *        here.
+ *
+ * TODO : 1.) This function cannot handle symlinks points to path which
+ *            goes out of the filesystem and comes backs again to same.
+ *            For example, consider vol is exported volume.It contains
+ *            dir,
+ *            symlink1 which points to ../vol/dir,
+ *            symlink2 which points to ../mnt/../vol/dir,
+ *            symlink1 and symlink2 are not handled right now.
+ *
+ *        2.) udp mount routine is much simpler from tcp routine and resolves
+ *            symlink directly.May be ,its better we change this routine
+ *            similar to udp
+ */
+int32_t
+mnt3_readlink_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                   int32_t op_ret, int32_t op_errno, const char *path,
+                   struct iatt *buf, dict_t *xdata)
+{
+        mnt3_resolve_t           *mres            = NULL;
+        int                      ret              = -EFAULT;
+        char                     *real_loc        = NULL;
+        size_t                   path_len         = 0;
+        size_t                   parent_path_len  = 0;
+        char                     *parent_path     = NULL;
+        char                     *absolute_path   = NULL;
+        char                     *relative_path   = NULL;
+        int                      mntstat          = 0;
 
+        GF_ASSERT (frame);
+
+        mres = frame->local;
+        if (!mres || !path || (path[0] == '/') || (op_ret < 0))
+                goto mnterr;
+
+        /* Finding current location of symlink */
+        parent_path_len = strlen (mres->resolveloc.path) - strlen (mres->resolveloc.name);
+        parent_path = gf_strndup (mres->resolveloc.path, parent_path_len);
+        if (!parent_path) {
+                ret = -ENOMEM;
+                goto mnterr;
+        }
+
+        relative_path = gf_strdup (path);
+        if (!relative_path) {
+                ret = -ENOMEM;
+                goto mnterr;
+        }
+        /* Resolving into absolute path */
+        ret = gf_build_absolute_path (parent_path, relative_path, &absolute_path);
+        if (ret < 0) {
+                gf_log (GF_MNT, GF_LOG_ERROR, "Cannot resolve symlink, path"
+                               "is out of boundary from current location %s"
+                               "and with relative path %s pointed by symlink",
+                                parent_path, relative_path);
+
+                goto mnterr;
+        }
+
+        /* Building the actual mount path to be mounted */
+        path_len = strlen (mres->exp->vol->name) +  strlen (absolute_path)
+                   + strlen (mres->remainingdir) + 1;
+        real_loc = GF_CALLOC (1, path_len, gf_nfs_mt_char);
+        if (!real_loc) {
+                ret = -ENOMEM;
+                goto mnterr;
+        }
+        sprintf (real_loc , "%s%s", mres->exp->vol->name, absolute_path);
+        gf_path_strip_trailing_slashes (real_loc);
+
+        /* There may entries after symlink in the mount path,
+         * we should include remaining entries too */
+        if (strlen (mres->remainingdir) > 0)
+                strcat (real_loc, mres->remainingdir);
+
+        gf_log (GF_MNT, GF_LOG_DEBUG, "Resolved path is : %s%s "
+                        "and actual mount path is %s",
+                        absolute_path, mres->remainingdir, real_loc);
+
+        /* After the resolving the symlink , parsing should be done
+         * for the populated mount path
+         */
+        ret = mnt3_parse_dir_exports (mres->req, mres->mstate, real_loc);
+
+        if (ret) {
+                gf_log (GF_MNT, GF_LOG_ERROR,
+                        "Resolved into an unknown path %s%s "
+                        "from the current location of symlink %s",
+                         absolute_path, mres->remainingdir, parent_path);
+        }
+
+        GF_FREE (real_loc);
+        GF_FREE (absolute_path);
+        GF_FREE (parent_path);
+        GF_FREE (relative_path);
+
+        return ret;
+
+mnterr:
+        if (mres) {
+                mntstat = mnt3svc_errno_to_mnterr (-ret);
+                mnt3svc_mnt_error_reply (mres->req, mntstat);
+        } else
+                gf_log (GF_MNT, GF_LOG_CRITICAL,
+                        "mres == NULL, this should *never* happen");
+        if (absolute_path)
+                GF_FREE (absolute_path);
+        if (parent_path)
+                GF_FREE (parent_path);
+        if (relative_path)
+                GF_FREE (relative_path);
+        return ret;
+}
 
 /* We will always have to perform a hard lookup on all the components of a
  * directory export for a mount request because in the mount reply we need the
@@ -1009,6 +1133,13 @@ __mnt3_resolve_subdir (mnt3_resolve_t *mres)
         }
 
         nfs_request_user_init (&nfu, mres->req);
+        if (IA_ISLNK (mres->resolveloc.inode->ia_type)) {
+                ret = nfs_readlink (mres->mstate->nfsx, mres->exp->vol, &nfu,
+                                    &mres->resolveloc, mnt3_readlink_cbk, mres);
+                gf_log (GF_MNT, GF_LOG_DEBUG, "Symlink found , need to resolve "
+                                              "into directory handle");
+                goto err;
+        }
         ret = nfs_lookup (mres->mstate->nfsx, mres->exp->vol, &nfu,
                           &mres->resolveloc, mnt3_resolve_subdir_cbk, mres);
 
@@ -1017,32 +1148,52 @@ err:
 }
 
 
+static gf_boolean_t
+mnt3_match_subnet_v4 (struct addrinfo *ai, uint32_t saddr, uint32_t mask)
+{
+        for (; ai; ai = ai->ai_next) {
+                struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
+
+                if (sin->sin_family != AF_INET)
+                        continue;
+
+                if (mask_match (saddr, sin->sin_addr.s_addr, mask))
+                        return _gf_true;
+        }
+
+        return _gf_false;
+}
+
+
 /**
  * This function will verify if the client is allowed to mount
  * the directory or not. Client's IP address will be compared with
  * allowed IP list or range present in mnt3_export structure.
  *
- * @param req - RPC request. This structure contains client's IP address.
+ * @param client_addr - This structure contains client's IP address.
  * @param export - mnt3_export structure. Contains allowed IP list/range.
  *
  * @return 0 - on Success and -EACCES on failure.
+ *
+ * TODO: Support IPv6 subnetwork
  */
 int
-mnt3_verify_auth (rpcsvc_request_t *req, struct mnt3_export *export)
+mnt3_verify_auth (struct sockaddr_in *client_addr, struct mnt3_export *export)
 {
         int                     retvalue = -EACCES;
         int                     ret = 0;
-        int                     shiftbits = 0;
-        uint32_t                ipv4netmask = 0;
-        uint32_t                routingprefix = 0;
         struct host_auth_spec   *host = NULL;
-        struct sockaddr_in      *client_addr = NULL;
         struct sockaddr_in      *allowed_addr = NULL;
         struct addrinfo         *allowed_addrinfo = NULL;
 
+        struct addrinfo         hint = {
+                .ai_family      = AF_INET,
+                .ai_protocol    = (int)IPPROTO_TCP,
+                .ai_flags       = AI_CANONNAME,
+        };
+
         /* Sanity check */
-        if ((NULL == req) ||
-            (NULL == req->trans) ||
+        if ((NULL == client_addr) ||
             (NULL == export) ||
             (NULL == export->hostspec)) {
                 gf_log (GF_MNT, GF_LOG_ERROR, "Invalid argument");
@@ -1051,9 +1202,15 @@ mnt3_verify_auth (rpcsvc_request_t *req, struct mnt3_export *export)
 
         host = export->hostspec;
 
-
-        /* Client's IP address. */
-        client_addr = (struct sockaddr_in *)(&(req->trans->peerinfo.sockaddr));
+        /*
+         * Currently IPv4 subnetwork is supported i.e. AF_INET.
+         * TODO: IPv6 subnetwork i.e. AF_INET6.
+         */
+        if (client_addr->sin_family != AF_INET) {
+                gf_log (GF_MNT, GF_LOG_ERROR,
+                        "Only IPv4 is supported for subdir-auth");
+                return retvalue;
+        }
 
         /* Try to see if the client IP matches the allowed IP list.*/
         while (NULL != host){
@@ -1065,77 +1222,38 @@ mnt3_verify_auth (rpcsvc_request_t *req, struct mnt3_export *export)
                 }
 
                 /* Get the addrinfo for the allowed host (host_addr). */
-                ret = getaddrinfo (host->host_addr,
-                                NULL,
-                                NULL,
-                                &allowed_addrinfo);
+                ret = getaddrinfo (host->host_addr, NULL,
+                                   &hint, &allowed_addrinfo);
                 if (0 != ret){
-                        gf_log (GF_MNT, GF_LOG_ERROR, "getaddrinfo: %s\n",
-                                gai_strerror (ret));
-                        host = host->next;
-
-                        /* Failed to get IP addrinfo. Continue to check other
-                         * allowed IPs in the list.
+                        /*
+                         * getaddrinfo() FAILED for the host IP addr. Continue
+                         * to search other allowed hosts in the  hostspec list.
                          */
+                        gf_log (GF_MNT, GF_LOG_DEBUG,
+                                "getaddrinfo: %s\n", gai_strerror (ret));
+                        host = host->next;
                         continue;
                 }
 
                 allowed_addr = (struct sockaddr_in *)(allowed_addrinfo->ai_addr);
-
                 if (NULL == allowed_addr) {
                         gf_log (GF_MNT, GF_LOG_ERROR, "Invalid structure");
                         break;
                 }
 
-                if (AF_INET == allowed_addr->sin_family){
-                        if (IPv4_ADDR_SIZE < host->routeprefix) {
-                                gf_log (GF_MNT, GF_LOG_ERROR, "invalid IP "
-                                        "configured for export-dir AUTH");
-                                host = host->next;
-                                continue;
-                        }
-
-                        /* -1 means no route prefix is provided. In this case
-                         * the IP should be an exact match. Which is same as
-                         * providing a route prefix of IPv4_ADDR_SIZE.
-                         */
-                        if (-1 == host->routeprefix) {
-                                routingprefix = IPv4_ADDR_SIZE;
-                        } else {
-                                routingprefix = host->routeprefix;
-                        }
-
-                        /* Create a mask from the routing prefix. User provided
-                         * CIDR address is split into IP address (host_addr) and
-                         * routing prefix (routeprefix). This CIDR address may
-                         * denote a single, distinct interface address or the
-                         * beginning address of an entire network.
-                         *
-                         * e.g. the IPv4 block 192.168.100.0/24 represents the
-                         * 256 IPv4 addresses from 192.168.100.0 to
-                         * 192.168.100.255.
-                         * Therefore to check if an IP matches 192.168.100.0/24
-                         * we should mask the IP with FFFFFF00 and compare it
-                         * with host address part of CIDR.
-                         */
-                        shiftbits = IPv4_ADDR_SIZE - routingprefix;
-                        ipv4netmask = 0xFFFFFFFFUL << shiftbits;
-
-                        /* Mask both the IPs and then check if they match
-                         * or not. */
-                        if (COMPARE_IPv4_ADDRS (allowed_addr,
-                                                client_addr,
-                                                ipv4netmask)){
-                                retvalue = 0;
-                                break;
-                        }
+                /* Check if the network addr of both IPv4 socket match */
+                if (mnt3_match_subnet_v4 (allowed_addrinfo,
+                                          client_addr->sin_addr.s_addr,
+                                          host->netmask)) {
+                        retvalue = 0;
+                        break;
                 }
 
-                /* Client IP didn't match the allowed IP.
-                 * Check with the next allowed IP.*/
+                /* No match yet, continue the search */
                host = host->next;
         }
 
+        /* FREE the dynamic memory allocated by getaddrinfo() */
         if (NULL != allowed_addrinfo) {
                freeaddrinfo (allowed_addrinfo);
         }
@@ -1147,16 +1265,19 @@ int
 mnt3_resolve_subdir (rpcsvc_request_t *req, struct mount3_state *ms,
                      struct mnt3_export *exp, char *subdir)
 {
-        mnt3_resolve_t  *mres = NULL;
-        int             ret = -EFAULT;
-        struct nfs3_fh  pfh = GF_NFS3FH_STATIC_INITIALIZER;
+        mnt3_resolve_t        *mres = NULL;
+        int                   ret = -EFAULT;
+        struct nfs3_fh        pfh = GF_NFS3FH_STATIC_INITIALIZER;
+        struct sockaddr_in    *sin = NULL;
 
         if ((!req) || (!ms) || (!exp) || (!subdir))
                 return ret;
 
+        sin = (struct sockaddr_in *)(&(req->trans->peerinfo.sockaddr));
+
         /* Need to check AUTH */
         if (NULL != exp->hostspec) {
-                ret = mnt3_verify_auth (req, exp);
+                ret = mnt3_verify_auth (sin, exp);
                 if (0 != ret) {
                         gf_log (GF_MNT,GF_LOG_ERROR,
                                         "AUTH verification failed");
@@ -1175,15 +1296,17 @@ mnt3_resolve_subdir (rpcsvc_request_t *req, struct mount3_state *ms,
         mres->req = req;
         strncpy (mres->remainingdir, subdir, MNTPATHLEN);
         if (gf_nfs_dvm_off (nfs_state (ms->nfsx)))
-                pfh = nfs3_fh_build_indexed_root_fh (mres->mstate->nfsx->children, mres->exp->vol);
+                pfh = nfs3_fh_build_indexed_root_fh (
+                                            mres->mstate->nfsx->children,
+                                            mres->exp->vol);
         else
                 pfh = nfs3_fh_build_uuid_root_fh (exp->volumeid);
 
         mres->parentfh = pfh;
         ret = __mnt3_resolve_subdir (mres);
         if (ret < 0) {
-                gf_log (GF_MNT, GF_LOG_ERROR, "Failed to resolve export dir: %s"
-                        , mres->exp->expname);
+                gf_log (GF_MNT, GF_LOG_ERROR,
+                        "Failed to resolve export dir: %s", mres->exp->expname);
                 GF_FREE (mres);
         }
 
@@ -1208,8 +1331,8 @@ mnt3_resolve_export_subdir (rpcsvc_request_t *req, struct mount3_state *ms,
 
         ret = mnt3_resolve_subdir (req, ms, exp, volume_subdir);
         if (ret < 0) {
-                gf_log (GF_MNT, GF_LOG_ERROR, "Failed to resolve export dir: %s"
-                        , exp->expname);
+                gf_log (GF_MNT, GF_LOG_ERROR,
+                        "Failed to resolve export dir: %s", exp->expname);
                 goto err;
         }
 
@@ -1267,45 +1390,100 @@ foundexp:
 }
 
 
-int
-mnt3_check_client_net (struct mount3_state *ms, rpcsvc_request_t *req,
-                       xlator_t *targetxl)
+static int
+mnt3_check_client_net_check (rpcsvc_t *svc, char *expvol,
+                             char *ipaddr, uint16_t port)
 {
+        int ret = RPCSVC_AUTH_REJECT;
 
-        rpcsvc_t                *svc = NULL;
-        rpc_transport_t         *trans = NULL;
-        struct sockaddr_storage sastorage = {0,};
-        char                    peer[RPCSVC_PEER_STRLEN] = {0,};
-        int                     ret = -1;
+        if ((!svc) || (!expvol) || (!ipaddr))
+                goto err;
 
-        if ((!ms) || (!req) || (!targetxl))
-                return -1;
-
-        svc = rpcsvc_request_service (req);
-
-        trans = rpcsvc_request_transport (req);
-        ret = rpcsvc_transport_peeraddr (trans, peer, RPCSVC_PEER_STRLEN,
-                                         &sastorage, sizeof (sastorage));
-        if (ret != 0) {
-                gf_log (GF_MNT, GF_LOG_WARNING, "Failed to get peer addr: %s",
-                        gai_strerror (ret));
-        }
-
-        ret = rpcsvc_auth_check (svc, targetxl->name, trans);
+        ret = rpcsvc_auth_check (svc, expvol, ipaddr);
         if (ret == RPCSVC_AUTH_REJECT) {
-                gf_log (GF_MNT, GF_LOG_INFO, "Peer %s  not allowed", peer);
+                gf_log (GF_MNT, GF_LOG_INFO, "Peer %s  not allowed", ipaddr);
                 goto err;
         }
 
-        ret = rpcsvc_transport_privport_check (svc, targetxl->name,
-                                               rpcsvc_request_transport (req));
+        ret = rpcsvc_transport_privport_check (svc, expvol, port);
         if (ret == RPCSVC_AUTH_REJECT) {
                 gf_log (GF_MNT, GF_LOG_INFO, "Peer %s rejected. Unprivileged "
-                        "port not allowed", peer);
+                        "port %d not allowed", ipaddr, port);
                 goto err;
         }
 
-        ret = 0;
+        ret = RPCSVC_AUTH_ACCEPT;
+err:
+        return ret;
+}
+
+static int
+mnt3_check_client_net_tcp (rpcsvc_request_t *req, char *volname)
+{
+        rpcsvc_t                *svc = NULL;
+        rpc_transport_t         *trans = NULL;
+        union gf_sock_union     sock_union;
+        socklen_t               socksize = sizeof (struct sockaddr_in);
+        char                    peer[RPCSVC_PEER_STRLEN] = {0,};
+        char                    *ipaddr = NULL;
+        uint16_t                port = 0;
+        int                     ret = RPCSVC_AUTH_REJECT;
+
+        if ((!req) || (!volname))
+                goto err;
+
+        svc = rpcsvc_request_service (req);
+        trans = rpcsvc_request_transport (req);
+        if ((!svc) || (!trans))
+                goto err;
+
+        ret = rpcsvc_transport_peeraddr (trans, peer, RPCSVC_PEER_STRLEN,
+                                         &sock_union.storage, socksize);
+        if (ret != 0) {
+                gf_log (GF_MNT, GF_LOG_WARNING,
+                                "Failed to get peer addr: %s",
+                                gai_strerror (ret));
+                ret = RPCSVC_AUTH_REJECT;
+                goto err;
+        }
+
+        /* peer[] gets IP:PORT formar, slash the port out */
+        if (!get_host_name ((char *)peer, &ipaddr))
+                ipaddr = peer;
+
+        port = ntohs (sock_union.sin.sin_port);
+
+        ret = mnt3_check_client_net_check (svc, volname, ipaddr, port);
+err:
+        return ret;
+}
+
+static int
+mnt3_check_client_net_udp (struct svc_req *req, char *volname, xlator_t *nfsx)
+{
+        rpcsvc_t                *svc = NULL;
+        struct sockaddr_in      *sin = NULL;
+        char                    ipaddr[INET_ADDRSTRLEN + 1] = {0, };
+        uint16_t                port = 0;
+        int                     ret = RPCSVC_AUTH_REJECT;
+        struct nfs_state        *nfs = NULL;
+
+        if ((!req) || (!volname) || (!nfsx))
+                goto err;
+
+        sin = svc_getcaller (req->rq_xprt);
+        if (!sin)
+                goto err;
+
+        (void) inet_ntop (AF_INET, &sin->sin_addr, ipaddr, INET_ADDRSTRLEN);
+
+        port = ntohs (sin->sin_port);
+
+        nfs = (struct nfs_state *)nfsx->private;
+        if (nfs != NULL)
+                svc = nfs->rpcsvc;
+
+        ret = mnt3_check_client_net_check (svc, volname, ipaddr, port);
 err:
         return ret;
 }
@@ -1315,7 +1493,7 @@ int
 mnt3_parse_dir_exports (rpcsvc_request_t *req, struct mount3_state *ms,
                         char *subdir)
 {
-        char                    volname[1024];
+        char                    volname[1024] = {0, };
         struct mnt3_export      *exp = NULL;
         char                    *volname_ptr = NULL;
         int                     ret = -ENOENT;
@@ -1343,7 +1521,8 @@ mnt3_parse_dir_exports (rpcsvc_request_t *req, struct mount3_state *ms,
                 goto err;
         }
 
-        if (mnt3_check_client_net (ms, req, exp->vol) == RPCSVC_AUTH_REJECT) {
+        ret = mnt3_check_client_net_tcp (req, exp->vol->name);
+        if (ret == RPCSVC_AUTH_REJECT) {
                 gf_log (GF_MNT, GF_LOG_DEBUG, "Client mount not allowed");
                 ret = -EACCES;
                 goto err;
@@ -1441,7 +1620,7 @@ mnt3svc_mnt (rpcsvc_request_t *req)
                  * call to mnt3_find_export().
                  *
                  * This is subdir mount, we are already DONE!
-                 * nfs_subvolume_started() and mnt3_check_client_net()
+                 * nfs_subvolume_started() and mnt3_check_client_net_tcp()
                  * validation are done in mnt3_parse_dir_exports()
                  * which is invoked through mnt3_find_export().
                  *
@@ -1459,7 +1638,7 @@ mnt3svc_mnt (rpcsvc_request_t *req)
                 goto mnterr;
         }
 
-        ret = mnt3_check_client_net (ms, req, exp->vol);
+        ret = mnt3_check_client_net_tcp (req, exp->vol->name);
         if (ret == RPCSVC_AUTH_REJECT) {
                 mntstat = MNT3ERR_ACCES;
                 gf_log (GF_MNT, GF_LOG_DEBUG, "Client mount not allowed");
@@ -1952,61 +2131,254 @@ err:
         return ret;
 }
 
-/* just declaring, definition is way down below */
-rpcsvc_program_t        mnt3prog;
 
-/* nfs3_rootfh used by mount3udp thread needs to access mount3prog.private
- * directly as we don't have nfs xlator pointer to dereference it. But thats OK
+/*
+ * __mnt3udp_get_mstate() Fetches mount3_state from xlator
+ * Linkage: Static
+ * Usage: Used only for UDP MOUNT codepath
  */
-
-struct nfs3_fh *
-nfs3_rootfh (char* path)
+static struct mount3_state *
+__mnt3udp_get_mstate (xlator_t *nfsx)
 {
+        struct nfs_state        *nfs = NULL;
         struct mount3_state     *ms = NULL;
-        struct nfs3_fh          *fh = NULL;
-        struct mnt3_export      *exp = NULL;
+
+        if (nfsx == NULL)
+                return NULL;
+
+        nfs = (struct nfs_state *)nfsx->private;
+        if (nfs == NULL)
+                return NULL;
+
+        ms = (struct mount3_state *)nfs->mstate;
+        return ms;
+}
+
+extern int
+glfs_resolve_at (struct glfs *, xlator_t *, inode_t *,
+                 const char *, loc_t *, struct iatt *, int, int);
+
+extern struct glfs *
+glfs_new_from_ctx (glusterfs_ctx_t *);
+
+extern void
+glfs_free_from_ctx (struct glfs *);
+
+static inode_t *
+__mnt3udp_get_export_subdir_inode (struct svc_req *req, char *subdir,
+                                   char *expname, /* OUT */
+                                   struct mnt3_export *exp)
+{
         inode_t                 *inode = NULL;
-        char                    *tmp = NULL;
+        loc_t                   loc = {0, };
+        struct iatt             buf = {0, };
+        int                     ret = -1;
+        glfs_t                  *fs = NULL;
 
-        ms = mnt3prog.private;
+        if ((!req) || (!subdir) || (!expname) || (!exp))
+                return NULL;
+
+        /* AUTH check for subdir i.e. nfs.export-dir */
+        if (exp->hostspec) {
+                struct sockaddr_in *sin = svc_getcaller (req->rq_xprt);
+                ret = mnt3_verify_auth (sin, exp);
+                if (ret) {
+                        gf_log (GF_MNT,GF_LOG_ERROR,
+                                "AUTH(nfs.export-dir) verification failed");
+                        errno = EACCES;
+                        return NULL;
+                }
+        }
+
+        /*
+         * IMP: glfs_t fs object is not used by glfs_resolve_at (). The main
+         * purpose is to not change the ABI of glfs_resolve_at () and not to
+         * pass a NULL object.
+         *
+         * TODO: Instead of linking against libgfapi.so, just for one API
+         * i.e. glfs_resolve_at(), It would be cleaner if PATH name to
+         * inode resolution code can be moved to libglusterfs.so or so.
+         * refer bugzilla for more details :
+         * https://bugzilla.redhat.com/show_bug.cgi?id=1161573
+         */
+        fs = glfs_new_from_ctx (exp->vol->ctx);
+        if (!fs)
+                return NULL;
+
+        ret = glfs_resolve_at (fs, exp->vol, NULL, subdir,
+                               &loc, &buf, 1 /* Follow link */,
+                               0 /* Hard lookup */);
+
+        glfs_free_from_ctx (fs);
+
+        if (ret != 0) {
+                loc_wipe (&loc);
+                return NULL;
+        }
+
+        inode = inode_ref (loc.inode);
+        snprintf (expname, PATH_MAX, "/%s%s", exp->vol->name, loc.path);
+
+        loc_wipe (&loc);
+
+        return inode;
+}
+
+static inode_t *
+__mnt3udp_get_export_volume_inode (struct svc_req *req, char *volpath,
+                                   char *expname, /* OUT */
+                                   struct mnt3_export *exp)
+{
+        char                    *rpath = NULL;
+        inode_t                 *inode = NULL;
+
+        if ((!req) || (!volpath) || (!expname) || (!exp))
+                return NULL;
+
+        rpath = strchr (volpath, '/');
+        if (rpath == NULL)
+                rpath = "/";
+
+        inode = inode_from_path (exp->vol->itable, rpath);
+        snprintf (expname, PATH_MAX, "/%s", exp->vol->name);
+
+        return inode;
+}
+
+/*
+ * nfs3_rootfh() is used for NFS MOUNT over UDP i.e. mountudpproc3_mnt_3_svc().
+ * Especially in mount3udp_thread() THREAD. Gluster NFS starts this thread
+ * when nfs.mount-udp is ENABLED (set to TRUE/ON).
+ */
+struct nfs3_fh *
+nfs3_rootfh (struct svc_req *req, xlator_t *nfsx,
+             char *path, char *expname /* OUT */)
+{
+        struct nfs3_fh          *fh = NULL;
+        inode_t                 *inode = NULL;
+        struct mnt3_export      *exp = NULL;
+        struct mount3_state     *ms = NULL;
+        struct nfs_state        *nfs = NULL;
+        int                     mnt3type = MNT3_EXPTYPE_DIR;
+        int                     ret = RPCSVC_AUTH_REJECT;
+
+        if ((!req) || (!nfsx) || (!path) || (!expname)) {
+                errno = EFAULT;
+                return NULL;
+        }
+
+        /*
+         * 1. First check if the MOUNT is for whole volume.
+         *      i.e. __mnt3udp_get_export_volume_inode ()
+         * 2. If NOT, then TRY for SUBDIR MOUNT.
+         *      i.e. __mnt3udp_get_export_subdir_inode ()
+         * 3. If a subdir is exported using nfs.export-dir,
+         *      then the mount type would be MNT3_EXPTYPE_DIR,
+         *      so make sure to find the proper path to be
+         *      resolved using __volume_subdir()
+         * 3. Make sure subdir export is allowed.
+         */
+        ms = __mnt3udp_get_mstate(nfsx);
+        if (!ms) {
+                errno = EFAULT;
+                return NULL;
+        }
+
         exp = mnt3_mntpath_to_export (ms, path);
-        if (exp == NULL)
+        if (exp != NULL)
+                mnt3type = exp->exptype;
+
+        if (mnt3type == MNT3_EXPTYPE_DIR) {
+                char    volname [MNTPATHLEN] = {0, };
+                char    *volptr = volname;
+
+                /* Subdir export (nfs3.export-dirs) check */
+                if (!gf_mnt3_export_dirs(ms)) {
+                        errno = EACCES;
+                        return NULL;
+                }
+
+                path = __volume_subdir (path, &volptr);
+                if (exp == NULL)
+                        exp = mnt3_mntpath_to_export (ms, volname);
+        }
+
+        if (exp == NULL) {
+                errno = ENOENT;
+                return NULL;
+        }
+
+        nfs = (struct nfs_state *)nfsx->private;
+        if (!nfs_subvolume_started (nfs, exp->vol)) {
+                errno = ENOENT;
+                return NULL;
+        }
+
+        /* AUTH check: respect nfs.rpc-auth-allow/reject */
+        ret = mnt3_check_client_net_udp (req, exp->vol->name, nfsx);
+        if (ret == RPCSVC_AUTH_REJECT) {
+                errno = EACCES;
+                return NULL;
+        }
+
+        switch (mnt3type) {
+
+        case MNT3_EXPTYPE_VOLUME:
+                inode = __mnt3udp_get_export_volume_inode (req, path,
+                                                           expname, exp);
+                break;
+
+        case MNT3_EXPTYPE_DIR:
+                inode = __mnt3udp_get_export_subdir_inode (req, path,
+                                                           expname, exp);
+                break;
+
+        default:
+                /* Never reachable */
+                gf_log (GF_MNT, GF_LOG_ERROR, "Unknown MOUNT3 type");
+                errno = EFAULT;
                 goto err;
+        }
 
-        tmp = (char *)path;
-        tmp = strchr (tmp, '/');
-        if (tmp == NULL)
-                tmp = "/";
-
-        inode = inode_from_path (exp->vol->itable, tmp);
-        if (inode == NULL)
+        if (inode == NULL) {
+                /* Don't over-write errno */
+                if (!errno)
+                        errno = ENOENT;
                 goto err;
+        }
 
+        /* Build the inode from FH */
         fh = GF_CALLOC (1, sizeof(*fh), gf_nfs_mt_nfs3_fh);
-        if (fh == NULL)
+        if (fh == NULL) {
+                errno = ENOMEM;
                 goto err;
-        nfs3_build_fh (inode, exp->volumeid, fh);
+        }
+
+        (void) nfs3_build_fh (inode, exp->volumeid, fh);
 
 err:
         if (inode)
                 inode_unref (inode);
+
         return fh;
 }
 
 int
-mount3udp_add_mountlist (char *host, dirpath *expname)
+mount3udp_add_mountlist (xlator_t *nfsx, char *host, char *export)
 {
         struct mountentry       *me = NULL;
         struct mount3_state     *ms = NULL;
-        char                    *export = NULL;
 
-        ms = mnt3prog.private;
+        if ((!host) || (!export) || (!nfsx))
+                return -1;
+
+        ms = __mnt3udp_get_mstate (nfsx);
+        if (!ms)
+                return -1;
+
         me = GF_CALLOC (1, sizeof (*me), gf_nfs_mt_mountentry);
         if (!me)
                 return -1;
-        export = (char *)expname;
-        while (*export == '/')
-                export++;
 
         strncpy (me->exname, export, MNTPATHLEN);
         strncpy (me->hostname, host, MNTPATHLEN);
@@ -2021,36 +2393,44 @@ mount3udp_add_mountlist (char *host, dirpath *expname)
 }
 
 int
-mount3udp_delete_mountlist (char *hostname, dirpath *expname)
+mount3udp_delete_mountlist (xlator_t *nfsx, char *hostname, char *export)
 {
         struct mount3_state     *ms = NULL;
-        char                    *export = NULL;
 
-        ms = mnt3prog.private;
-        export = (char *)expname;
-        while (*export == '/')
-                export++;
+        if ((!hostname) || (!export) || (!nfsx))
+                return -1;
+
+        ms = __mnt3udp_get_mstate (nfsx);
+        if (!ms)
+                return -1;
+
         mnt3svc_umount (ms, export, hostname);
         return 0;
 }
 
 /**
- * This function will parse the hostip (IP addres, IP range, or hostname)
+ * This function will parse the hostip (IP address, IP range, or hostname)
  * and fill the host_auth_spec structure.
  *
  * @param hostspec - struct host_auth_spec
  * @param hostip   - IP address, IP range (CIDR format) or hostname
  *
  * @return 0 - on success and -1 on failure
+ *
+ * NB: This does not support IPv6 currently.
  */
 int
 mnt3_export_fill_hostspec (struct host_auth_spec* hostspec, const char* hostip)
 {
-        char *ipdupstr = NULL;
-        char *savptr = NULL;
-        char *ip = NULL;
-        char *token = NULL;
-        int  ret = -1;
+        char     *ipdupstr = NULL;
+        char     *savptr = NULL;
+        char     *endptr = NULL;
+        char     *ip = NULL;
+        char     *token = NULL;
+        int      ret = -1;
+        long     prefixlen = IPv4_ADDR_SIZE; /* default */
+        uint32_t shiftbits = 0;
+        size_t   length = 0;
 
         /* Create copy of the string so that the source won't change
          */
@@ -2061,25 +2441,58 @@ mnt3_export_fill_hostspec (struct host_auth_spec* hostspec, const char* hostip)
         }
 
         ip = strtok_r (ipdupstr, "/", &savptr);
+        /* Validate the Hostname or IPv4 address
+         * TODO: IPv6 support for subdir auth.
+         */
+        length = strlen (ip);
+        if ((!valid_ipv4_address (ip, (int)length, _gf_false)) &&
+            (!valid_host_name (ip, (int)length))) {
+                gf_log (GF_MNT, GF_LOG_ERROR,
+                        "Invalid hostname or IPv4 address: %s", ip);
+                goto err;
+        }
+
         hostspec->host_addr = gf_strdup (ip);
         if (NULL == hostspec->host_addr) {
                 gf_log (GF_MNT, GF_LOG_ERROR, "Memory allocation failed");
                 goto err;
         }
 
-        /* Check if the IP is in <IP address> / <Range> format.
-         * If yes, then strip the range and store it separately.
+        /**
+         * User provided CIDR address (xx.xx.xx.xx/n format) is split
+         * into HOST (IP addr or hostname) and network prefix(n) from
+         * which netmask would be calculated. This CIDR address may
+         * denote a single, distinct interface address or the beginning
+         * address of an entire network.
+         *
+         * e.g. the IPv4 block 192.168.100.0/24 represents the 256
+         * IPv4 addresses from 192.168.100.0 to 192.168.100.255.
+         * Therefore to check if an IP matches 192.168.100.0/24
+         * we should mask the IP with FFFFFF00 and compare it with
+         * host address part of CIDR.
+         *
+         * Refer: mask_match() in common-utils.c.
          */
         token = strtok_r (NULL, "/", &savptr);
-
-        if (NULL == token) {
-              hostspec->routeprefix = -1;
-        } else {
-              hostspec->routeprefix = atoi (token);
+        if (token != NULL) {
+              prefixlen = strtol (token, &endptr, 10);
+              if ((errno != 0) || (*endptr != '\0') ||
+                  (prefixlen < 0) || (prefixlen > IPv4_ADDR_SIZE)) {
+                      gf_log (THIS->name, GF_LOG_WARNING,
+                              "Invalid IPv4 subnetwork mask");
+                      goto err;
+              }
         }
 
-        // success
-        ret = 0;
+        /*
+         * 1. Calculate the network mask address.
+         * 2. Convert it into Big-Endian format.
+         * 3. Store it in hostspec netmask.
+         */
+        shiftbits = IPv4_ADDR_SIZE - prefixlen;
+        hostspec->netmask = htonl ((uint32_t)~0 << shiftbits);
+
+        ret = 0; /* SUCCESS */
 err:
         if (NULL != ipdupstr) {
                 GF_FREE (ipdupstr);
@@ -2647,7 +3060,7 @@ mnt3svc_init (xlator_t *nfsx)
         }
 
         if (nfs->mount_udp) {
-                pthread_create (&udp_thread, NULL, mount3udp_thread, NULL);
+                pthread_create (&udp_thread, NULL, mount3udp_thread, nfsx);
         }
         return &mnt3prog;
 err:

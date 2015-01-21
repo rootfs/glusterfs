@@ -17,28 +17,58 @@
  *    their _cbk functions, which later passes the call to next layer.
  *    Very helpful translator for debugging.
  */
+#define TRACE_STAT_TO_STR(buf, str) trace_stat_to_str (buf, str, sizeof (str))
+
+static inline void
+trace_stat_to_str(struct iatt *buf, char *str, size_t len)
+{
+        char     atime_buf[256]    = {0,};
+        char     mtime_buf[256]    = {0,};
+        char     ctime_buf[256]    = {0,};
+
+        if (!buf)
+                return;
+
+        gf_time_fmt (atime_buf, sizeof atime_buf, buf->ia_atime,
+                     gf_timefmt_dirent);
+
+        gf_time_fmt (mtime_buf, sizeof mtime_buf, buf->ia_mtime,
+                     gf_timefmt_dirent);
+
+        gf_time_fmt (ctime_buf, sizeof ctime_buf, buf->ia_ctime,
+                     gf_timefmt_dirent);
+
+        snprintf (str, len,
+                  "gfid=%s ino=%"PRIu64", mode=%o, "
+                  "nlink=%"GF_PRI_NLINK", uid=%u, "
+                  "gid=%u, size=%"PRIu64", "
+                  "blocks=%"PRIu64", atime=%s, "
+                  "mtime=%s, ctime=%s",
+                  uuid_utoa (buf->ia_gfid),
+                  buf->ia_ino,
+                  st_mode_from_ia (buf->ia_prot, buf->ia_type),
+                  buf->ia_nlink, buf->ia_uid,
+                  buf->ia_gid, buf->ia_size,
+                  buf->ia_blocks, atime_buf,
+                  mtime_buf, ctime_buf);
+}
+
 
 int
 dump_history_trace (circular_buffer_t *cb, void *data)
 {
-        char    *string      = NULL;
-        struct  tm      *tm  = NULL;
-        char    timestr[256] = {0,};
-
-        string = (char *)cb->data;
-        tm    = localtime (&cb->tv.tv_sec);
+        char     timestr[256] = {0,};
 
         /* Since we are continuing with adding entries to the buffer even when
            gettimeofday () fails, it's safe to check tm and then dump the time
            at which the entry was added to the buffer */
-        if (tm) {
-                strftime (timestr, 256, "%Y-%m-%d %H:%M:%S", tm);
-                snprintf (timestr + strlen (timestr), 256 - strlen (timestr),
-                          ".%"GF_PRI_SUSECONDS, cb->tv.tv_usec);
-                gf_proc_dump_write ("TIME", "%s", timestr);
-        }
 
-        gf_proc_dump_write ("FOP", "%s\n", string);
+        gf_time_fmt (timestr, sizeof timestr, cb->tv.tv_sec, gf_timefmt_Ymd_T);
+        snprintf (timestr + strlen (timestr), 256 - strlen (timestr),
+                  ".%"GF_PRI_SUSECONDS, cb->tv.tv_usec);
+        gf_proc_dump_write ("TIME", "%s", timestr);
+
+        gf_proc_dump_write ("FOP", "%s\n", cb->data);
 
         return 0;
 }
@@ -62,9 +92,9 @@ trace_create_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_CREATE].enabled) {
                 char  string[4096] = {0,};
                 if (op_ret >= 0) {
-                        trace_stat_to_str (buf, statstr);
-                        trace_stat_to_str (preparent, preparentstr);
-                        trace_stat_to_str (postparent, postparentstr);
+                        TRACE_STAT_TO_STR (buf, statstr);
+                        TRACE_STAT_TO_STR (preparent, preparentstr);
+                        TRACE_STAT_TO_STR (postparent, postparentstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": gfid=%s (op_ret=%d, fd=%p"
@@ -135,7 +165,7 @@ trace_stat_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_STAT].enabled) {
                 char string[4096] = {0,};
                 if (op_ret == 0) {
-                        trace_stat_to_str (buf, statstr);
+                        TRACE_STAT_TO_STR (buf, statstr);
                         snprintf (string, sizeof (string),
                                   "%"PRId64": gfid=%s op_ret=%d buf=%s",
                                   frame->root->unique,
@@ -172,7 +202,7 @@ trace_readv_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_READ].enabled) {
                 char  string[4096] = {0,};
                 if (op_ret >= 0) {
-                        trace_stat_to_str (buf, statstr);
+                        TRACE_STAT_TO_STR (buf, statstr);
                         snprintf (string, sizeof (string),
                                   "%"PRId64": gfid=%s op_ret=%d buf=%s",
                                   frame->root->unique,
@@ -210,8 +240,8 @@ trace_writev_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_WRITE].enabled) {
                 char  string[4096] = {0,};
                 if (op_ret >= 0) {
-                        trace_stat_to_str (prebuf, preopstr);
-                        trace_stat_to_str (postbuf, postopstr);
+                        TRACE_STAT_TO_STR (prebuf, preopstr);
+                        TRACE_STAT_TO_STR (postbuf, postopstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": (op_ret=%d, "
@@ -301,8 +331,8 @@ trace_fsync_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_FSYNC].enabled) {
                 char  string[4096] = {0,};
                 if (op_ret == 0) {
-                        trace_stat_to_str (prebuf, preopstr);
-                        trace_stat_to_str (postbuf, postopstr);
+                        TRACE_STAT_TO_STR (prebuf, preopstr);
+                        TRACE_STAT_TO_STR (postbuf, postopstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": (op_ret=%d, "
@@ -342,8 +372,8 @@ trace_setattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_SETATTR].enabled) {
                 char  string[4096]  = {0,};
                 if (op_ret == 0) {
-                        trace_stat_to_str (statpre, preopstr);
-                        trace_stat_to_str (statpost, postopstr);
+                        TRACE_STAT_TO_STR (statpre, preopstr);
+                        TRACE_STAT_TO_STR (statpost, postopstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": (op_ret=%d, "
@@ -381,8 +411,8 @@ trace_fsetattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_FSETATTR].enabled) {
                 char  string[4096] = {0,};
                 if (op_ret == 0) {
-                        trace_stat_to_str (statpre, preopstr);
-                        trace_stat_to_str (statpost, postopstr);
+                        TRACE_STAT_TO_STR (statpre, preopstr);
+                        TRACE_STAT_TO_STR (statpost, postopstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": (op_ret=%d, "
@@ -420,8 +450,8 @@ trace_unlink_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_UNLINK].enabled) {
                 char string[4096] = {0,};
                 if (op_ret == 0) {
-                        trace_stat_to_str (preparent, preparentstr);
-                        trace_stat_to_str (postparent, postparentstr);
+                        TRACE_STAT_TO_STR (preparent, preparentstr);
+                        TRACE_STAT_TO_STR (postparent, postparentstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": gfid=%s op_ret=%d, "
@@ -468,11 +498,11 @@ trace_rename_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_RENAME].enabled) {
                 char  string[4096] = {0,};
                 if (op_ret == 0) {
-                        trace_stat_to_str (buf, statstr);
-                        trace_stat_to_str (preoldparent, preoldparentstr);
-                        trace_stat_to_str (postoldparent, postoldparentstr);
-                        trace_stat_to_str (prenewparent, prenewparentstr);
-                        trace_stat_to_str (postnewparent, postnewparentstr);
+                        TRACE_STAT_TO_STR (buf, statstr);
+                        TRACE_STAT_TO_STR (preoldparent, preoldparentstr);
+                        TRACE_STAT_TO_STR (postoldparent, postoldparentstr);
+                        TRACE_STAT_TO_STR (prenewparent, prenewparentstr);
+                        TRACE_STAT_TO_STR (postnewparent, postnewparentstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": (op_ret=%d, "
@@ -515,7 +545,7 @@ trace_readlink_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_READLINK].enabled) {
                 char string[4096] = {0,};
                 if (op_ret == 0) {
-                        trace_stat_to_str (stbuf, statstr);
+                        TRACE_STAT_TO_STR (stbuf, statstr);
                         snprintf (string, sizeof (string),
                                   "%"PRId64": (op_ret=%d, op_errno=%d,"
                                   "buf=%s, stbuf = { %s })",
@@ -555,8 +585,8 @@ trace_lookup_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_LOOKUP].enabled) {
                 char  string[4096] = {0,};
                 if (op_ret == 0) {
-                        trace_stat_to_str (buf, statstr);
-                        trace_stat_to_str (postparent, postparentstr);
+                        TRACE_STAT_TO_STR (buf, statstr);
+                        TRACE_STAT_TO_STR (postparent, postparentstr);
                         /* print buf->ia_gfid instead of inode->gfid,
                          * since if the inode is not yet linked to the
                          * inode table (fresh lookup) then null gfid
@@ -606,9 +636,9 @@ trace_symlink_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_SYMLINK].enabled) {
                 char  string[4096] = {0,};
                 if (op_ret == 0) {
-                        trace_stat_to_str (buf, statstr);
-                        trace_stat_to_str (preparent, preparentstr);
-                        trace_stat_to_str (postparent, postparentstr);
+                        TRACE_STAT_TO_STR (buf, statstr);
+                        TRACE_STAT_TO_STR (preparent, preparentstr);
+                        TRACE_STAT_TO_STR (postparent, postparentstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": gfid=%s (op_ret=%d "
@@ -650,9 +680,9 @@ trace_mknod_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         char string[4096]  = {0,};
         if (trace_fop_names[GF_FOP_MKNOD].enabled) {
                 if (op_ret == 0) {
-                        trace_stat_to_str (buf, statstr);
-                        trace_stat_to_str (preparent, preparentstr);
-                        trace_stat_to_str (postparent, postparentstr);
+                        TRACE_STAT_TO_STR (buf, statstr);
+                        TRACE_STAT_TO_STR (preparent, preparentstr);
+                        TRACE_STAT_TO_STR (postparent, postparentstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": gfid=%s (op_ret=%d "
@@ -694,9 +724,9 @@ trace_mkdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_MKDIR].enabled) {
                 char  string[4096]  = {0,};
                 if (op_ret == 0) {
-                        trace_stat_to_str (buf, statstr);
-                        trace_stat_to_str (preparent, preparentstr);
-                        trace_stat_to_str (postparent, postparentstr);
+                        TRACE_STAT_TO_STR (buf, statstr);
+                        TRACE_STAT_TO_STR (preparent, preparentstr);
+                        TRACE_STAT_TO_STR (postparent, postparentstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": gfid=%s (op_ret=%d "
@@ -738,9 +768,9 @@ trace_link_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         char  string[4096]  = {0,};
         if (trace_fop_names[GF_FOP_LINK].enabled) {
                 if (op_ret == 0) {
-                        trace_stat_to_str (buf, statstr);
-                        trace_stat_to_str (preparent, preparentstr);
-                        trace_stat_to_str (postparent, postparentstr);
+                        TRACE_STAT_TO_STR (buf, statstr);
+                        TRACE_STAT_TO_STR (preparent, preparentstr);
+                        TRACE_STAT_TO_STR (postparent, postparentstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": (op_ret=%d, "
@@ -833,8 +863,8 @@ trace_rmdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_RMDIR].enabled) {
                 char  string[4096] = {0,};
                 if (op_ret == 0) {
-                        trace_stat_to_str (preparent, preparentstr);
-                        trace_stat_to_str (postparent, postparentstr);
+                        TRACE_STAT_TO_STR (preparent, preparentstr);
+                        TRACE_STAT_TO_STR (postparent, postparentstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": gfid=%s op_ret=%d, "
@@ -873,8 +903,8 @@ trace_truncate_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_TRUNCATE].enabled) {
                 char   string[4096] = {0,};
                 if (op_ret == 0) {
-                        trace_stat_to_str (prebuf, preopstr);
-                        trace_stat_to_str (postbuf, postopstr);
+                        TRACE_STAT_TO_STR (prebuf, preopstr);
+                        TRACE_STAT_TO_STR (postbuf, postopstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": (op_ret=%d, "
@@ -1133,8 +1163,8 @@ trace_ftruncate_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_FTRUNCATE].enabled) {
                 char  string[4096]  = {0,};
                 if (op_ret == 0) {
-                        trace_stat_to_str (prebuf, prebufstr);
-                        trace_stat_to_str (postbuf, postbufstr);
+                        TRACE_STAT_TO_STR (prebuf, prebufstr);
+                        TRACE_STAT_TO_STR (postbuf, postbufstr);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": op_ret=%d, "
@@ -1170,7 +1200,7 @@ trace_fstat_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         if (trace_fop_names[GF_FOP_FSTAT].enabled) {
                 char string[4096]  = {0.};
                 if (op_ret == 0) {
-                        trace_stat_to_str (buf, statstr);
+                        TRACE_STAT_TO_STR (buf, statstr);
                         snprintf (string, sizeof (string),
                                   "%"PRId64": gfid=%s op_ret=%d "
                                   "buf=%s", frame->root->unique,
@@ -1994,7 +2024,6 @@ int
 trace_setattr (call_frame_t *frame, xlator_t *this, loc_t *loc,
                struct iatt *stbuf, int32_t valid, dict_t *xdata)
 {
-        uint64_t     ia_time          = 0;
         char         actime_str[256]  = {0,};
         char         modtime_str[256] = {0,};
         trace_conf_t *conf            = NULL;
@@ -2031,13 +2060,11 @@ trace_setattr (call_frame_t *frame, xlator_t *this, loc_t *loc,
                 }
 
                 if (valid & (GF_SET_ATTR_ATIME | GF_SET_ATTR_MTIME)) {
-                        ia_time = stbuf->ia_atime;
-                        strftime (actime_str, 256, "[%b %d %H:%M:%S]",
-                                  localtime ((time_t *)&ia_time));
+                        gf_time_fmt (actime_str, sizeof actime_str,
+                                     stbuf->ia_atime, gf_timefmt_bdT);
 
-                        ia_time = stbuf->ia_mtime;
-                        strftime (modtime_str, 256, "[%b %d %H:%M:%S]",
-                                  localtime ((time_t *)&ia_time));
+                        gf_time_fmt (modtime_str, sizeof modtime_str,
+                                     stbuf->ia_mtime, gf_timefmt_bdT);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": gfid=%s path=%s "
@@ -2065,7 +2092,6 @@ int
 trace_fsetattr (call_frame_t *frame, xlator_t *this, fd_t *fd,
                 struct iatt *stbuf, int32_t valid, dict_t *xdata)
 {
-        uint64_t       ia_time          = 0;
         char           actime_str[256]  = {0,};
         char           modtime_str[256] = {0,};
         trace_conf_t   *conf            = NULL;
@@ -2100,13 +2126,11 @@ trace_fsetattr (call_frame_t *frame, xlator_t *this, fd_t *fd,
                 }
 
                 if (valid & (GF_SET_ATTR_ATIME | GF_SET_ATTR_MTIME)) {
-                        ia_time = stbuf->ia_atime;
-                        strftime (actime_str, 256, "[%b %d %H:%M:%S]",
-                                  localtime ((time_t *)&ia_time));
+                        gf_time_fmt (actime_str, sizeof actime_str,
+                                     stbuf->ia_atime, gf_timefmt_bdT);
 
-                        ia_time = stbuf->ia_mtime;
-                        strftime (modtime_str, 256, "[%b %d %H:%M:%S]",
-                                  localtime ((time_t *)&ia_time));
+                        gf_time_fmt (modtime_str, sizeof modtime_str,
+                                     stbuf->ia_mtime, gf_timefmt_bdT);
 
                         snprintf (string, sizeof (string),
                                   "%"PRId64": gfid=%s fd=%p "

@@ -28,6 +28,15 @@
 #include <sys/wait.h>
 #include <dlfcn.h>
 
+#ifndef _PATH_SETFATTR
+# ifdef GF_LINUX_HOST_OS
+#  define _PATH_SETFATTR "/usr/bin/setfattr"
+# endif
+# ifdef __NetBSD__
+#  define _PATH_SETFATTR "/usr/pkg/bin/setfattr"
+# endif
+#endif
+
 /* Any negative pid to make it special client */
 #define QUOTA_CRAWL_PID "-100"
 
@@ -164,10 +173,11 @@ glusterd_quota_initiate_fs_crawl (glusterd_conf_t *priv, char *volname,
                                   int type)
 {
         pid_t                      pid;
-        int32_t                    ret              = 0;
-        int                        status           = 0;
-        char                       mountdir[]       = "/tmp/mntXXXXXX";
-        runner_t                   runner           = {0};
+        int32_t                    ret               = 0;
+        int                        status            = 0;
+        char                       mountdir[]        = "/tmp/mntXXXXXX";
+        char                       logfile[PATH_MAX] = {0,};
+        runner_t                   runner            = {0};
 
         if (mkdtemp (mountdir) == NULL) {
                 gf_log ("glusterd", GF_LOG_DEBUG,
@@ -175,6 +185,8 @@ glusterd_quota_initiate_fs_crawl (glusterd_conf_t *priv, char *volname,
                 ret = -1;
                 goto out;
         }
+        snprintf (logfile, sizeof (logfile),
+                  DEFAULT_LOG_FILE_DIRECTORY"/%s-quota-crawl.log", volname);
 
         runinit (&runner);
         runner_add_args (&runner, SBIN_DIR"/glusterfs",
@@ -182,8 +194,7 @@ glusterd_quota_initiate_fs_crawl (glusterd_conf_t *priv, char *volname,
                          "--volfile-id", volname,
 			 "--use-readdirp=no",
                          "--client-pid", QUOTA_CRAWL_PID,
-                         "-l", DEFAULT_LOG_FILE_DIRECTORY"/quota-crawl.log",
-                         mountdir, NULL);
+                         "-l", logfile, mountdir, NULL);
 
         synclock_unlock (&priv->big_lock);
         ret = runner_run_reuse (&runner);
@@ -216,27 +227,40 @@ glusterd_quota_initiate_fs_crawl (glusterd_conf_t *priv, char *volname,
                 runinit (&runner);
 
                 if (type == GF_QUOTA_OPTION_TYPE_ENABLE)
-
-                        runner_add_args (&runner, "/usr/bin/find", "find", ".",
-                                         NULL);
-
-                else if (type == GF_QUOTA_OPTION_TYPE_DISABLE)
-
                         runner_add_args (&runner, "/usr/bin/find", ".",
-                                         "-exec", "/usr/bin/setfattr", "-n",
+                                         "-exec", "/usr/bin/stat",
+                                         "{}", "\\", ";", NULL);
+
+                else if (type == GF_QUOTA_OPTION_TYPE_DISABLE) {
+
+#if defined(GF_DARWIN_HOST_OS)
+                        runner_add_args (&runner, "/usr/bin/find", ".",
+                                         "-exec", "/usr/bin/xattr", "-w",
+                                         VIRTUAL_QUOTA_XATTR_CLEANUP_KEY, "1",
+                                         "{}", "\\", ";", NULL);
+#elif defined(__FreeBSD__)
+                        runner_add_args (&runner, "/usr/bin/find", ".",
+                                         "-exec", "/usr/sbin/setextattr",
+                                         EXTATTR_NAMESPACE_USER,
+                                         VIRTUAL_QUOTA_XATTR_CLEANUP_KEY, "1",
+                                         "{}", "\\", ";", NULL);
+#else
+                        runner_add_args (&runner, "/usr/bin/find", ".",
+                                         "-exec", _PATH_SETFATTR, "-n",
                                          VIRTUAL_QUOTA_XATTR_CLEANUP_KEY, "-v",
                                          "1", "{}", "\\", ";", NULL);
+#endif
+
+                }
 
                 if (runner_start (&runner) == -1)
                         _exit (EXIT_FAILURE);
 
 #ifndef GF_LINUX_HOST_OS
                 runner_end (&runner); /* blocks in waitpid */
-                runcmd ("umount", mountdir, NULL);
-#else
-                runcmd ("umount", "-l", mountdir, NULL);
 #endif
-                rmdir (mountdir);
+                gf_umount_lazy ("glusterd", mountdir, 1);
+
                 _exit (EXIT_SUCCESS);
         }
         ret = (waitpid (pid, &status, 0) == pid &&
@@ -449,6 +473,9 @@ glusterd_set_quota_limit (char *volname, char *path, char *hard_limit,
                                      sizeof (existing_limit));
                 if (ret < 0) {
                         switch (errno) {
+#if defined(ENOATTR) && (ENOATTR != ENODATA)
+                        case ENODATA: /* FALLTHROUGH */
+#endif
                         case ENOATTR:
                                 existing_limit.sl = -1;
                             break;
@@ -474,7 +501,7 @@ glusterd_set_quota_limit (char *volname, char *path, char *hard_limit,
 
         new_limit.sl = hton64 (new_limit.sl);
 
-        ret = gf_string2bytesize (hard_limit, (uint64_t*)&new_limit.hl);
+        ret = gf_string2bytesize_uint64 (hard_limit, (uint64_t*)&new_limit.hl);
         if (ret)
                 goto out;
 
@@ -482,7 +509,7 @@ glusterd_set_quota_limit (char *volname, char *path, char *hard_limit,
 
         ret = sys_lsetxattr (abspath, "trusted.glusterfs.quota.limit-set",
                              (char *)(void *)&new_limit, sizeof (new_limit), 0);
-        if (ret) {
+        if (ret == -1) {
                 gf_asprintf (op_errstr, "setxattr of "
                              "'trusted.glusterfs.quota.limit-set' failed on %s."
                              " Reason : %s", abspath, strerror (errno));
@@ -746,10 +773,6 @@ out:
                 close (conf_fd);
         }
 
-        if (fd != -1) {
-                close (fd);
-        }
-
         if (ret && (fd > 0)) {
                 gf_store_unlink_tmppath (volinfo->quota_conf_shandle);
         } else if (!ret) {
@@ -759,16 +782,14 @@ out:
                         if (ret) {
                                 gf_log (this->name, GF_LOG_ERROR, "Failed to "
                                         "compute cksum for quota conf file");
-                                goto out;
+                                return ret;
                         }
 
                         ret = glusterd_store_save_quota_version_and_cksum
                                                                       (volinfo);
-                        if (ret) {
+                        if (ret)
                                 gf_log (this->name, GF_LOG_ERROR, "Failed to "
                                         "store quota version and cksum");
-                                goto out;
-                        }
                 }
         }
 
@@ -993,7 +1014,8 @@ glusterd_quotad_op (int opcode)
                         if (glusterd_all_volumes_with_quota_stopped ())
                                 ret = glusterd_quotad_stop ();
                         else
-                                ret = glusterd_check_generate_start_quotad ();
+                                ret = glusterd_check_generate_start_quotad_wait
+                                        ();
                         break;
 
                 default:
@@ -1400,13 +1422,13 @@ glusterd_op_stage_quota (dict_t *dict, char **op_errstr, dict_t *rsp_dict)
                                 "Faild to get hard-limit from dict");
                         goto out;
                 }
-                ret = gf_string2bytesize (hard_limit_str, &hard_limit);
+                ret = gf_string2bytesize_uint64 (hard_limit_str, &hard_limit);
                 if (ret) {
                         gf_log (this->name, GF_LOG_ERROR,
                                 "Failed to convert hard-limit string to value");
                         goto out;
                 }
-                if (hard_limit > INT64_MAX) {
+                if (hard_limit > UINT64_MAX) {
                         ret = -1;
                         ret = gf_asprintf (op_errstr, "Hard-limit %s is greater"
                                            " than %"PRId64"bytes. Please set a "

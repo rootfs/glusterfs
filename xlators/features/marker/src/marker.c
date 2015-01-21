@@ -23,7 +23,15 @@
 #include "byte-order.h"
 #include "syncop.h"
 
+#include <fnmatch.h>
+
 #define _GF_UID_GID_CHANGED 1
+
+static char   *quota_external_xattrs[] = {
+        QUOTA_SIZE_KEY,
+        QUOTA_LIMIT_KEY,
+        NULL,
+};
 
 void
 fini (xlator_t *this);
@@ -86,7 +94,7 @@ loc_wipe:
 }
 
 int
-marker_inode_loc_fill (inode_t *inode, loc_t *loc)
+marker_inode_loc_fill (inode_t *inode, char *name, loc_t *loc)
 {
         char            *resolvedpath = NULL;
         int              ret          = -1;
@@ -97,7 +105,7 @@ marker_inode_loc_fill (inode_t *inode, loc_t *loc)
 
 	parent = inode_parent (inode, NULL, NULL);
 
-        ret = inode_path (inode, NULL, &resolvedpath);
+        ret = inode_path (inode, name, &resolvedpath);
         if (ret < 0)
                 goto err;
 
@@ -129,7 +137,7 @@ marker_trav_parent (marker_local_t *local)
         } else
                 parent = local->loc.parent;
 
-        ret = marker_inode_loc_fill (parent, &loc);
+        ret = marker_inode_loc_fill (parent, NULL, &loc);
 
         if (ret < 0) {
                 ret = -1;
@@ -216,8 +224,8 @@ stat_stampfile (xlator_t *this, marker_conf_t *priv,
 
         if (stat (priv->timestamp_file, &buf) != -1) {
                 vol_mark->retval = 0;
-                vol_mark->sec = htonl (buf.st_ctime);
-                vol_mark->usec = htonl (ST_CTIM_NSEC (&buf)/1000);
+                vol_mark->sec = htonl (buf.st_mtime);
+                vol_mark->usec = htonl (ST_MTIM_NSEC (&buf)/1000);
         } else
                 vol_mark->retval = 1;
 
@@ -250,23 +258,24 @@ marker_getxattr_stampfile_cbk (call_frame_t *frame, xlator_t *this,
 
         STACK_UNWIND_STRICT (getxattr, frame, 0, 0, dict, xdata);
 
-        dict_unref (dict);
+        if (dict)
+                dict_unref (dict);
 out:
         return 0;
 }
 
-int32_t
+gf_boolean_t
 call_from_special_client (call_frame_t *frame, xlator_t *this, const char *name)
 {
         struct volume_mark     *vol_mark   = NULL;
         marker_conf_t          *priv       = NULL;
-        gf_boolean_t            ret        = _gf_true;
+        gf_boolean_t           is_true     = _gf_true;
 
         priv = (marker_conf_t *)this->private;
 
         if (frame->root->pid != GF_CLIENT_PID_GSYNCD || name == NULL ||
             strcmp (name, MARKER_XATTR_PREFIX "." VOLUME_MARK) != 0) {
-                ret = _gf_false;
+                is_true = _gf_false;
                 goto out;
         }
 
@@ -274,7 +283,46 @@ call_from_special_client (call_frame_t *frame, xlator_t *this, const char *name)
 
         marker_getxattr_stampfile_cbk (frame, this, name, vol_mark, NULL);
 out:
-        return ret;
+        return is_true;
+}
+
+static gf_boolean_t
+_is_quota_internal_xattr (dict_t *d, char *k, data_t *v, void *data)
+{
+        int     i = 0;
+        char    **external_xattrs = data;
+
+        for (i = 0; external_xattrs && external_xattrs[i]; i++) {
+                if (strcmp (k, external_xattrs[i]) == 0)
+                        return _gf_false;
+        }
+
+        if (fnmatch ("trusted.glusterfs.quota*", k, 0) == 0)
+                return _gf_true;
+
+        /* It would be nice if posix filters pgfid xattrs. But since marker
+         * also takes up responsibility to clean these up, adding the filtering
+         * here (Check 'quota_xattr_cleaner')
+         */
+        if (fnmatch (PGFID_XATTR_KEY_PREFIX"*", k, 0) == 0)
+                return _gf_true;
+
+        return _gf_false;
+}
+
+static void
+marker_filter_internal_xattrs (xlator_t *this, dict_t *xattrs)
+{
+        marker_conf_t *priv   = NULL;
+        char         **ext    = NULL;
+
+        priv = this->private;
+        if (priv->feature_enabled & GF_QUOTA)
+                ext = quota_external_xattrs;
+
+        dict_foreach_match (xattrs, _is_quota_internal_xattr, ext,
+                            dict_remove_foreach_fn, NULL);
+        return;
 }
 
 int32_t
@@ -282,12 +330,7 @@ marker_getxattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                      int32_t op_ret, int32_t op_errno, dict_t *dict,
                      dict_t *xdata)
 {
-        int            ret    = 0;
-        char           *src   = NULL;
-        char           *dst   = NULL;
-        int            len    = 0;
         marker_local_t *local = NULL;
-
         local = frame->local;
 
 
@@ -307,36 +350,14 @@ marker_getxattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                    is changed. So let that xattr be healed by other xlators
                    properly whenever directory healing is done.
                 */
-                ret = dict_get_ptr_and_len (dict, QUOTA_LIMIT_KEY,
-                                            (void **)&src, &len);
-                if (ret) {
-                        gf_log (this->name, GF_LOG_DEBUG, "dict_get on %s "
-                                "failed", QUOTA_LIMIT_KEY);
-                } else {
-                        dst = GF_CALLOC (len, sizeof (char), gf_common_mt_char);
-                        if (dst)
-                                memcpy (dst, src, len);
-                }
-
                 /*
                  * Except limit-set xattr, rest of the xattrs are maintained
                  * by quota xlator. Don't expose them to other xlators.
                  * This filter makes sure quota xattrs are not healed as part of
                  * metadata self-heal
                  */
-                GF_REMOVE_INTERNAL_XATTR ("trusted.glusterfs.quota*", dict);
-                if (!ret && IA_ISDIR (local->loc.inode->ia_type) && dst) {
-                        ret = dict_set_dynptr (dict, QUOTA_LIMIT_KEY,
-                                               dst, len);
-                        if (ret)
-                                gf_log (this->name, GF_LOG_WARNING, "setting "
-                                        "key %s failed", QUOTA_LIMIT_KEY);
-                        else
-                                dst = NULL;
-                }
+                marker_filter_internal_xattrs (frame->this, dict);
         }
-
-        GF_FREE (dst);
 
         frame->local = NULL;
         STACK_UNWIND_STRICT (getxattr, frame, op_ret, op_errno, dict, xdata);
@@ -348,10 +369,10 @@ int32_t
 marker_getxattr (call_frame_t *frame, xlator_t *this, loc_t *loc,
                  const char *name, dict_t *xdata)
 {
-        gf_boolean_t   ret    = _gf_false;
-        marker_conf_t *priv   = NULL;
-        unsigned long  cookie = 0;
-        marker_local_t *local = NULL;
+        gf_boolean_t    is_true  = _gf_false;
+        marker_conf_t   *priv    = NULL;
+        unsigned long   cookie   = 0;
+        marker_local_t  *local   = NULL;
 
         priv = this->private;
 
@@ -362,16 +383,15 @@ marker_getxattr (call_frame_t *frame, xlator_t *this, loc_t *loc,
 
         MARKER_INIT_LOCAL (frame, local);
 
-        ret = loc_copy (&local->loc, loc);
-        if (ret < 0)
-                goto out;
+        if ((loc_copy (&local->loc, loc)) < 0)
+		goto out;
 
         gf_log (this->name, GF_LOG_DEBUG, "USER:PID = %d", frame->root->pid);
 
         if (priv && priv->feature_enabled & GF_XTIME)
-                ret = call_from_special_client (frame, this, name);
+                is_true = call_from_special_client (frame, this, name);
 
-        if (ret == _gf_false) {
+        if (is_true == _gf_false) {
                 if (name == NULL) {
                         /* Signifies that marker translator
                          * has to filter the quota's xattr's,
@@ -380,10 +400,11 @@ marker_getxattr (call_frame_t *frame, xlator_t *this, loc_t *loc,
                          */
                         cookie = 1;
                 }
-                STACK_WIND_COOKIE (frame, marker_getxattr_cbk, (void *)cookie,
+                STACK_WIND_COOKIE (frame, marker_getxattr_cbk,
+				   (void *)cookie,
                                    FIRST_CHILD(this),
-                                   FIRST_CHILD(this)->fops->getxattr, loc,
-                                   name, xdata);
+                                   FIRST_CHILD(this)->fops->getxattr,
+				   loc, name, xdata);
         }
 
         return 0;
@@ -567,7 +588,7 @@ marker_mkdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         if (op_ret == -1) {
                 gf_log (this->name, GF_LOG_TRACE, "error occurred "
-                        "while Creating a file %s", strerror (op_errno));
+                        "while creating directory %s", strerror (op_errno));
         }
 
         local = (marker_local_t *) frame->local;
@@ -641,7 +662,7 @@ marker_create_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         if (op_ret == -1) {
                 gf_log (this->name, GF_LOG_TRACE, "error occurred "
-                        "while Creating a file %s", strerror (op_errno));
+                        "while creating file %s", strerror (op_errno));
         }
 
         local = (marker_local_t *) frame->local;
@@ -764,7 +785,7 @@ marker_writev (call_frame_t *frame,
 
         MARKER_INIT_LOCAL (frame, local);
 
-        ret = marker_inode_loc_fill (fd->inode, &local->loc);
+        ret = marker_inode_loc_fill (fd->inode, NULL, &local->loc);
 
         if (ret == -1)
                 goto err;
@@ -1130,7 +1151,7 @@ marker_rename_release_oldp_lock (call_frame_t *frame, void *cookie,
         local = frame->local;
         oplocal = local->oplocal;
 
-        if ((op_ret < 0) && (op_errno != ENOATTR)) {
+        if ((op_ret < 0) && (op_errno != ENOATTR) && (op_errno != ENODATA)) {
                 local->err = op_errno;
         }
 
@@ -1275,7 +1296,7 @@ marker_do_rename (call_frame_t *frame, void *cookie, xlator_t *this,
         if (cookie == (void *) _GF_UID_GID_CHANGED)
                 MARKER_RESET_UID_GID (frame, frame->root, local);
 
-        if ((op_ret < 0) && (op_errno != ENOATTR)) {
+        if ((op_ret < 0) && (op_errno != ENOATTR) && (op_errno != ENODATA)) {
                 local->err = op_errno ? op_errno : EINVAL;
                 gf_log (this->name, GF_LOG_WARNING,
                         "fetching contribution values from %s (gfid:%s) "
@@ -1327,7 +1348,7 @@ marker_get_newpath_contribution (call_frame_t *frame, void *cookie,
         if (cookie == (void *) _GF_UID_GID_CHANGED)
                 MARKER_RESET_UID_GID (frame, frame->root, local);
 
-        if ((op_ret < 0) && (op_errno != ENOATTR)) {
+        if ((op_ret < 0) && (op_errno != ENOATTR) && (op_errno != ENODATA)) {
                 local->err = op_errno ? op_errno : EINVAL;
                 gf_log (this->name, GF_LOG_WARNING,
                         "fetching contribution values from %s (gfid:%s) "
@@ -1699,7 +1720,7 @@ marker_ftruncate (call_frame_t *frame, xlator_t *this, fd_t *fd, off_t offset,
 
         MARKER_INIT_LOCAL (frame, local);
 
-        ret = marker_inode_loc_fill (fd->inode, &local->loc);
+        ret = marker_inode_loc_fill (fd->inode, NULL, &local->loc);
 
         if (ret == -1)
                 goto err;
@@ -1797,8 +1818,8 @@ marker_mknod_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         marker_conf_t      *priv    = NULL;
 
         if (op_ret == -1) {
-                gf_log (this->name, GF_LOG_TRACE, "%s occurred while "
-                        "creating symlinks ", strerror (op_errno));
+                gf_log (this->name, GF_LOG_TRACE, "%s occurred with "
+                        "mknod ", strerror (op_errno));
         }
 
         local = (marker_local_t *) frame->local;
@@ -1916,7 +1937,7 @@ marker_fallocate(call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t mode,
 
         MARKER_INIT_LOCAL (frame, local);
 
-        ret = marker_inode_loc_fill (fd->inode, &local->loc);
+        ret = marker_inode_loc_fill (fd->inode, NULL, &local->loc);
 
         if (ret == -1)
                 goto err;
@@ -1985,7 +2006,7 @@ marker_discard(call_frame_t *frame, xlator_t *this, fd_t *fd, off_t offset,
 
         MARKER_INIT_LOCAL (frame, local);
 
-        ret = marker_inode_loc_fill (fd->inode, &local->loc);
+        ret = marker_inode_loc_fill (fd->inode, NULL, &local->loc);
 
         if (ret == -1)
                 goto err;
@@ -2052,7 +2073,7 @@ marker_zerofill(call_frame_t *frame, xlator_t *this, fd_t *fd, off_t offset,
 
         MARKER_INIT_LOCAL (frame, local);
 
-        ret = marker_inode_loc_fill (fd->inode, &local->loc);
+        ret = marker_inode_loc_fill (fd->inode, NULL, &local->loc);
 
         if (ret == -1)
                 goto err;
@@ -2337,8 +2358,8 @@ marker_fsetxattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         marker_conf_t      *priv    = NULL;
 
         if (op_ret == -1) {
-                gf_log (this->name, GF_LOG_TRACE, "%s occurred while "
-                        "creating symlinks ", strerror (op_errno));
+                gf_log (this->name, GF_LOG_TRACE, "%s occurred in "
+                        "fsetxattr", strerror (op_errno));
         }
 
         local = (marker_local_t *) frame->local;
@@ -2381,7 +2402,7 @@ marker_fsetxattr (call_frame_t *frame, xlator_t *this, fd_t *fd, dict_t *dict,
 
         MARKER_INIT_LOCAL (frame, local);
 
-        ret = marker_inode_loc_fill (fd->inode, &local->loc);
+        ret = marker_inode_loc_fill (fd->inode, NULL, &local->loc);
 
         if (ret == -1)
                 goto err;
@@ -2405,8 +2426,8 @@ marker_fsetattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         marker_conf_t      *priv    = NULL;
 
         if (op_ret == -1) {
-                gf_log (this->name, GF_LOG_ERROR, "%s occurred while "
-                        "creating symlinks ", strerror (op_errno));
+                gf_log (this->name, GF_LOG_TRACE, "%s occurred in "
+                        "fsetattr ", strerror (op_errno));
         }
 
         local = (marker_local_t *) frame->local;
@@ -2447,7 +2468,7 @@ marker_fsetattr (call_frame_t *frame, xlator_t *this, fd_t *fd,
 
         MARKER_INIT_LOCAL (frame, local);
 
-        ret = marker_inode_loc_fill (fd->inode, &local->loc);
+        ret = marker_inode_loc_fill (fd->inode, NULL, &local->loc);
 
         if (ret == -1)
                 goto err;
@@ -2475,8 +2496,7 @@ marker_setattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         frame->local = NULL;
 
         if (op_ret == -1) {
-                gf_log (this->name, ((op_errno == ENOENT) ? GF_LOG_DEBUG :
-                                     GF_LOG_ERROR),
+                gf_log (this->name, GF_LOG_TRACE,
                         "%s occurred during setattr of %s",
                         strerror (op_errno),
                         (local ? local->loc.path : "<nul>"));
@@ -2538,8 +2558,10 @@ marker_removexattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         marker_conf_t      *priv    = NULL;
 
         if (op_ret == -1) {
-                gf_log (this->name, GF_LOG_ERROR, "%s occurred while "
-                        "creating symlinks ", strerror (op_errno));
+                gf_log (this->name, GF_LOG_TRACE,
+                                "%s occurred while "
+                                "removing extended attribute",
+                                     strerror (op_errno));
         }
 
         local = (marker_local_t *) frame->local;
@@ -2592,6 +2614,15 @@ err:
         return 0;
 }
 
+static gf_boolean_t
+__has_quota_xattrs (dict_t *xattrs)
+{
+        if (dict_foreach_match (xattrs, _is_quota_internal_xattr, NULL,
+                                dict_null_foreach_fn, NULL) > 0)
+                return _gf_true;
+
+        return _gf_false;
+}
 
 int32_t
 marker_lookup_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
@@ -2600,10 +2631,24 @@ marker_lookup_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 {
         marker_conf_t  *priv    = NULL;
         marker_local_t *local   = NULL;
+        dict_t         *xattrs  = NULL;
+        priv = this->private;
 
         if (op_ret == -1) {
                 gf_log (this->name, GF_LOG_TRACE, "lookup failed with %s",
                         strerror (op_errno));
+        }
+
+        if (dict && __has_quota_xattrs (dict)) {
+                xattrs = dict_copy_with_ref (dict, NULL);
+                if (!xattrs) {
+                        op_ret = -1;
+                        op_errno = ENOMEM;
+                } else {
+                        marker_filter_internal_xattrs (this, xattrs);
+                }
+        } else if (dict) {
+                xattrs = dict_ref (dict);
         }
 
         local = (marker_local_t *) frame->local;
@@ -2611,7 +2656,7 @@ marker_lookup_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         frame->local = NULL;
 
         STACK_UNWIND_STRICT (lookup, frame, op_ret, op_errno, inode, buf,
-                             dict, postparent);
+                             xattrs, postparent);
 
         if (op_ret == -1 || local == NULL)
                 goto out;
@@ -2625,14 +2670,14 @@ marker_lookup_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                 uuid_copy (local->loc.gfid, buf->ia_gfid);
 
 
-        priv = this->private;
-
         if (priv->feature_enabled & GF_QUOTA) {
                 mq_xattr_state (this, &local->loc, dict, *buf);
         }
 
 out:
         marker_local_unref (local);
+        if (xattrs)
+                dict_unref (xattrs);
 
         return 0;
 }
@@ -2651,6 +2696,8 @@ marker_lookup (call_frame_t *frame, xlator_t *this,
                 goto wind;
 
         local = mem_get0 (this->local_pool);
+        if (local == NULL)
+                goto err;
 
         MARKER_INIT_LOCAL (frame, local);
 
@@ -2665,7 +2712,7 @@ wind:
                     FIRST_CHILD(this)->fops->lookup, loc, xattr_req);
         return 0;
 err:
-        STACK_UNWIND_STRICT (lookup, frame, -1, 0, NULL, NULL, NULL, NULL);
+        STACK_UNWIND_STRICT (lookup, frame, -1, ENOMEM, NULL, NULL, NULL, NULL);
 
         return 0;
 }
@@ -2679,6 +2726,7 @@ marker_build_ancestry_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         gf_dirent_t *entry = NULL;
         loc_t        loc    = {0, };
         inode_t     *parent = NULL;
+        int          ret    = -1;
 
         if ((op_ret <= 0) || (entries == NULL)) {
                 goto out;
@@ -2687,19 +2735,19 @@ marker_build_ancestry_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
         list_for_each_entry (entry, &entries->list, list) {
                 if (entry->inode == entry->inode->table->root) {
-                        loc.path = gf_strdup ("/");
                         inode_unref (parent);
                         parent = NULL;
                 }
 
-                loc.inode = inode_ref (entry->inode);
-
-                if (parent != NULL) {
-                        loc.parent = inode_ref (parent);
-                        uuid_copy (loc.pargfid, parent->gfid);
+                ret = marker_inode_loc_fill (entry->inode,
+                                             entry->d_name, &loc);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_WARNING, "Couldn't build "
+                                "loc for %s/%s",
+                                parent? uuid_utoa (parent->gfid): NULL,
+                                entry->d_name);
+                        continue;
                 }
-
-                uuid_copy (loc.gfid, entry->d_stat.ia_gfid);
 
                 mq_xattr_state (this, &loc, entry->dict, entry->d_stat);
 
@@ -2725,6 +2773,7 @@ marker_readdirp_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         marker_conf_t  *priv  = NULL;
         marker_local_t *local = NULL;
         loc_t           loc   = {0, };
+        int             ret   = -1;
 
         if (op_ret <= 0)
                 goto unwind;
@@ -2741,11 +2790,15 @@ marker_readdirp_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                     (strcmp (entry->d_name, "..") == 0))
                         continue;
 
-                loc.inode = inode_ref (entry->inode);
-                loc.parent = inode_ref (local->loc.inode);
-
-                uuid_copy (loc.gfid, entry->d_stat.ia_gfid);
-                uuid_copy (loc.pargfid, loc.parent->gfid);
+                ret = marker_inode_loc_fill (entry->inode,
+                                             entry->d_name, &loc);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_WARNING, "Couldn't build "
+                                "loc for %s/%s",
+                                uuid_utoa (local->loc.inode->gfid),
+                                entry->d_name);
+                        continue;
+                }
 
                 mq_xattr_state (this, &loc, entry->dict, entry->d_stat);
 
@@ -2772,7 +2825,11 @@ marker_readdirp (call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
 
         priv = this->private;
 
-        if ((dict != NULL) && dict_get (dict, GET_ANCESTRY_DENTRY_KEY)) {
+        dict = dict ? dict_ref(dict) : dict_new();
+        if (!dict)
+                goto unwind;
+
+        if (dict_get (dict, GET_ANCESTRY_DENTRY_KEY)) {
                 STACK_WIND (frame, marker_build_ancestry_cbk,
                             FIRST_CHILD(this),
                             FIRST_CHILD(this)->fops->readdirp,
@@ -2785,9 +2842,6 @@ marker_readdirp (call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
 
                         loc.parent = local->loc.inode = inode_ref (fd->inode);
 
-                        if (dict == NULL)
-                                dict = dict_new ();
-
                         mq_req_xattr (this, &loc, dict);
                 }
 
@@ -2797,9 +2851,12 @@ marker_readdirp (call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
                             fd, size, offset, dict);
         }
 
+        dict_unref (dict);
+        return 0;
+unwind:
+        STACK_UNWIND_STRICT (readdirp, frame, -1, ENOMEM, NULL, NULL);
         return 0;
 }
-
 
 int32_t
 mem_acct_init (xlator_t *this)
@@ -2813,7 +2870,7 @@ mem_acct_init (xlator_t *this)
 
         if (ret != 0) {
                 gf_log(this->name, GF_LOG_ERROR, "Memory accounting init"
-                       "failed");
+                       " failed");
                 return ret;
         }
 
@@ -2850,14 +2907,11 @@ init_xtime_priv (xlator_t *this, dict_t *options)
 
                 if (ret == -1){
                         priv->marker_xattr = NULL;
-
-                        gf_log (this->name, GF_LOG_ERROR,
-                                "Failed to allocate memory");
                         goto out;
                 }
 
                 gf_log (this->name, GF_LOG_DEBUG,
-                        "the volume-uuid = %s", priv->volume_uuid);
+                        "volume-uuid = %s", priv->volume_uuid);
         } else {
                 priv->volume_uuid = NULL;
 

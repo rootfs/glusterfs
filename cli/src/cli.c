@@ -97,8 +97,12 @@ glusterfs_ctx_defaults_init (glusterfs_ctx_t *ctx)
         cmd_args_t    *cmd_args = NULL;
         struct rlimit  lim = {0, };
         call_pool_t   *pool = NULL;
+        int            ret         = -1;
 
-        xlator_mem_acct_init (THIS, cli_mt_end);
+        ret = xlator_mem_acct_init (THIS, cli_mt_end);
+        if (ret != 0) {
+                return ret;
+        }
 
         ctx->process_uuid = generate_glusterfs_ctx_id ();
         if (!ctx->process_uuid)
@@ -179,7 +183,7 @@ logging_init (glusterfs_ctx_t *ctx, struct cli_state *state)
 
         /* CLI should not have something to DEBUG after the release,
            hence defaulting to INFO loglevel */
-        gf_log_set_loglevel ((state->log_level == -1) ? GF_LOG_INFO :
+        gf_log_set_loglevel ((state->log_level == GF_LOG_NONE) ? GF_LOG_INFO :
                              state->log_level);
 
         return 0;
@@ -297,7 +301,8 @@ cli_rpc_notify (struct rpc_clnt *rpc, void *mydata, rpc_clnt_event_t event,
 int
 cli_opt_parse (char *opt, struct cli_state *state)
 {
-        char *oarg;
+        char            *oarg           = NULL;
+        gf_boolean_t    secure_mgmt_tmp = 0;
 
         if (strcmp (opt, "") == 0)
                 return 1;
@@ -370,6 +375,20 @@ cli_opt_parse (char *opt, struct cli_state *state)
                 return 0;
         }
 
+        oarg = strtail (opt, "secure-mgmt=");
+        if (oarg) {
+                if (gf_string2boolean(oarg,&secure_mgmt_tmp) == 0) {
+                        if (secure_mgmt_tmp) {
+                                /* See declaration for why this is an int. */
+                                state->ctx->secure_mgmt = 1;
+                        }
+                }
+                else {
+                        cli_err ("invalide secure-mgmt value (ignored)");
+                }
+                return 0;
+        }
+
         return -1;
 }
 
@@ -383,6 +402,11 @@ parse_cmdline (int argc, char *argv[], struct cli_state *state)
 
         state->argc=argc-1;
         state->argv=&argv[1];
+
+        /* Do this first so that an option can override. */
+        if (access(SECURE_ACCESS_FILE,F_OK) == 0) {
+                state->ctx->secure_mgmt = 1;
+        }
 
         for (i = 0; i < state->argc; i++) {
                 opt = strtail (state->argv[i], "--");
@@ -431,7 +455,7 @@ cli_state_init (struct cli_state *state)
         int                   ret = 0;
 
 
-        state->log_level = -1;
+        state->log_level = GF_LOG_NONE;
 
         tree = &state->tree;
         tree->state = state;
@@ -533,7 +557,10 @@ cli_quotad_clnt_rpc_init (void)
 
         global_quotad_rpc = rpc;
 out:
-        dict_unref (rpc_opts);
+        if (ret) {
+                if (rpc_opts)
+                        dict_destroy(rpc_opts);
+        }
         return rpc;
 }
 
@@ -545,7 +572,6 @@ cli_rpc_init (struct cli_state *state)
         int                     ret = -1;
         int                     port = CLI_GLUSTERD_PORT;
         xlator_t                *this = NULL;
-
 
         this = THIS;
         cli_rpc_prog = &cli_prog;
@@ -565,7 +591,8 @@ cli_rpc_init (struct cli_state *state)
                                                         0);
                 if (ret)
                         goto out;
-        } else if (state->remote_host) {
+        }
+        else if (state->remote_host) {
                 gf_log ("cli", GF_LOG_INFO, "Connecting to remote glusterd at "
                         "%s", state->remote_host);
                 ret = dict_set_str (options, "remote-host", state->remote_host);
@@ -583,7 +610,8 @@ cli_rpc_init (struct cli_state *state)
                                     "inet");
                 if (ret)
                         goto out;
-        } else {
+        }
+        else {
                 gf_log ("cli", GF_LOG_DEBUG, "Connecting to glusterd using "
                         "default socket");
                 ret = rpc_transport_unix_options_build

@@ -57,6 +57,8 @@ typedef enum {
         } while (0)
 
 #define CLIENT_STACK_UNWIND(op, frame, params ...) do {             \
+                if (!frame)                                         \
+                        break;                                      \
                 clnt_local_t *__local = frame->local;               \
                 frame->local = NULL;                                \
                 STACK_UNWIND_STRICT (op, frame, params);            \
@@ -96,10 +98,6 @@ typedef struct clnt_conf {
         char                   disconnect_err_logged; /* flag used to prevent
                                                          excessive disconnect
                                                          logging */
-
-        char                   need_different_port; /* flag used to change the
-                                                       portmap path in case of
-                                                       'tcp,rdma' on server */
         gf_boolean_t           lk_heal;
         uint16_t               lk_version; /* this variable is used to distinguish
                                               client-server transaction while
@@ -125,6 +123,8 @@ typedef struct clnt_conf {
          * how manytimes set_volume is called
          */
         uint64_t               setvol_count;
+
+        gf_boolean_t           send_gids; /* let the server resolve gids */
 } clnt_conf_t;
 
 typedef struct _client_fd_ctx {

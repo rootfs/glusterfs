@@ -238,6 +238,15 @@ make_file_path (char *base, const char *subdir, const char *filename,
                   "/%s", filename);
 }
 
+static int
+is_index_file_current (char *filename, uuid_t priv_index)
+{
+        char *current_index = alloca (strlen ("xattrop-") + GF_UUID_BUF_SIZE);
+
+        sprintf (current_index, "xattrop-%s", uuid_utoa(priv_index));
+        return (!strcmp(filename, current_index));
+}
+
 static void
 check_delete_stale_index_file (xlator_t *this, char *filename)
 {
@@ -247,6 +256,10 @@ check_delete_stale_index_file (xlator_t *this, char *filename)
         index_priv_t    *priv = NULL;
 
         priv = this->private;
+
+        if (is_index_file_current (filename, priv->index))
+                return;
+
         make_file_path (priv->index_basepath, XATTROP_SUBDIR,
                         filename, filepath, sizeof (filepath));
         ret = stat (filepath, &st);
@@ -255,10 +268,11 @@ check_delete_stale_index_file (xlator_t *this, char *filename)
 }
 
 static int
-index_fill_readdir (fd_t *fd, DIR *dir, off_t off,
+index_fill_readdir (fd_t *fd, index_fd_ctx_t *fctx, DIR *dir, off_t off,
                     size_t size, gf_dirent_t *entries)
 {
         off_t     in_case = -1;
+        off_t     last_off = 0;
         size_t    filled = 0;
         int       count = 0;
         char      entrybuf[sizeof(struct dirent) + 256 + 8];
@@ -272,10 +286,21 @@ index_fill_readdir (fd_t *fd, DIR *dir, off_t off,
                 rewinddir (dir);
         } else {
                 seekdir (dir, off);
+#ifndef GF_LINUX_HOST_OS
+                if ((u_long)telldir(dir) != off && off != fctx->dir_eof) {
+                        gf_log (THIS->name, GF_LOG_ERROR,
+                                "seekdir(0x%llx) failed on dir=%p: "
+				"Invalid argument (offset reused from "
+				"another DIR * structure?)", off, dir);
+                        errno = EINVAL;
+                        count = -1;
+                        goto out;
+                }
+#endif /* GF_LINUX_HOST_OS */
         }
 
         while (filled <= size) {
-                in_case = telldir (dir);
+                in_case = (u_long)telldir (dir);
 
                 if (in_case == -1) {
                         gf_log (THIS->name, GF_LOG_ERROR,
@@ -310,6 +335,19 @@ index_fill_readdir (fd_t *fd, DIR *dir, off_t off,
 
                 if (this_size + filled > size) {
                         seekdir (dir, in_case);
+#ifndef GF_LINUX_HOST_OS
+                        if ((u_long)telldir(dir) != in_case &&
+                            in_case != fctx->dir_eof) {
+				gf_log (THIS->name, GF_LOG_ERROR,
+					"seekdir(0x%llx) failed on dir=%p: "
+					"Invalid argument (offset reused from "
+					"another DIR * structure?)",
+					in_case, dir);
+				errno = EINVAL;
+				count = -1;
+				goto out;
+                        }
+#endif /* GF_LINUX_HOST_OS */
                         break;
                 }
 
@@ -321,7 +359,14 @@ index_fill_readdir (fd_t *fd, DIR *dir, off_t off,
                                 entry->d_name, strerror (errno));
                         goto out;
                 }
-                this_entry->d_off = telldir (dir);
+                /*
+                 * we store the offset of next entry here, which is
+                 * probably not intended, but code using syncop_readdir()
+                 * (glfs-heal.c, afr-self-heald.c, pump.c) rely on it
+                 * for directory read resumption.
+                 */
+                last_off = (u_long)telldir(dir);
+                this_entry->d_off = last_off;
                 this_entry->d_ino = entry->d_ino;
 
                 list_add_tail (&this_entry->list, &entries->list);
@@ -330,9 +375,12 @@ index_fill_readdir (fd_t *fd, DIR *dir, off_t off,
                 count ++;
         }
 
-        if ((!readdir (dir) && (errno == 0)))
+        if ((!readdir (dir) && (errno == 0))) {
                 /* Indicate EOF */
                 errno = ENOENT;
+                /* Remember EOF offset for later detection */
+                fctx->dir_eof = last_off;
+        }
 out:
         return count;
 }
@@ -497,13 +545,13 @@ fop_fxattrop_index_action (xlator_t *this, inode_t *inode, dict_t *xattr)
         _xattrop_index_action (this, inode, xattr);
 }
 
-inline gf_boolean_t
+static inline gf_boolean_t
 index_xattrop_track (loc_t *loc, gf_xattrop_flags_t flags, dict_t *dict)
 {
         return (flags == GF_XATTROP_ADD_ARRAY);
 }
 
-inline gf_boolean_t
+static inline gf_boolean_t
 index_fxattrop_track (fd_t *fd, gf_xattrop_flags_t flags, dict_t *dict)
 {
         return (flags == GF_XATTROP_ADD_ARRAY);
@@ -545,9 +593,11 @@ __index_fd_ctx_get (fd_t *fd, xlator_t *this, index_fd_ctx_t **ctx)
                 fctx = NULL;
                 goto out;
         }
+        fctx->dir_eof = -1;
 
         ret = __fd_ctx_set (fd, this, (uint64_t)(long)fctx);
         if (ret) {
+                closedir (fctx->dir);
                 GF_FREE (fctx);
                 fctx = NULL;
                 ret = -EINVAL;
@@ -913,7 +963,7 @@ index_readdir_wrapper (call_frame_t *frame, xlator_t *this,
                 goto done;
         }
 
-        count = index_fill_readdir (fd, dir, off, size, &entries);
+        count = index_fill_readdir (fd, fctx, dir, off, size, &entries);
 
         /* pick ENOENT to indicate EOF */
         op_errno = errno;
@@ -1026,6 +1076,26 @@ normal:
         STACK_WIND (frame, default_lookup_cbk, FIRST_CHILD(this),
                     FIRST_CHILD(this)->fops->lookup, loc, xattr_req);
 
+        return 0;
+}
+
+int32_t
+index_opendir (call_frame_t *frame, xlator_t *this,
+               loc_t *loc, fd_t *fd, dict_t *xdata)
+{
+        index_priv_t    *priv = NULL;
+
+        priv = this->private;
+        if (uuid_compare (fd->inode->gfid, priv->xattrop_vgfid))
+                goto normal;
+
+        frame->local = NULL;
+        STACK_UNWIND_STRICT (opendir, frame, 0, 0, fd, NULL);
+        return 0;
+
+normal:
+        STACK_WIND (frame, default_opendir_cbk, FIRST_CHILD(this),
+                    FIRST_CHILD(this)->fops->opendir, loc, fd, xdata);
         return 0;
 }
 
@@ -1214,8 +1284,11 @@ index_releasedir (xlator_t *this, fd_t *fd)
                 goto out;
 
         fctx = (index_fd_ctx_t*) (long) ctx;
-        if (fctx->dir)
-                closedir (fctx->dir);
+        if (fctx->dir) {
+                ret = closedir (fctx->dir);
+                if (ret)
+                        gf_log (this->name, GF_LOG_ERROR, "closedir error: %s", strerror (errno));
+        }
 
         GF_FREE (fctx);
 out:
@@ -1254,6 +1327,7 @@ struct xlator_fops fops = {
         //interface functions follow
         .getxattr    = index_getxattr,
         .lookup      = index_lookup,
+        .opendir     = index_opendir,
         .readdir     = index_readdir,
         .unlink      = index_unlink
 };

@@ -30,7 +30,8 @@
 #include "dict.h"
 #include "compat.h"
 #include "compat-errno.h"
-#include "statedump.h"
+#include "syscall.h"
+#include "glusterd-statedump.h"
 #include "glusterd-sm.h"
 #include "glusterd-op-sm.h"
 #include "glusterd-store.h"
@@ -39,6 +40,7 @@
 #include "glusterd-locks.h"
 #include "common-utils.h"
 #include "run.h"
+#include "rpc-clnt-ping.h"
 
 #include "syncop.h"
 
@@ -52,7 +54,7 @@ extern struct rpcsvc_program gd_svc_mgmt_prog;
 extern struct rpcsvc_program gd_svc_mgmt_v3_prog;
 extern struct rpcsvc_program gd_svc_peer_prog;
 extern struct rpcsvc_program gd_svc_cli_prog;
-extern struct rpcsvc_program gd_svc_cli_prog_ro;
+extern struct rpcsvc_program gd_svc_cli_trusted_progs;
 extern struct rpc_clnt_program gd_brick_prog;
 extern struct rpcsvc_program glusterd_mgmt_hndsk_prog;
 
@@ -66,7 +68,7 @@ rpcsvc_cbk_program_t glusterd_cbk_prog = {
 
 struct rpcsvc_program *gd_inet_programs[] = {
         &gd_svc_peer_prog,
-        &gd_svc_cli_prog_ro,
+        &gd_svc_cli_trusted_progs, /* Must be index 1 for secure_mgmt! */
         &gd_svc_mgmt_prog,
         &gd_svc_mgmt_v3_prog,
         &gluster_pmap_prog,
@@ -197,22 +199,24 @@ glusterd_options_init (xlator_t *this)
                 goto out;
 
         ret = glusterd_store_retrieve_options (this);
-        if (ret == 0)
+        if (ret == 0) {
                 goto out;
+        }
 
         ret = dict_set_str (priv->opts, GLUSTERD_GLOBAL_OPT_VERSION,
                             initial_version);
         if (ret)
                 goto out;
+
         ret = glusterd_store_options (this, priv->opts);
         if (ret) {
                 gf_log (this->name, GF_LOG_ERROR, "Unable to store version");
                 return ret;
         }
 out:
-
         return 0;
 }
+
 int
 glusterd_fetchspec_notify (xlator_t *this)
 {
@@ -238,11 +242,40 @@ glusterd_fetchspec_notify (xlator_t *this)
 }
 
 int
-glusterd_priv (xlator_t *this)
+glusterd_fetchsnap_notify (xlator_t *this)
 {
-        return 0;
-}
+        int              ret   = -1;
+        glusterd_conf_t *priv  = NULL;
+        rpc_transport_t *trans = NULL;
 
+        priv = this->private;
+
+        /*
+         * TODO: As of now, the identification of the rpc clients in the
+         * handshake protocol is not there. So among so many glusterfs processes
+         * registered with glusterd, it is hard to identify one particular
+         * process (in this particular case, the snap daemon). So the callback
+         * notification is sent to all the transports from the transport list.
+         * Only those processes which have a rpc client registered for this
+         * callback will respond to the notification. Once the identification
+         * of the rpc clients becomes possible, the below section can be changed
+         * to send callback notification to only those rpc clients, which have
+         * registered.
+         */
+        pthread_mutex_lock (&priv->xprt_lock);
+        {
+                list_for_each_entry (trans, &priv->xprt_list, list) {
+                        rpcsvc_callback_submit (priv->rpc, trans,
+                                                &glusterd_cbk_prog,
+                                                GF_CBK_GET_SNAPS, NULL, 0);
+                }
+        }
+        pthread_mutex_unlock (&priv->xprt_lock);
+
+        ret = 0;
+
+        return ret;
+}
 
 
 int32_t
@@ -286,7 +319,6 @@ glusterd_rpcsvc_notify (rpcsvc_t *rpc, void *xl, rpcsvc_event_t event,
         switch (event) {
         case RPCSVC_EVENT_ACCEPT:
         {
-                INIT_LIST_HEAD (&xprt->list);
 
                 pthread_mutex_lock (&priv->xprt_lock);
                 list_add_tail (&xprt->list, &priv->xprt_list);
@@ -311,7 +343,7 @@ out:
 }
 
 
-inline int32_t
+static inline int32_t
 glusterd_program_register (xlator_t *this, rpcsvc_t *svc,
                            rpcsvc_program_t *prog)
 {
@@ -804,7 +836,7 @@ check_prepare_mountbroker_root (char *mountbroker_root)
         dfd0 = dup (dfd);
 
         for (;;) {
-                ret = openat (dfd, "..", O_RDONLY);
+                ret = sys_openat (dfd, "..", O_RDONLY);
                 if (ret != -1) {
                         dfd2 = ret;
                         ret = fstat (dfd2, &st2);
@@ -839,11 +871,11 @@ check_prepare_mountbroker_root (char *mountbroker_root)
                 st = st2;
         }
 
-        ret = mkdirat (dfd0, MB_HIVE, 0711);
+        ret = sys_mkdirat (dfd0, MB_HIVE, 0711);
         if (ret == -1 && errno == EEXIST)
                 ret = 0;
         if (ret != -1)
-                ret = fstatat (dfd0, MB_HIVE, &st, AT_SYMLINK_NOFOLLOW);
+                ret = sys_fstatat (dfd0, MB_HIVE, &st, AT_SYMLINK_NOFOLLOW);
         if (ret == -1 || st.st_mode != (S_IFDIR|0711)) {
                 gf_log ("", GF_LOG_ERROR,
                         "failed to set up mountbroker-root directory %s",
@@ -952,32 +984,6 @@ _install_mount_spec (dict_t *opts, char *key, data_t *value, void *data)
 }
 
 
-static int
-gd_default_synctask_cbk (int ret, call_frame_t *frame, void *opaque)
-{
-        glusterd_conf_t     *priv = THIS->private;
-        synclock_unlock (&priv->big_lock);
-        return ret;
-}
-
-static void
-glusterd_launch_synctask (synctask_fn_t fn, void *opaque)
-{
-        xlator_t        *this = NULL;
-        glusterd_conf_t *priv = NULL;
-        int             ret   = -1;
-
-        this = THIS;
-        priv = this->private;
-
-        synclock_lock (&priv->big_lock);
-        ret = synctask_new (this->ctx->env, fn, gd_default_synctask_cbk, NULL,
-                            opaque);
-        if (ret)
-                gf_log (this->name, GF_LOG_CRITICAL, "Failed to spawn bricks"
-                        " and other volume related services");
-}
-
 int
 glusterd_uds_rpcsvc_notify (rpcsvc_t *rpc, void *xl, rpcsvc_event_t event,
                             void *data)
@@ -997,7 +1003,7 @@ glusterd_init_uds_listener (xlator_t *this)
         dict_t          *options = NULL;
         rpcsvc_t        *rpc = NULL;
         data_t          *sock_data = NULL;
-        char            sockfile[PATH_MAX+1] = {0,};
+        char            sockfile[UNIX_PATH_MAX+1] = {0,};
         int             i = 0;
 
 
@@ -1005,9 +1011,9 @@ glusterd_init_uds_listener (xlator_t *this)
 
         sock_data = dict_get (this->options, "glusterd-sockfile");
         if (!sock_data) {
-                strncpy (sockfile, DEFAULT_GLUSTERD_SOCKFILE, PATH_MAX);
+                strncpy (sockfile, DEFAULT_GLUSTERD_SOCKFILE, UNIX_PATH_MAX);
         } else {
-                strncpy (sockfile, sock_data->data, PATH_MAX);
+                strncpy (sockfile, sock_data->data, UNIX_PATH_MAX);
         }
 
         options = dict_new ();
@@ -1072,6 +1078,8 @@ glusterd_stop_uds_listener (xlator_t *this)
         glusterd_conf_t         *conf = NULL;
         rpcsvc_listener_t       *listener = NULL;
         rpcsvc_listener_t       *next = NULL;
+        data_t                  *sock_data = NULL;
+        char                     sockfile[UNIX_PATH_MAX+1] = {0,};
 
         GF_ASSERT (this);
         conf = this->private;
@@ -1084,10 +1092,17 @@ glusterd_stop_uds_listener (xlator_t *this)
                 rpcsvc_listener_destroy (listener);
         }
 
-        (void) rpcsvc_unregister_notify (conf->uds_rpc, glusterd_rpcsvc_notify,
+        (void) rpcsvc_unregister_notify (conf->uds_rpc,
+                                         glusterd_uds_rpcsvc_notify,
                                          this);
 
-        unlink (DEFAULT_GLUSTERD_SOCKFILE);
+        sock_data = dict_get (this->options, "glusterd-sockfile");
+        if (!sock_data) {
+                strncpy (sockfile, DEFAULT_GLUSTERD_SOCKFILE, UNIX_PATH_MAX);
+        } else {
+                strncpy (sockfile, sock_data->data, UNIX_PATH_MAX);
+        }
+        unlink (sockfile);
 
         GF_FREE (conf->uds_rpc);
         conf->uds_rpc = NULL;
@@ -1145,7 +1160,7 @@ glusterd_init_snap_folder (xlator_t *this)
 
         if ((-1 == ret) && (ENOENT == errno)) {
                 /* Create missing folders */
-                ret = mkdir_p (snap_mount_folder, 0777, _gf_false);
+                ret = mkdir_p (snap_mount_folder, 0777, _gf_true);
 
                 if (-1 == ret) {
                         gf_log (this->name, GF_LOG_CRITICAL,
@@ -1184,6 +1199,24 @@ init (xlator_t *this)
         int                i                 = 0;
         char              *valgrind_str      = NULL;
 
+#ifndef GF_DARWIN_HOST_OS
+        {
+                struct rlimit lim;
+                lim.rlim_cur = 65536;
+                lim.rlim_max = 65536;
+
+                if (setrlimit (RLIMIT_NOFILE, &lim) == -1) {
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "Failed to set 'ulimit -n "
+                                " 65536': %s", strerror(errno));
+                } else {
+                        gf_log (this->name, GF_LOG_INFO,
+                                "Maximum allowed open file descriptors "
+                                "set to 65536");
+                }
+        }
+#endif
+
         dir_data = dict_get (this->options, "working-directory");
 
         if (!dir_data) {
@@ -1210,7 +1243,7 @@ init (xlator_t *this)
 
 
         if ((-1 == ret) && (ENOENT == errno)) {
-                ret = mkdir (workdir, 0777);
+                ret = mkdir_p (workdir, 0777, _gf_true);
 
                 if (-1 == ret) {
                         gf_log (this->name, GF_LOG_CRITICAL,
@@ -1222,7 +1255,7 @@ init (xlator_t *this)
                 first_time = 1;
         }
 
-        setenv ("GLUSTERD_WORKING_DIR", workdir, 1);
+        setenv ("GLUSTERD_WORKDIR", workdir, 1);
         gf_log (this->name, GF_LOG_INFO, "Using %s as working directory",
                 workdir);
 
@@ -1234,7 +1267,7 @@ init (xlator_t *this)
                 exit (1);
         }
 
-        snprintf (cmd_log_filename, PATH_MAX,"%s/.cmd_log_history",
+        snprintf (cmd_log_filename, PATH_MAX, "%s/cmd_history.log",
                   DEFAULT_LOG_FILE_DIRECTORY);
         ret = gf_cmd_log_init (cmd_log_filename);
 
@@ -1251,6 +1284,17 @@ init (xlator_t *this)
         if ((-1 == ret) && (errno != EEXIST)) {
                 gf_log (this->name, GF_LOG_CRITICAL,
                         "Unable to create volume directory %s"
+                        " ,errno = %d", storedir, errno);
+                exit (1);
+        }
+
+        snprintf (storedir, PATH_MAX, "%s/snaps", workdir);
+
+        ret = mkdir (storedir, 0777);
+
+        if ((-1 == ret) && (errno != EEXIST)) {
+                gf_log (this->name, GF_LOG_CRITICAL,
+                        "Unable to create snaps directory %s"
                         " ,errno = %d", storedir, errno);
                 exit (1);
         }
@@ -1328,8 +1372,34 @@ init (xlator_t *this)
                 goto out;
         }
 
+        if (this->ctx->secure_mgmt) {
+                /*
+                 * The socket code will turn on SSL based on the same check,
+                 * but that will by default turn on own-thread as well and
+                 * we're not multi-threaded enough to handle that.  Thus, we
+                 * override the value here.
+                 */
+                ret = dict_set_str (this->options,
+                                    "transport.socket.own-thread", "off");
+                if (ret != 0) {
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "failed to clear own-thread");
+                        goto out;
+                }
+                /*
+                 * With strong authentication, we can afford to allow
+                 * privileged operations over TCP.
+                 */
+                gd_inet_programs[1] = &gd_svc_cli_prog;
+                /*
+                 * This is the only place where we want secure_srvr to reflect
+                 * the management-plane setting.
+                 */
+                this->ctx->secure_srvr = MGMT_SSL_ALWAYS;
+        }
+
         /*
-         * only one (atmost a pair - rdma and socket) listener for
+         * only one (at most a pair - rdma and socket) listener for
          * glusterd1_mop_prog, gluster_pmap_prog and gluster_handshake_prog.
          */
         ret = rpcsvc_create_listeners (rpc, this->options, this->name);
@@ -1353,9 +1423,10 @@ init (xlator_t *this)
                 }
         }
 
-        /* Start a unix domain socket listener just for cli commands
-         * This should prevent ports from being wasted by being in TIMED_WAIT
-         * when cli commands are done continuously
+        /*
+         * Start a unix domain socket listener just for cli commands This
+         * should prevent ports from being wasted by being in TIMED_WAIT when
+         * cli commands are done continuously
          */
         uds_rpc = glusterd_init_uds_listener (this);
         if (uds_rpc == NULL) {
@@ -1376,6 +1447,7 @@ init (xlator_t *this)
         GF_VALIDATE_OR_GOTO(this->name, conf->quotad, out);
 
         INIT_LIST_HEAD (&conf->peers);
+        INIT_LIST_HEAD (&conf->xaction_peers);
         INIT_LIST_HEAD (&conf->volumes);
         INIT_LIST_HEAD (&conf->snapshots);
         INIT_LIST_HEAD (&conf->missed_snaps_list);
@@ -1560,7 +1632,7 @@ struct xlator_fops fops;
 struct xlator_cbks cbks;
 
 struct xlator_dumpops dumpops = {
-        .priv  = glusterd_priv,
+        .priv  = glusterd_dump_priv,
 };
 
 
@@ -1635,6 +1707,12 @@ struct volume_options options[] = {
         { .key = {"snap-brick-path"},
           .type = GF_OPTION_TYPE_STR,
           .description = "directory where the bricks for the snapshots will be created"
+        },
+        { .key  = {"ping-timeout"},
+          .type = GF_OPTION_TYPE_TIME,
+          .min  = 0,
+          .max  = 300,
+          .default_value = TOSTRING(RPC_DEFAULT_PING_TIMEOUT),
         },
         { .key   = {NULL} },
 };

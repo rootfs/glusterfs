@@ -137,7 +137,7 @@ __glfs_refresh_inode (struct glfs *fs, xlator_t *subvol, inode_t *inode)
 }
 
 int
-glfs_loc_touchup (loc_t *loc)
+priv_glfs_loc_touchup (loc_t *loc)
 {
 	char *path = NULL;
 	int   ret = -1;
@@ -165,6 +165,7 @@ out:
 	return ret;
 }
 
+GFAPI_SYMVER_PRIVATE_DEFAULT(glfs_loc_touchup, 3.4.0);
 
 int
 glfs_resolve_symlink (struct glfs *fs, xlator_t *subvol, inode_t *inode,
@@ -240,13 +241,25 @@ glfs_resolve_component (struct glfs *fs, xlator_t *subvol, inode_t *parent,
 	loc.parent = inode_ref (parent);
 	uuid_copy (loc.pargfid, parent->gfid);
 
+        /* /.. and /. should point back to /
+           we lookup using inode and gfid of root
+           Fill loc.name so that we make use md-cache.
+           md-cache is not valid for nameless lookups.
+        */
+        if (__is_root_gfid (parent->gfid) &&
+            (strcmp (component, "..") == 0)) {
+                loc.inode = inode_ref (parent);
+                loc.name = ".";
+        } else {
+                if (strcmp (component, ".") == 0)
+                        loc.inode = inode_ref (parent);
+                else if (strcmp (component, "..") == 0)
+                        loc.inode = inode_parent (parent, 0, 0);
+                else
+                        loc.inode = inode_grep (parent->table, parent,
+                                                component);
+        }
 
-	if (strcmp (component, ".") == 0)
-		loc.inode = inode_ref (parent);
-	else if (strcmp (component, "..") == 0)
-		loc.inode = inode_parent (parent, 0, 0);
-	else
-		loc.inode = inode_grep (parent->table, parent, component);
 
 	if (loc.inode) {
 		uuid_copy (loc.gfid, loc.inode->gfid);
@@ -260,20 +273,40 @@ glfs_resolve_component (struct glfs *fs, xlator_t *subvol, inode_t *parent,
 	} else {
 		uuid_generate (gfid);
 		loc.inode = inode_new (parent->table);
+                if (!loc.inode) {
+                        errno = ENOMEM;
+                        goto out;
+                }
+
+                xattr_req = dict_new ();
+                if (!xattr_req) {
+                        errno = ENOMEM;
+                        goto out;
+                }
+
+                ret = dict_set_static_bin (xattr_req, "gfid-req", gfid, 16);
+                if (ret) {
+                        errno = ENOMEM;
+                        goto out;
+                }
+
 	}
 
-	if (!loc.inode)
-		goto out;
-
-	glret = glfs_loc_touchup (&loc);
+	glret = priv_glfs_loc_touchup (&loc);
 	if (glret < 0) {
 		ret = -1;
 		goto out;
 	}
 
-	ret = syncop_lookup (subvol, &loc, NULL, &ciatt, NULL, NULL);
-        DECODE_SYNCOP_ERR (ret);
-	if (ret && reval) {
+        ret = syncop_lookup (subvol, &loc, xattr_req, &ciatt, NULL, NULL);
+        if (ret && reval) {
+                /*
+                 * A stale mapping might exist for a dentry/inode that has been
+                 * removed from another client.
+                 */
+                if (-ret == ENOENT)
+                        inode_unlink(loc.inode, loc.parent,
+                                     loc.name);
 		inode_unref (loc.inode);
 		loc.inode = inode_new (parent->table);
 		if (!loc.inode) {
@@ -297,8 +330,8 @@ glfs_resolve_component (struct glfs *fs, xlator_t *subvol, inode_t *parent,
 
 		ret = syncop_lookup (subvol, &loc, xattr_req, &ciatt,
 				     NULL, NULL);
-                DECODE_SYNCOP_ERR (ret);
 	}
+        DECODE_SYNCOP_ERR (ret);
 	if (ret)
 		goto out;
 
@@ -319,7 +352,7 @@ out:
 
 
 int
-glfs_resolve_at (struct glfs *fs, xlator_t *subvol, inode_t *at,
+priv_glfs_resolve_at (struct glfs *fs, xlator_t *subvol, inode_t *at,
 		 const char *origpath, loc_t *loc, struct iatt *iatt,
 		 int follow, int reval)
 {
@@ -396,7 +429,7 @@ glfs_resolve_at (struct glfs *fs, xlator_t *subvol, inode_t *at,
 			if (ret < 0)
 				break;
 
-			ret = glfs_resolve_at (fs, subvol, parent, lpath,
+			ret = priv_glfs_resolve_at (fs, subvol, parent, lpath,
 					       &sym_loc,
 					       /* followed iatt becomes the
 						  component iatt
@@ -450,7 +483,7 @@ glfs_resolve_at (struct glfs *fs, xlator_t *subvol, inode_t *at,
 		ret = 0;
 	}
 
-        if (glfs_loc_touchup (loc) < 0) {
+        if (priv_glfs_loc_touchup (loc) < 0) {
                 ret = -1;
         }
 out:
@@ -461,6 +494,8 @@ out:
 	return ret;
 }
 
+GFAPI_SYMVER_PRIVATE_DEFAULT(glfs_resolve_at, 3.4.0);
+
 
 int
 glfs_resolve_path (struct glfs *fs, xlator_t *subvol, const char *origpath,
@@ -470,13 +505,13 @@ glfs_resolve_path (struct glfs *fs, xlator_t *subvol, const char *origpath,
 	inode_t *cwd = NULL;
 
 	if (origpath[0] == '/')
-		return glfs_resolve_at (fs, subvol, NULL, origpath, loc, iatt,
-					follow, reval);
+		return priv_glfs_resolve_at (fs, subvol, NULL, origpath, loc,
+                                             iatt, follow, reval);
 
 	cwd = glfs_cwd_get (fs);
 
-	ret = glfs_resolve_at (fs, subvol, cwd, origpath, loc, iatt,
-			       follow, reval);
+	ret = priv_glfs_resolve_at (fs, subvol, cwd, origpath, loc, iatt,
+                                    follow, reval);
 	if (cwd)
 		inode_unref (cwd);
 
@@ -485,7 +520,7 @@ glfs_resolve_path (struct glfs *fs, xlator_t *subvol, const char *origpath,
 
 
 int
-glfs_resolve (struct glfs *fs, xlator_t *subvol, const char *origpath,
+priv_glfs_resolve (struct glfs *fs, xlator_t *subvol, const char *origpath,
 	      loc_t *loc, struct iatt *iatt, int reval)
 {
 	int ret = -1;
@@ -494,7 +529,7 @@ glfs_resolve (struct glfs *fs, xlator_t *subvol, const char *origpath,
 
 	return ret;
 }
-
+GFAPI_SYMVER_PRIVATE_DEFAULT(glfs_resolve, 3.7.0);
 
 int
 glfs_lresolve (struct glfs *fs, xlator_t *subvol, const char *origpath,
@@ -522,7 +557,7 @@ glfs_migrate_fd_locks_safe (struct glfs *fs, xlator_t *oldsubvol, fd_t *oldfd,
 	newfd->lk_ctx = fd_lk_ctx_ref (oldfd->lk_ctx);
 
 	ret = syncop_fgetxattr (oldsubvol, oldfd, &lockinfo,
-				GF_XATTR_LOCKINFO_KEY);
+				GF_XATTR_LOCKINFO_KEY, NULL);
         DECODE_SYNCOP_ERR (ret);
 	if (ret < 0) {
 		gf_log (fs->volname, GF_LOG_WARNING,
@@ -802,36 +837,9 @@ __glfs_active_subvol (struct glfs *fs)
 	return new_subvol;
 }
 
-xlator_t *
-glfs_active_subvol (struct glfs *fs)
-{
-	xlator_t      *subvol = NULL;
-	xlator_t      *old_subvol = NULL;
-
-	glfs_lock (fs);
-	{
-		subvol = __glfs_active_subvol (fs);
-
-		if (subvol)
-			subvol->winds++;
-
-		if (fs->old_subvol) {
-			old_subvol = fs->old_subvol;
-			fs->old_subvol = NULL;
-			old_subvol->switched = 1;
-		}
-	}
-	glfs_unlock (fs);
-
-	if (old_subvol)
-		glfs_subvol_done (fs, old_subvol);
-
-	return subvol;
-}
-
 
 void
-glfs_subvol_done (struct glfs *fs, xlator_t *subvol)
+priv_glfs_subvol_done (struct glfs *fs, xlator_t *subvol)
 {
 	int ref = 0;
 	xlator_t *active_subvol = NULL;
@@ -852,6 +860,37 @@ glfs_subvol_done (struct glfs *fs, xlator_t *subvol)
 	}
 }
 
+GFAPI_SYMVER_PRIVATE_DEFAULT(glfs_subvol_done, 3.4.0);
+
+
+xlator_t *
+priv_glfs_active_subvol (struct glfs *fs)
+{
+	xlator_t      *subvol = NULL;
+	xlator_t      *old_subvol = NULL;
+
+	glfs_lock (fs);
+	{
+		subvol = __glfs_active_subvol (fs);
+
+		if (subvol)
+			subvol->winds++;
+
+		if (fs->old_subvol) {
+			old_subvol = fs->old_subvol;
+			fs->old_subvol = NULL;
+			old_subvol->switched = 1;
+		}
+	}
+	glfs_unlock (fs);
+
+	if (old_subvol)
+		priv_glfs_subvol_done (fs, old_subvol);
+
+	return subvol;
+}
+
+GFAPI_SYMVER_PRIVATE_DEFAULT(glfs_active_subvol, 3.4.0);
 
 int
 __glfs_cwd_set (struct glfs *fs, inode_t *inode)

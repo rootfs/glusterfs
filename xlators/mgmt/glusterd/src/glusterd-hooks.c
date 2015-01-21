@@ -46,7 +46,7 @@ char glusterd_hook_dirnames[GD_OP_MAX][256] =
         [GD_OP_REMOVE_BRICK]            = "remove-brick",
         [GD_OP_REPLACE_BRICK]           = EMPTY,
         [GD_OP_SET_VOLUME]              = "set",
-        [GD_OP_RESET_VOLUME]            = EMPTY,
+        [GD_OP_RESET_VOLUME]            = "reset",
         [GD_OP_SYNC_VOLUME]             = EMPTY,
         [GD_OP_LOG_ROTATE]              = EMPTY,
         [GD_OP_GSYNC_CREATE]            = "gsync-create",
@@ -66,7 +66,8 @@ char glusterd_hook_dirnames[GD_OP_MAX][256] =
 static inline gf_boolean_t
 glusterd_is_hook_enabled (char *script)
 {
-        return (script[0] == 'S');
+        return (script[0] == 'S' && (fnmatch ("*.rpmsave", script, 0) != 0)
+                                 && (fnmatch ("*.rpmnew", script, 0) != 0));
 }
 
 int
@@ -181,7 +182,7 @@ glusterd_hooks_set_volume_args (dict_t *dict, runner_t *runner)
                 goto out;
 
         runner_add_arg (runner, "-o");
-        for (i = 1; (ret == 0); i++) {
+        for (i = 1; ret == 0; i++) {
                 snprintf (query, sizeof (query), "key%d", i);
                 ret = dict_get_str (dict, query, &key);
                 if (ret)
@@ -259,6 +260,7 @@ glusterd_hooks_add_op_args (runner_t *runner, glusterd_op_t op,
 
                 case GD_OP_SET_VOLUME:
                         ret = glusterd_hooks_set_volume_args (op_ctx, runner);
+                        glusterd_hooks_add_working_dir (runner, priv);
                         break;
 
                 case GD_OP_GSYNC_CREATE:
@@ -277,6 +279,13 @@ glusterd_hooks_add_op_args (runner_t *runner, glusterd_op_t op,
                         glusterd_hooks_add_hooks_version (runner);
                         glusterd_hooks_add_op (runner, "add-brick");
                         glusterd_hooks_add_working_dir (runner, priv);
+                        break;
+
+               case GD_OP_RESET_VOLUME:
+                        glusterd_hooks_add_hooks_version (runner);
+                        glusterd_hooks_add_op (runner, "reset");
+                        glusterd_hooks_add_working_dir (runner, priv);
+                        break;
 
                 default:
                         break;
@@ -328,7 +337,7 @@ glusterd_hooks_run_hooks (char *hooks_path, glusterd_op_t op, dict_t *op_ctx,
 
         ret = -1;
         line_count = 0;
-        glusterd_for_each_entry (entry, hookdir);
+        GF_FOR_EACH_ENTRY_IN_DIR (entry, hookdir);
         while (entry) {
                 if (line_count == N-1) {
                         N *= 2;
@@ -342,7 +351,7 @@ glusterd_hooks_run_hooks (char *hooks_path, glusterd_op_t op, dict_t *op_ctx,
                         line_count++;
                 }
 
-                glusterd_for_each_entry (entry, hookdir);
+                GF_FOR_EACH_ENTRY_IN_DIR (entry, hookdir);
         }
 
         lines[line_count] = NULL;

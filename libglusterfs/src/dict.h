@@ -122,7 +122,7 @@ void data_unref (data_t *data);
 
 int32_t dict_lookup  (dict_t *this, char *key, data_t **data);
 /*
-   TODO: provide converts for differnt byte sizes, signedness, and void *
+   TODO: provide converts for different byte sizes, signedness, and void *
  */
 data_t *int_to_data (int64_t value);
 data_t *str_to_data (char *value);
@@ -176,6 +176,19 @@ int dict_foreach_fnmatch (dict_t *dict, char *pattern,
                                     data_t *value,
                                     void *data),
                           void *data);
+
+int
+dict_foreach_match (dict_t *dict,
+             gf_boolean_t (*match)(dict_t *this,
+                                char *key,
+                                data_t *value,
+                                void *mdata),
+             void *match_data,
+             int (*action)(dict_t *this,
+                                char *key,
+                                data_t *value,
+                                void *adata),
+              void *action_data);
 
 int dict_null_foreach_fn (dict_t *d, char *k,
                           data_t *v, void *tmp);
@@ -234,6 +247,12 @@ GF_MUST_CHECK int dict_get_str (dict_t *this, char *key, char **str);
 GF_MUST_CHECK int dict_get_str_boolean (dict_t *this, char *key, int default_val);
 GF_MUST_CHECK int dict_serialize_value_with_delim (dict_t *this, char *buf, int32_t *serz_len,
                                                     char delimiter);
+void
+dict_dump_to_statedump (dict_t *dict, char *dict_name, char *domain);
 
-void dict_dump (dict_t *dict);
+void
+dict_dump_to_log (dict_t *dict);
+
+int
+dict_dump_to_str (dict_t *dict, char *dump, int dumpsize, char *format);
 #endif

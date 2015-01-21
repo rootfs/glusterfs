@@ -142,9 +142,6 @@ server_submit_reply (call_frame_t *frame, rpcsvc_request_t *req, void *arg,
         char                    new_iobref = 0;
         client_t               *client     = NULL;
         gf_boolean_t            lk_heal    = _gf_false;
-        server_conf_t          *conf       = NULL;
-        gf_barrier_t           *barrier    = NULL;
-        gf_barrier_payload_t   *stub       = NULL;
         gf_boolean_t            barriered  = _gf_false;
 
         GF_VALIDATE_OR_GOTO ("server", req, ret);
@@ -153,7 +150,6 @@ server_submit_reply (call_frame_t *frame, rpcsvc_request_t *req, void *arg,
                 state = CALL_STATE (frame);
                 frame->local = NULL;
                 client = frame->root->client;
-                conf = (server_conf_t *) client->this->private;
         }
 
         if (client)
@@ -176,32 +172,6 @@ server_submit_reply (call_frame_t *frame, rpcsvc_request_t *req, void *arg,
 
         iobref_add (iobref, iob);
 
-        if (conf)
-                barrier = conf->barrier;
-        if (barrier) {
-                /* todo: write's with fd flags set to O_SYNC and O_DIRECT */
-                LOCK (&barrier->lock);
-                {
-                        if (is_fop_barriered (barrier->fops, req->procnum) &&
-                            (barrier_add_to_queue (barrier))) {
-                                stub = gf_barrier_payload (req, &rsp, frame,
-                                                           payload,
-                                                           payloadcount, iobref,
-                                                           iob, new_iobref);
-                                if (stub) {
-                                        gf_barrier_enqueue (barrier, stub);
-                                        barriered = _gf_true;
-                                } else {
-                                        gf_log ("", GF_LOG_ERROR, "Failed to "
-                                                " barrier fop %"PRIu64,
-                                                ((uint64_t)1 << req->procnum));
-                                }
-                        }
-                }
-                UNLOCK (&barrier->lock);
-                if (barriered == _gf_true)
-                        goto out;
-        }
         /* Then, submit the message for transmission. */
         ret = rpcsvc_submit_generic (req, &rsp, 1, payload, payloadcount,
                                      iobref);
@@ -231,19 +201,18 @@ server_submit_reply (call_frame_t *frame, rpcsvc_request_t *req, void *arg,
 
         ret = 0;
 ret:
-        if (state) {
+        if (state)
                 free_state (state);
-        }
 
-        if (frame) {
+        if (client)
                 gf_client_unref (client);
-                STACK_DESTROY (frame->root);
-        }
 
-        if (new_iobref) {
+        if (frame)
+                STACK_DESTROY (frame->root);
+
+        if (new_iobref)
                 iobref_unref (iobref);
-        }
-out:
+
         return ret;
 }
 
@@ -411,6 +380,12 @@ _check_for_auth_option (dict_t *d, char *k, data_t *v,
         if (!tail)
                 goto out;
 
+        if (strncmp(tail, "addr.", 5) != 0) {
+                gf_log (xl->name, GF_LOG_INFO,
+                        "skip format check for non-addr auth option %s", k);
+                goto out;
+        }
+
         /* fast fwd thru module type */
         tail = strchr (tail, '.');
         if (!tail)
@@ -452,11 +427,10 @@ _check_for_auth_option (dict_t *d, char *k, data_t *v,
                         else
                                 addr = NULL;
                 }
-
-                GF_FREE (tmp_addr_list);
-                tmp_addr_list = NULL;
         }
 out:
+        GF_FREE (tmp_addr_list);
+
         return ret;
 }
 
@@ -521,7 +495,6 @@ server_rpc_notify (rpcsvc_t *rpc, void *xl, rpcsvc_event_t event,
 
                    trans->protocol_private = client->conn;
                 */
-                INIT_LIST_HEAD (&trans->list);
 
                 pthread_mutex_lock (&conf->mutex);
                 {
@@ -546,7 +519,7 @@ server_rpc_notify (rpcsvc_t *rpc, void *xl, rpcsvc_event_t event,
                 if (!client)
                         break;
 
-                gf_log (this->name, GF_LOG_INFO, "disconnecting connection"
+                gf_log (this->name, GF_LOG_INFO, "disconnecting connection "
                         "from %s", client->client_uid);
 
                 /* If lock self heal is off, then destroy the
@@ -664,6 +637,7 @@ int
 server_init_grace_timer (xlator_t *this, dict_t *options,
                          server_conf_t *conf)
 {
+        char      timestr[64]    = {0,};
         int32_t   ret            = -1;
         int32_t   grace_timeout  = -1;
         char     *lk_heal        = NULL;
@@ -687,8 +661,10 @@ server_init_grace_timer (xlator_t *this, dict_t *options,
         else
                 conf->grace_ts.tv_sec = 10;
 
-        gf_log (this->name, GF_LOG_DEBUG, "Server grace timeout "
-                "value = %"PRIu64, conf->grace_ts.tv_sec);
+        gf_time_fmt (timestr, sizeof timestr, conf->grace_ts.tv_sec,
+                     gf_timefmt_s);
+        gf_log (this->name, GF_LOG_DEBUG, "Server grace timeout value = %s",
+                timestr);
 
         conf->grace_ts.tv_nsec  = 0;
 
@@ -709,6 +685,8 @@ reconfigure (xlator_t *this, dict_t *options)
         data_t                   *data;
         int                       ret = 0;
         char                     *statedump_path = NULL;
+        xlator_t                 *xl     = NULL;
+
         conf = this->private;
 
         if (!conf) {
@@ -719,6 +697,14 @@ reconfigure (xlator_t *this, dict_t *options)
                 conf->inode_lru_limit = inode_lru_limit;
                 gf_log (this->name, GF_LOG_TRACE, "Reconfigured inode-lru-limit"
                         " to %d", conf->inode_lru_limit);
+
+                /* traverse through the xlator graph. For each xlator in the
+                   graph check whether it is a bound_xl or not (bound_xl means
+                   the xlator will have its itable pointer set). If so, then
+                   set the lru limit for the itable.
+                */
+                xlator_foreach (this, xlator_set_inode_lru_limit,
+                                &inode_lru_limit);
         }
 
         data = dict_get (options, "trace");
@@ -764,6 +750,17 @@ reconfigure (xlator_t *this, dict_t *options)
         ret = gf_auth_init (this, conf->auth_modules);
         if (ret) {
                 dict_unref (conf->auth_modules);
+                goto out;
+        }
+
+        GF_OPTION_RECONF ("manage-gids", conf->server_manage_gids, options,
+                          bool, out);
+
+        GF_OPTION_RECONF ("gid-timeout", conf->gid_cache_timeout, options,
+                          int32, out);
+        if (gid_cache_reconf (&conf->gid_cache, conf->gid_cache_timeout) < 0) {
+                gf_log(this->name, GF_LOG_ERROR, "Failed to reconfigure group "
+                        "cache.");
                 goto out;
         }
 
@@ -827,8 +824,6 @@ init (xlator_t *this)
         server_conf_t     *conf     = NULL;
         rpcsvc_listener_t *listener = NULL;
         char              *statedump_path = NULL;
-        gf_barrier_t      *barrier  = NULL;
-        char              *str      = NULL;
         GF_VALIDATE_OR_GOTO ("init", this, out);
 
         if (this->children == NULL) {
@@ -896,6 +891,19 @@ init (xlator_t *this)
                 goto out;
         }
 
+        ret = dict_get_str_boolean (this->options, "manage-gids", _gf_false);
+        if (ret == -1)
+                conf->server_manage_gids = _gf_false;
+        else
+                conf->server_manage_gids = ret;
+
+        GF_OPTION_INIT("gid-timeout", conf->gid_cache_timeout, int32, out);
+        if (gid_cache_init (&conf->gid_cache, conf->gid_cache_timeout) < 0) {
+                gf_log(this->name, GF_LOG_ERROR, "Failed to initialize "
+                        "group cache.");
+                goto out;
+        }
+
         /* RPC related */
         conf->rpc = rpcsvc_init (this, this->ctx, this->options, 0);
         if (conf->rpc == NULL) {
@@ -912,6 +920,12 @@ init (xlator_t *this)
                         "Failed to configure outstanding-rpc-limit");
                 goto out;
         }
+
+        /*
+         * This is the only place where we want secure_srvr to reflect
+         * the data-plane setting.
+         */
+        this->ctx->secure_srvr = MGMT_SSL_COPY_IO;
 
         ret = rpcsvc_create_listeners (conf->rpc, this->options,
                                        this->name);
@@ -977,37 +991,6 @@ init (xlator_t *this)
                 }
         }
 #endif
-        /* barrier related */
-        barrier = GF_CALLOC (1, sizeof (*barrier),1);
-        if (!barrier) {
-                gf_log (this->name, GF_LOG_WARNING,
-                        "WARNING: Failed to allocate barrier");
-                ret = -1;
-                goto out;
-        }
-
-        LOCK_INIT (&barrier->lock);
-        INIT_LIST_HEAD (&barrier->queue);
-        barrier->on = _gf_false;
-
-        GF_OPTION_INIT ("barrier-queue-length", barrier->max_size,
-                        int64, out);
-        GF_OPTION_INIT ("barrier-timeout", barrier->time_out,
-                        uint64, out);
-
-        ret = dict_get_str (this->options, "barrier-fops", &str);
-        if (ret) {
-                gf_log (this->name, GF_LOG_DEBUG,
-                        "setting barrier fops to default value");
-        }
-        ret = gf_barrier_fops_configure (this, barrier, str);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR,
-                        "invalid barrier fops specified");
-                goto out;
-        }
-
-        conf->barrier = barrier;
         this->private = conf;
 
         ret = 0;
@@ -1072,37 +1055,10 @@ notify (xlator_t *this, int32_t event, void *data, ...)
         va_end (ap);
 
         switch (event) {
-        case GF_EVENT_VOLUME_BARRIER_OP:
-               ret = dict_get_int32 (dict, "barrier", &val);
-               if (ret) {
-                       gf_log (this->name, GF_LOG_ERROR,
-                               "Wrong BARRIER event");
-                       goto out;
-               }
-               /* !val un-barrier, if val, barrier */
-               if (val) {
-                       ret = gf_barrier_start (this);
-                       if (ret)
-                                gf_log (this->name, GF_LOG_ERROR,
-                                        "Barrier start failed");
-               } else {
-                       ret = gf_barrier_stop (this);
-                       if (ret)
-                               gf_log (this->name, GF_LOG_ERROR,
-                                       "Barrier stop failed");
-               }
-               ret = dict_set_int32 (output, "barrier-status", ret);
-               if (ret)
-                       gf_log (this->name, GF_LOG_ERROR,
-                               "Failed to set barrier-status in dict");
-               break;
-
-               /* todo: call default_notify to make other xlators handle it.*/
         default:
                 default_notify (this, event, data);
                 break;
         }
-out:
         return ret;
 }
 
@@ -1137,9 +1093,6 @@ struct volume_options options[] = {
           .type  = GF_OPTION_TYPE_PATH,
         },
         { .key   = {"transport.*"},
-          .type  = GF_OPTION_TYPE_ANY,
-        },
-        { .key   = {"rpc*"},
           .type  = GF_OPTION_TYPE_ANY,
         },
         { .key   = {"inode-lru-limit"},
@@ -1226,23 +1179,26 @@ struct volume_options options[] = {
                          "overrides the auth.allow option. By default, all"
                          " connections are allowed."
         },
-        {.key  = {"barrier-timeout"},
-         .type = GF_OPTION_TYPE_INT,
-         .default_value = "60",
-         .min  = 0,
-         .max  = 360,
-         .description = "Barrier timeout in seconds",
+        { .key  = {"rpc.outstanding-rpc-limit"},
+          .type = GF_OPTION_TYPE_INT,
+          .min  = RPCSVC_MIN_OUTSTANDING_RPC_LIMIT,
+          .max  = RPCSVC_MAX_OUTSTANDING_RPC_LIMIT,
+          .default_value = TOSTRING(RPCSVC_DEFAULT_OUTSTANDING_RPC_LIMIT),
+          .description = "Parameter to throttle the number of incoming RPC "
+                         "requests from a client. 0 means no limit (can "
+                         "potentially run out of memory)"
         },
-        {.key  = {"barrier-queue-length"},
-         .type = GF_OPTION_TYPE_INT,
-         .default_value = "4096",
-         .min  = 0,
-         .max  = 16384,
-         .description = "Barrier queue length",
+
+        { .key   = {"manage-gids"},
+          .type  = GF_OPTION_TYPE_BOOL,
+          .default_value = "off",
+          .description = "Resolve groups on the server-side."
         },
-        {.key = {"barrier-fops"},
-         .type = GF_OPTION_TYPE_STR,
-         .description = "Allow a comma seperated fop lists",
+        { .key = {"gid-timeout"},
+          .type = GF_OPTION_TYPE_INT,
+          .default_value = "2",
+          .description = "Timeout in seconds for the cached groups to expire."
         },
+
         { .key   = {NULL} },
 };

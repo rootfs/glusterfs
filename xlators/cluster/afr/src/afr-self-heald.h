@@ -53,8 +53,6 @@ typedef struct {
 	struct subvol_healer   *index_healers;
 	struct subvol_healer   *full_healers;
 
-	eh_t                    *healed;
-        eh_t                    *heal_failed;
         eh_t                    *split_brain;
         eh_t                    **statistics;
 } afr_self_heald_t;
@@ -69,4 +67,10 @@ afr_selfheal_daemon_init (xlator_t *this);
 int
 afr_xl_op (xlator_t *this, dict_t *input, dict_t *output);
 
+int
+afr_shd_gfid_to_path (xlator_t *this, xlator_t *subvol, uuid_t gfid,
+                      char **path_p);
+
+int
+afr_shd_index_purge (xlator_t *subvol, inode_t *inode, char *name);
 #endif /* !_AFR_SELF_HEALD_H */

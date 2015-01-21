@@ -58,6 +58,8 @@ gf_rdma_disconnect (rpc_transport_t *this);
 static void
 gf_rdma_cm_handle_disconnect (rpc_transport_t *this);
 
+static int
+gf_rdma_cm_handle_connect_init (struct rdma_cm_event *event);
 
 static void
 gf_rdma_put_post (gf_rdma_queue_t *queue, gf_rdma_post_t *post)
@@ -620,8 +622,8 @@ gf_rdma_get_device (rpc_transport_t *this, struct ibv_context *ibctx,
 
                 /* completion threads */
                 ret = gf_thread_create (&trav->send_thread, NULL,
-					gf_rdma_send_completion_proc,
-					trav->send_chan);
+                                        gf_rdma_send_completion_proc,
+                                        trav->send_chan);
                 if (ret) {
                         gf_log (this->name, GF_LOG_ERROR,
                                 "could not create send completion thread for "
@@ -630,8 +632,8 @@ gf_rdma_get_device (rpc_transport_t *this, struct ibv_context *ibctx,
                 }
 
                 ret = gf_thread_create (&trav->recv_thread, NULL,
-					 gf_rdma_recv_completion_proc,
-					 trav->recv_chan);
+                                         gf_rdma_recv_completion_proc,
+                                         trav->recv_chan);
                 if (ret) {
                         gf_log (this->name, GF_LOG_ERROR,
                                 "could not create recv completion thread "
@@ -640,8 +642,8 @@ gf_rdma_get_device (rpc_transport_t *this, struct ibv_context *ibctx,
                 }
 
                 ret = gf_thread_create (&trav->async_event_thread, NULL,
-					 gf_rdma_async_event_thread,
-					 ibctx);
+                                         gf_rdma_async_event_thread,
+                                         ibctx);
                 if (ret) {
                         gf_log (this->name, GF_LOG_ERROR,
                                 "could not create async_event_thread");
@@ -716,6 +718,7 @@ gf_rdma_transport_new (rpc_transport_t *listener, struct rdma_cm_id *cm_id)
         this->name = gf_strdup (listener->name);
         this->notify = listener->notify;
         this->mydata = listener->mydata;
+        this->xl = listener->xl;
 
         this->myinfo.sockaddr_len = sizeof (cm_id->route.addr.src_addr);
         memcpy (&this->myinfo.sockaddr, &cm_id->route.addr.src_addr,
@@ -783,7 +786,7 @@ gf_rdma_cm_handle_connect_request (struct rdma_cm_event *event)
         int                     ret         = -1;
         rpc_transport_t        *this        = NULL, *listener = NULL;
         struct rdma_cm_id      *child_cm_id = NULL, *listener_cm_id = NULL;
-	struct rdma_conn_param  conn_param  = {0, };
+        struct rdma_conn_param  conn_param  = {0, };
         gf_rdma_private_t      *priv        = NULL;
         gf_rdma_options_t      *options     = NULL;
 
@@ -817,20 +820,20 @@ gf_rdma_cm_handle_connect_request (struct rdma_cm_event *event)
                 goto out;
         }
 
-	conn_param.responder_resources = 1;
-	conn_param.initiator_depth = 1;
+        conn_param.responder_resources = 1;
+        conn_param.initiator_depth = 1;
         conn_param.retry_count = options->attr_retry_cnt;
         conn_param.rnr_retry_count = options->attr_rnr_retry;
 
-	ret = rdma_accept(child_cm_id, &conn_param);
-	if (ret < 0) {
+        ret = rdma_accept(child_cm_id, &conn_param);
+        if (ret < 0) {
                 gf_log (listener->name, GF_LOG_WARNING, "rdma_accept failed "
                         "peer:%s me:%s (%s)", this->peerinfo.identifier,
                         this->myinfo.identifier, strerror (errno));
                 gf_rdma_cm_handle_disconnect (this);
                 goto out;
-	}
-
+        }
+        gf_rdma_cm_handle_connect_init (event);
         ret = 0;
 
 out:
@@ -841,8 +844,8 @@ out:
 static int
 gf_rdma_cm_handle_route_resolved (struct rdma_cm_event *event)
 {
-	struct rdma_conn_param  conn_param = {0, };
-	int                     ret        = 0;
+        struct rdma_conn_param  conn_param = {0, };
+        int                     ret        = 0;
         rpc_transport_t        *this       = NULL;
         gf_rdma_private_t      *priv       = NULL;
         gf_rdma_peer_t         *peer       = NULL;
@@ -867,19 +870,19 @@ gf_rdma_cm_handle_route_resolved (struct rdma_cm_event *event)
                 goto out;
         }
 
-	memset(&conn_param, 0, sizeof conn_param);
-	conn_param.responder_resources = 1;
-	conn_param.initiator_depth = 1;
-	conn_param.retry_count = options->attr_retry_cnt;
+        memset(&conn_param, 0, sizeof conn_param);
+        conn_param.responder_resources = 1;
+        conn_param.initiator_depth = 1;
+        conn_param.retry_count = options->attr_retry_cnt;
         conn_param.rnr_retry_count = options->attr_rnr_retry;
 
-	ret = rdma_connect(peer->cm_id, &conn_param);
-	if (ret != 0) {
+        ret = rdma_connect(peer->cm_id, &conn_param);
+        if (ret != 0) {
                 gf_log (this->name, GF_LOG_WARNING,
                         "rdma_connect failed (%s)", strerror (errno));
                 gf_rdma_cm_handle_disconnect (this);
                 goto out;
-	}
+        }
 
         gf_log (this->name, GF_LOG_TRACE, "route resolved (me:%s peer:%s)",
                 this->myinfo.identifier, this->peerinfo.identifier);
@@ -935,7 +938,7 @@ static void
 gf_rdma_cm_handle_disconnect (rpc_transport_t *this)
 {
         gf_rdma_private_t *priv       = NULL;
-        char               need_unref = 0, connected = 0;
+        char               need_unref = 0;
 
         priv = this->private;
         gf_log (this->name, GF_LOG_DEBUG,
@@ -945,7 +948,6 @@ gf_rdma_cm_handle_disconnect (rpc_transport_t *this)
         {
                 if (priv->peer.cm_id != NULL) {
                         need_unref = 1;
-                        connected = priv->connected;
                         priv->connected = 0;
                 }
 
@@ -953,9 +955,7 @@ gf_rdma_cm_handle_disconnect (rpc_transport_t *this)
         }
         pthread_mutex_unlock (&priv->write_mutex);
 
-        if (connected) {
-                rpc_transport_notify (this, RPC_TRANSPORT_DISCONNECT, this);
-        }
+        rpc_transport_notify (this, RPC_TRANSPORT_DISCONNECT, this);
 
         if (need_unref)
                 rpc_transport_unref (this);
@@ -964,7 +964,7 @@ gf_rdma_cm_handle_disconnect (rpc_transport_t *this)
 
 
 static int
-gf_rdma_cm_handle_event_established (struct rdma_cm_event *event)
+gf_rdma_cm_handle_connect_init (struct rdma_cm_event *event)
 {
         rpc_transport_t   *this  = NULL;
         gf_rdma_private_t *priv  = NULL;
@@ -974,6 +974,13 @@ gf_rdma_cm_handle_event_established (struct rdma_cm_event *event)
         cm_id = event->id;
         this = cm_id->context;
         priv = this->private;
+
+        if (priv->connected == 1) {
+                gf_log (this->name, GF_LOG_TRACE,
+                        "received event RDMA_CM_EVENT_ESTABLISHED (me:%s peer:%s)",
+                        this->myinfo.identifier, this->peerinfo.identifier);
+                return ret;
+        }
 
         priv->connected = 1;
 
@@ -985,6 +992,9 @@ gf_rdma_cm_handle_event_established (struct rdma_cm_event *event)
         pthread_mutex_unlock (&priv->write_mutex);
 
         if (priv->entity == GF_RDMA_CLIENT) {
+                gf_log (this->name, GF_LOG_TRACE,
+                        "received event RDMA_CM_EVENT_ESTABLISHED (me:%s peer:%s)",
+                        this->myinfo.identifier, this->peerinfo.identifier);
                 ret = rpc_transport_notify (this, RPC_TRANSPORT_CONNECT, this);
 
         } else if (priv->entity == GF_RDMA_SERVER) {
@@ -995,10 +1005,6 @@ gf_rdma_cm_handle_event_established (struct rdma_cm_event *event)
         if (ret < 0) {
                 gf_rdma_disconnect (this);
         }
-
-        gf_log (this->name, GF_LOG_TRACE,
-                "received event RDMA_CM_EVENT_ESTABLISHED (me:%s peer:%s)",
-                this->myinfo.identifier, this->peerinfo.identifier);
 
         return ret;
 }
@@ -1059,7 +1065,7 @@ gf_rdma_cm_event_handler (void *data)
                         break;
 
                 case RDMA_CM_EVENT_ESTABLISHED:
-                        gf_rdma_cm_handle_event_established (event);
+                        gf_rdma_cm_handle_connect_init (event);
                         break;
 
                 case RDMA_CM_EVENT_ADDR_ERROR:
@@ -2027,7 +2033,7 @@ out:
 }
 
 
-inline int32_t
+static inline int32_t
 __gf_rdma_register_local_mr_for_rdma (gf_rdma_peer_t *peer,
                                       struct iovec *vector, int count,
                                       gf_rdma_post_context_t *ctx)
@@ -2690,13 +2696,34 @@ gf_rdma_submit_request (rpc_transport_t *this, rpc_transport_req_t *req)
         int32_t               ret   = 0;
         gf_rdma_ioq_t        *entry = NULL;
         rpc_transport_data_t  data  = {0, };
+        gf_rdma_private_t    *priv  = NULL;
+        gf_rdma_peer_t       *peer  = NULL;
 
         if (req == NULL) {
                 goto out;
         }
 
+        priv = this->private;
+        if (priv == NULL) {
+                ret = -1;
+                goto out;
+        }
+
+        peer = &priv->peer;
         data.is_request = 1;
         data.data.req = *req;
+/*
+ * when fist message is received on a transport, quota variable will
+ * initiaize  and quota_set will set to one. In gluster code client
+ * process with respect to transport is the one who sends the first
+ * message. Before settng quota_set variable if a submit request is
+ * came on server, then the message should not send.
+ */
+
+        if (priv->entity == GF_RDMA_SERVER && peer->quota_set == 0) {
+                ret = 0;
+                goto out;
+        }
 
         entry = gf_rdma_ioq_new (this, &data);
         if (entry == NULL) {
@@ -3074,7 +3101,7 @@ out:
 }
 
 
-inline int32_t
+static inline int32_t
 gf_rdma_decode_error_msg (gf_rdma_peer_t *peer, gf_rdma_post_t *post,
                           size_t bytes_in_post)
 {
@@ -3616,7 +3643,7 @@ out:
 }
 
 
-inline int32_t
+static inline int32_t
 gf_rdma_recv_request (gf_rdma_peer_t *peer, gf_rdma_post_t *post,
                       gf_rdma_read_chunk_t *readch)
 {
@@ -3667,7 +3694,7 @@ gf_rdma_process_recv (gf_rdma_peer_t *peer, struct ibv_wc *wc)
 
         header = (gf_rdma_header_t *)post->buf;
 
-	priv = peer->trans->private;
+        priv = peer->trans->private;
 
         pthread_mutex_lock (&priv->write_mutex);
         {
@@ -4102,9 +4129,9 @@ gf_rdma_options_init (rpc_transport_t *this)
         options->recv_size = GLUSTERFS_RDMA_INLINE_THRESHOLD;/*this->ctx->page_size * 4;  512 KB*/
         options->send_count = 4096;
         options->recv_count = 4096;
-	options->attr_timeout = GF_RDMA_TIMEOUT;
-	options->attr_retry_cnt = GF_RDMA_RETRY_CNT;
-	options->attr_rnr_retry = GF_RDMA_RNR_RETRY;
+        options->attr_timeout = GF_RDMA_TIMEOUT;
+        options->attr_retry_cnt = GF_RDMA_RETRY_CNT;
+        options->attr_rnr_retry = GF_RDMA_RNR_RETRY;
 
         temp = dict_get (this->options,
                          "transport.rdma.work-request-send-count");
@@ -4114,22 +4141,22 @@ gf_rdma_options_init (rpc_transport_t *this)
         temp = dict_get (this->options,
                          "transport.rdma.work-request-recv-count");
         if (temp)
-		options->recv_count = data_to_int32 (temp);
+                options->recv_count = data_to_int32 (temp);
 
-	temp = dict_get (this->options, "transport.rdma.attr-timeout");
+        temp = dict_get (this->options, "transport.rdma.attr-timeout");
 
-	if (temp)
-		options->attr_timeout = data_to_uint8 (temp);
+        if (temp)
+                options->attr_timeout = data_to_uint8 (temp);
 
-	temp = dict_get (this->options, "transport.rdma.attr-retry-cnt");
+        temp = dict_get (this->options, "transport.rdma.attr-retry-cnt");
 
-	if (temp)
-		options->attr_retry_cnt = data_to_uint8 (temp);
+        if (temp)
+                options->attr_retry_cnt = data_to_uint8 (temp);
 
-	temp = dict_get (this->options, "transport.rdma.attr-rnr-retry");
+        temp = dict_get (this->options, "transport.rdma.attr-rnr-retry");
 
-	if (temp)
-		options->attr_rnr_retry = data_to_uint8 (temp);
+        if (temp)
+                options->attr_rnr_retry = data_to_uint8 (temp);
 
         options->port = 1;
         temp = dict_get (this->options,
@@ -4196,8 +4223,8 @@ __gf_rdma_ctx_create (void)
         }
 
         ret = gf_thread_create (&rdma_ctx->rdma_cm_thread, NULL,
-				gf_rdma_cm_event_handler,
-				rdma_ctx->rdma_cm_event_channel);
+                                gf_rdma_cm_event_handler,
+                                rdma_ctx->rdma_cm_event_channel);
         if (ret != 0) {
                 gf_log (GF_RDMA_LOG_NAME, GF_LOG_WARNING,
                         "creation of thread to handle rdma-cm events "
@@ -4268,7 +4295,7 @@ gf_rdma_disconnect (rpc_transport_t *this)
         int32_t            ret  = 0;
 
         priv = this->private;
-        gf_log_callingfn (this->name, GF_LOG_WARNING,
+        gf_log_callingfn (this->name, GF_LOG_DEBUG,
                           "disconnect called (peer:%s)",
                           this->peerinfo.identifier);
 
@@ -4388,6 +4415,7 @@ gf_rdma_listen (rpc_transport_t *this)
         int                  ret          = 0;
         gf_rdma_ctx_t       *rdma_ctx     = NULL;
         char                 service[NI_MAXSERV], host[NI_MAXHOST];
+        int                  optval = 2;
 
         priv = this->private;
         peer = &priv->peer;
@@ -4428,6 +4456,15 @@ gf_rdma_listen (rpc_transport_t *this)
         }
 
         sprintf (this->myinfo.identifier, "%s:%s", host, service);
+
+        ret = rdma_set_option(peer->cm_id, RDMA_OPTION_ID,
+                              RDMA_OPTION_ID_REUSEADDR,
+                              (void *)&optval, sizeof(optval));
+        if (ret != 0) {
+                gf_log (this->name, GF_LOG_WARNING,
+                        "rdma option set failed (%s)", strerror (errno));
+                goto err;
+        }
 
         ret = rdma_bind_addr (peer->cm_id, &sock_union.sa);
         if (ret != 0) {
@@ -4538,16 +4575,16 @@ struct volume_options options[] = {
                     "transport.rdma.remote-port"},
           .type  = GF_OPTION_TYPE_INT
         },
-	{ .key   = {"transport.rdma.attr-timeout",
-		    "rdma-attr-timeout"},
+        { .key   = {"transport.rdma.attr-timeout",
+                    "rdma-attr-timeout"},
           .type  = GF_OPTION_TYPE_INT
         },
-	{ .key   = {"transport.rdma.attr-retry-cnt",
-		    "rdma-attr-retry-cnt"},
+        { .key   = {"transport.rdma.attr-retry-cnt",
+                    "rdma-attr-retry-cnt"},
           .type  = GF_OPTION_TYPE_INT
         },
-	{ .key   = {"transport.rdma.attr-rnr-retry",
-		    "rdma-attr-rnr-retry"},
+        { .key   = {"transport.rdma.attr-rnr-retry",
+                    "rdma-attr-rnr-retry"},
           .type  = GF_OPTION_TYPE_INT
         },
         { .key   = {"transport.rdma.listen-port", "listen-port"},

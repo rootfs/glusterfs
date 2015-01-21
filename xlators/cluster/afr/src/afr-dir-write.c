@@ -278,7 +278,6 @@ afr_mark_new_entry_changelog (call_frame_t *frame, xlator_t *this)
         dict_t        *xattr      = NULL;
         int32_t       **changelog = NULL;
         int           i           = 0;
-	int           idx         = 0;
         int           op_errno    = ENOMEM;
 	unsigned char *pending    = NULL;
 	int           call_count   = 0;
@@ -294,15 +293,9 @@ afr_mark_new_entry_changelog (call_frame_t *frame, xlator_t *this)
 	if (!new_local)
 		goto out;
 
-        changelog = afr_matrix_create (priv->child_count, AFR_NUM_CHANGE_LOGS);
-        if (!changelog)
-                goto out;
-
         xattr = dict_new ();
 	if (!xattr)
 		goto out;
-
-	idx = afr_index_for_transaction_type (AFR_DATA_TRANSACTION);
 
 	pending = alloca0 (priv->child_count);
 
@@ -312,17 +305,17 @@ afr_mark_new_entry_changelog (call_frame_t *frame, xlator_t *this)
 			call_count ++;
 			continue;
 		}
-
-		changelog[i][idx] = hton32(1);
 		pending[i] = 1;
 	}
+
+        changelog = afr_mark_pending_changelog (priv, pending, xattr,
+                                            local->cont.dir_fop.buf.ia_type);
+        if (!changelog)
+                goto out;
 
         new_local->pending = changelog;
         uuid_copy (new_local->loc.gfid, local->cont.dir_fop.buf.ia_gfid);
         new_local->loc.inode = inode_ref (local->inode);
-
-
-	afr_set_pending_dict (priv, xattr, changelog);
 
         new_local->call_count = call_count;
 
@@ -446,8 +439,6 @@ afr_create (call_frame_t *frame, xlator_t *this, loc_t *loc, int32_t flags,
         int                     op_errno                = ENOMEM;
 
         priv = this->private;
-
-        QUORUM_CHECK(create,out);
 
         transaction_frame = copy_frame (frame);
         if (!transaction_frame)
@@ -585,8 +576,6 @@ afr_mknod (call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
 
         priv = this->private;
 
-        QUORUM_CHECK(mknod,out);
-
         transaction_frame = copy_frame (frame);
         if (!transaction_frame)
                 goto out;
@@ -718,8 +707,6 @@ afr_mkdir (call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
 
         priv = this->private;
 
-        QUORUM_CHECK(mkdir,out);
-
         transaction_frame = copy_frame (frame);
         if (!transaction_frame)
                 goto out;
@@ -848,8 +835,6 @@ afr_link (call_frame_t *frame, xlator_t *this, loc_t *oldloc, loc_t *newloc,
         int                     op_errno                = ENOMEM;
 
         priv = this->private;
-
-        QUORUM_CHECK(link,out);
 
         transaction_frame = copy_frame (frame);
         if (!transaction_frame)
@@ -980,8 +965,6 @@ afr_symlink (call_frame_t *frame, xlator_t *this, const char *linkpath,
         int                     op_errno                = ENOMEM;
 
         priv = this->private;
-
-        QUORUM_CHECK(symlink,out);
 
         transaction_frame = copy_frame (frame);
         if (!transaction_frame)
@@ -1116,11 +1099,11 @@ afr_rename (call_frame_t *frame, xlator_t *this, loc_t *oldloc, loc_t *newloc,
 
         priv = this->private;
 
-        QUORUM_CHECK(rename,out);
-
         transaction_frame = copy_frame (frame);
-        if (!transaction_frame)
+        if (!transaction_frame) {
                 op_errno = ENOMEM;
+                goto out;
+        }
 
 	local = AFR_FRAME_INIT (transaction_frame, op_errno);
 	if (!local)
@@ -1271,8 +1254,6 @@ afr_unlink (call_frame_t *frame, xlator_t *this, loc_t *loc, int xflag,
 
         priv = this->private;
 
-        QUORUM_CHECK(unlink,out);
-
         transaction_frame = copy_frame (frame);
         if (!transaction_frame)
                 goto out;
@@ -1399,8 +1380,6 @@ afr_rmdir (call_frame_t *frame, xlator_t *this, loc_t *loc, int flags,
         int                     nlockee                 = 0;
 
         priv = this->private;
-
-        QUORUM_CHECK(rmdir,out);
 
         transaction_frame = copy_frame (frame);
         if (!transaction_frame)

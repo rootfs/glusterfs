@@ -389,6 +389,10 @@ __inode_unref (inode_t *inode)
         if (!inode)
                 return NULL;
 
+        /*
+         * Root inode should always be in active list of inode table. So unrefs
+         * on root inode are no-ops.
+         */
         if (__is_root_gfid(inode->gfid))
                 return inode;
 
@@ -419,6 +423,18 @@ __inode_ref (inode_t *inode)
                 inode->table->lru_size--;
                 __inode_activate (inode);
         }
+
+        /*
+         * Root inode should always be in active list of inode table. So unrefs
+         * on root inode are no-ops. If we do not allow unrefs but allow refs,
+         * it leads to refcount overflows and deleting and adding the inode
+         * to active-list, which is ugly. active_size (check __inode_activate)
+         * in inode table increases which is wrong. So just keep the ref
+         * count as 1 always
+         */
+        if (__is_root_gfid(inode->gfid) && inode->ref)
+                return inode;
+
         inode->ref++;
 
         return inode;
@@ -817,6 +833,17 @@ __inode_link (inode_t *inode, inode_t *parent, const char *name,
                 if (inode->table != parent->table) {
                         GF_ASSERT (!"link attempted b/w inodes of diff table");
                 }
+
+                if (parent->ia_type != IA_IFDIR) {
+                        GF_ASSERT (!"link attempted on non-directory parent");
+                        return NULL;
+                }
+
+                if (!name || strlen (name) == 0) {
+                        GF_ASSERT (!"link attempted with no basename on "
+                                    "parent");
+                        return NULL;
+                }
         }
 
         link_inode = inode;
@@ -837,11 +864,27 @@ __inode_link (inode_t *inode, inode_t *parent, const char *name,
                         inode->ia_type    = iatt->ia_type;
                         __inode_hash (inode);
                 }
-        }
+        } else {
+		/* @old_inode serves another important purpose - it indicates
+		   to the code further below whether a dentry cycle check is
+		   required or not (a new inode linkage can never result in
+		   creation of a loop.)
+
+		   if the given @inode is already hashed, it actually means
+		   it is an "old" inode and deserves to undergo the cyclic
+		   check.
+		*/
+		old_inode = inode;
+	}
 
         if (name) {
                 if (!strcmp(name, ".") || !strcmp(name, ".."))
                         return link_inode;
+
+                if (strchr (name, '/')) {
+                        GF_ASSERT (!"inode link attempted with '/' in name");
+                        return NULL;
+                }
         }
 
         /* use only link_inode beyond this point */
@@ -1000,6 +1043,8 @@ static void
 __inode_unlink (inode_t *inode, inode_t *parent, const char *name)
 {
         dentry_t *dentry = NULL;
+        char pgfid[64] = {0};
+        char gfid[64] = {0};
 
         if (!inode || !parent || !name)
                 return;
@@ -1007,8 +1052,14 @@ __inode_unlink (inode_t *inode, inode_t *parent, const char *name)
         dentry = __dentry_search_for_inode (inode, parent->gfid, name);
 
         /* dentry NULL for corrupted backend */
-        if (dentry)
+        if (dentry) {
                 __dentry_unset (dentry);
+        } else {
+                gf_log ("inode", GF_LOG_WARNING, "%s/%s: dentry not "
+                        "found in %s", uuid_utoa_r (parent->gfid, pgfid), name,
+                        uuid_utoa_r (inode->gfid, gfid));
+        }
+
 }
 
 
@@ -1238,6 +1289,27 @@ inode_path (inode_t *inode, const char *name, char **bufp)
         return ret;
 }
 
+void
+__inode_table_set_lru_limit (inode_table_t *table, uint32_t lru_limit)
+{
+        table->lru_limit = lru_limit;
+        return;
+}
+
+
+void
+inode_table_set_lru_limit (inode_table_t *table, uint32_t lru_limit)
+{
+        pthread_mutex_lock (&table->lock);
+        {
+                __inode_table_set_lru_limit (table, lru_limit);
+        }
+        pthread_mutex_unlock (&table->lock);
+
+        inode_table_prune (table);
+
+        return;
+}
 
 static int
 inode_table_prune (inode_table_t *table)

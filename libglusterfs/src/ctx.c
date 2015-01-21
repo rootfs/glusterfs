@@ -31,6 +31,8 @@ glusterfs_ctx_new ()
                 goto out;
         }
 
+	ctx->mem_acct_enable = 1;
+
         INIT_LIST_HEAD (&ctx->graphs);
 	INIT_LIST_HEAD (&ctx->mempool_list);
 
@@ -42,6 +44,7 @@ glusterfs_ctx_new ()
 		free (ctx);
 		ctx = NULL;
 	}
+
 out:
 	return ctx;
 }

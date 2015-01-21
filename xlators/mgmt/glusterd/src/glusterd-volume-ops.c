@@ -25,13 +25,225 @@
 #include "glusterd-store.h"
 #include "glusterd-utils.h"
 #include "glusterd-volgen.h"
+#include "glusterd-messages.h"
 #include "run.h"
+#include "glusterd-snapshot-utils.h"
+
+#include <stdint.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <stdlib.h>
 
 #define glusterd_op_start_volume_args_get(dict, volname, flags) \
         glusterd_op_stop_volume_args_get (dict, volname, flags)
 
 extern int
 _get_slave_status (dict_t *this, char *key, data_t *value, void *data);
+
+gf_ai_compare_t
+glusterd_compare_addrinfo (struct addrinfo *first, struct addrinfo *next)
+{
+        int             ret = -1;
+        struct addrinfo *tmp1 = NULL;
+        struct addrinfo *tmp2 = NULL;
+        char            firstip[NI_MAXHOST] = {0.};
+        char            nextip[NI_MAXHOST] = {0,};
+
+        for (tmp1 = first; tmp1 != NULL; tmp1 = tmp1->ai_next) {
+                ret = getnameinfo (tmp1->ai_addr, tmp1->ai_addrlen, firstip,
+                                   NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+                if (ret)
+                        return GF_AI_COMPARE_ERROR;
+                for (tmp2 = next; tmp2 != NULL; tmp2 = tmp2->ai_next) {
+                      ret = getnameinfo (tmp2->ai_addr, tmp2->ai_addrlen,
+                                         nextip, NI_MAXHOST, NULL, 0,
+                                         NI_NUMERICHOST);
+                      if (ret)
+                              return GF_AI_COMPARE_ERROR;
+                      if (!strcmp (firstip, nextip)) {
+                              return GF_AI_COMPARE_MATCH;
+                      }
+                }
+        }
+        return GF_AI_COMPARE_NO_MATCH;
+}
+
+/* Check for non optimal brick order for replicate :
+ * Checks if bricks belonging to a replicate volume
+ * are present on the same server
+ */
+int32_t
+glusterd_check_brick_order(dict_t *dict, char *err_str)
+{
+        int             ret             = -1;
+        int             i               = 0;
+        int             j               = 0;
+        int             k               = 0;
+        xlator_t        *this           = NULL;
+        addrinfo_list_t *ai_list        = NULL;
+        addrinfo_list_t *ai_list_tmp1   = NULL;
+        addrinfo_list_t *ai_list_tmp2   = NULL;
+        char            *brick          = NULL;
+        char            *brick_list     = NULL;
+        char            *brick_list_dup = NULL;
+        char            *tmpptr         = NULL;
+        char            *volname        = NULL;
+        int32_t         brick_count     = 0;
+        int32_t         type            = GF_CLUSTER_TYPE_NONE;
+        int32_t         sub_count       = 0;
+        struct addrinfo *ai_info        = NULL;
+
+        const char      failed_string[2048] = "Failed to perform brick order "
+                                "check. Use 'force' at the end of the command"
+                                " if you want to override this behavior. ";
+        const char      found_string[2048]  = "Multiple bricks of a replicate "
+                                "volume are present on the same server. This "
+                                "setup is not optimal. Use 'force' at the "
+                                "end of the command if you want to override "
+                                "this behavior. ";
+
+        this = THIS;
+
+        GF_ASSERT(this);
+
+        ai_list = malloc (sizeof (addrinfo_list_t));
+        ai_list->info = NULL;
+        INIT_LIST_HEAD (&ai_list->list);
+
+        ret = dict_get_str (dict, "volname", &volname);
+        if (ret) {
+                gf_log (this->name, GF_LOG_ERROR, "Unable to get volume name");
+                goto out;
+        }
+
+        ret = dict_get_int32 (dict, "type", &type);
+        if (ret) {
+                snprintf (err_str, 512, "Unable to get type of volume %s",
+                          volname);
+                gf_log (this->name, GF_LOG_WARNING, "%s", err_str);
+                goto out;
+        }
+
+        ret = dict_get_str (dict, "bricks", &brick_list);
+        if (ret) {
+                gf_log (this->name, GF_LOG_ERROR, "Bricks check : Could not "
+                        "retrieve bricks list");
+                goto out;
+        }
+
+        ret = dict_get_int32 (dict, "count", &brick_count);
+        if (ret) {
+                gf_log (this->name, GF_LOG_ERROR, "Bricks check : Could not "
+                        "retrieve brick count");
+                goto out;
+        }
+
+        if (type != GF_CLUSTER_TYPE_DISPERSE) {
+                ret = dict_get_int32 (dict, "replica-count", &sub_count);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_ERROR, "Bricks check : Could"
+                                " not retrieve replica count");
+                        goto out;
+                }
+                gf_log (this->name, GF_LOG_DEBUG, "Replicate cluster type "
+                        "found. Checking brick order.");
+        } else {
+                ret = dict_get_int32 (dict, "disperse-count", &sub_count);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_ERROR, "Bricks check : Could"
+                                " not retrieve disperse count");
+                        goto out;
+                }
+                gf_log (this->name, GF_LOG_INFO, "Disperse cluster type"
+                        " found. Checking brick order.");
+        }
+
+        brick_list_dup = gf_strdup(brick_list);
+        /* Resolve hostnames and get addrinfo */
+        while (i < brick_count) {
+                ++i;
+                brick = strtok_r (brick_list_dup, " \n", &tmpptr);
+                brick_list = tmpptr;
+                if (brick == NULL)
+                        goto check_failed;
+                brick = strtok_r (brick, ":", &tmpptr);
+                if (brick == NULL)
+                        goto check_failed;
+                ret = getaddrinfo (brick, NULL, NULL, &ai_info);
+                if (ret != 0) {
+                        ret = 0;
+                        gf_log (this->name, GF_LOG_ERROR, "unable to resolve "
+                                "host name");
+                        goto out;
+                }
+                ai_list_tmp1 = malloc (sizeof (addrinfo_list_t));
+                if (ai_list_tmp1 == NULL) {
+                        ret = 0;
+                        gf_log (this->name, GF_LOG_ERROR, "failed to allocate "
+                                "memory");
+                        goto out;
+                }
+                ai_list_tmp1->info = ai_info;
+                list_add_tail (&ai_list_tmp1->list, &ai_list->list);
+                ai_list_tmp1 = NULL;
+        }
+
+        i = 0;
+        ai_list_tmp1 = list_entry (ai_list->list.next, addrinfo_list_t, list);
+
+        /* Check for bad brick order */
+        while (i < brick_count) {
+                ++i;
+                ai_info = ai_list_tmp1->info;
+                ai_list_tmp1 = list_entry (ai_list_tmp1->list.next,
+                                           addrinfo_list_t, list);
+                if (0 == i % sub_count) {
+                        j = 0;
+                        continue;
+                }
+                ai_list_tmp2 = ai_list_tmp1;
+                k = j;
+                while (k < sub_count - 1) {
+                        ++k;
+                        ret = glusterd_compare_addrinfo (ai_info,
+                                                         ai_list_tmp2->info);
+                        if (GF_AI_COMPARE_ERROR == ret)
+                                goto check_failed;
+                        if (GF_AI_COMPARE_MATCH == ret)
+                                goto found_bad_brick_order;
+                        ai_list_tmp2 = list_entry (ai_list_tmp2->list.next,
+                                                   addrinfo_list_t, list);
+                }
+                ++j;
+        }
+        gf_log (this->name, GF_LOG_DEBUG, "Brick order okay");
+        ret = 0;
+        goto out;
+
+check_failed:
+        gf_log (this->name, GF_LOG_ERROR, "Failed bad brick order check");
+        snprintf (err_str, sizeof (failed_string), failed_string);
+        ret = -1;
+        goto out;
+
+found_bad_brick_order:
+        gf_log (this->name, GF_LOG_INFO, "Bad brick order found");
+        snprintf (err_str, sizeof (found_string), found_string);
+        ret = -1;
+out:
+        ai_list_tmp2 = NULL;
+        GF_FREE (brick_list_dup);
+        list_for_each_entry (ai_list_tmp1, &ai_list->list, list) {
+                if (ai_list_tmp1->info)
+                          freeaddrinfo (ai_list_tmp1->info);
+                free (ai_list_tmp2);
+                ai_list_tmp2 = ai_list_tmp1;
+        }
+        free (ai_list_tmp2);
+        return ret;
+}
 
 int
 __glusterd_handle_create_volume (rpcsvc_request_t *req)
@@ -426,6 +638,59 @@ glusterd_handle_cli_delete_volume (rpcsvc_request_t *req)
                                             __glusterd_handle_cli_delete_volume);
 }
 
+static int
+glusterd_handle_heal_enable_disable (rpcsvc_request_t *req, dict_t *dict,
+                                     glusterd_volinfo_t *volinfo)
+{
+        gf_xl_afr_op_t                  heal_op = GF_AFR_OP_INVALID;
+        int                             ret = 0;
+        xlator_t                        *this = THIS;
+        char                            *key = NULL;
+        char                            *value = NULL;
+
+        ret = dict_get_int32 (dict, "heal-op", (int32_t *)&heal_op);
+        if (ret || (heal_op == GF_AFR_OP_INVALID)) {
+                ret = -1;
+                goto out;
+        }
+
+        if ((heal_op != GF_AFR_OP_HEAL_ENABLE) &&
+            (heal_op != GF_AFR_OP_HEAL_DISABLE)) {
+                ret = -EINVAL;
+                goto out;
+        }
+
+        key = volgen_get_shd_key (volinfo);
+        if (!key) {
+                ret = -1;
+                goto out;
+        }
+
+        /* Convert this command to volume-set command based on volume type */
+        ret = dict_set_str (dict, "key1", key);
+        if (ret)
+                goto out;
+
+        if (heal_op == GF_AFR_OP_HEAL_ENABLE) {
+                value = "enable";
+        } else if (heal_op == GF_AFR_OP_HEAL_DISABLE) {
+                value = "disable";
+        }
+
+        ret = dict_set_str (dict, "value1", value);
+        if (ret)
+                goto out;
+
+        ret = dict_set_int32 (dict, "count", 1);
+        if (ret)
+                goto out;
+
+        ret = glusterd_op_begin_synctask (req, GD_OP_SET_VOLUME, dict);
+
+out:
+        return ret;
+}
+
 int
 __glusterd_handle_cli_heal_volume (rpcsvc_request_t *req)
 {
@@ -484,7 +749,21 @@ __glusterd_handle_cli_heal_volume (rpcsvc_request_t *req)
         if (ret) {
                 snprintf (op_errstr, sizeof (op_errstr),
                           "Volume %s does not exist", volname);
-                gf_log (this->name, GF_LOG_ERROR, "%s", op_errstr);
+                goto out;
+        }
+
+        ret = glusterd_handle_heal_enable_disable (req, dict, volinfo);
+        if (ret == -EINVAL) {
+                ret = 0;
+        } else {
+                /*
+                 * If the return value is -ve but not -EINVAL then the command
+                 * failed. If the return value is 0 then the synctask for the
+                 * op has begun, so in both cases just 'goto out'. If there was
+                 * a failure it will respond with an error, otherwise the
+                 * synctask will take the responsibility of sending the
+                 * response.
+                 */
                 goto out;
         }
 
@@ -503,6 +782,7 @@ out:
                 if (op_errstr[0] == '\0')
                         snprintf (op_errstr, sizeof (op_errstr),
                                   "operation failed");
+                gf_log (this->name, GF_LOG_ERROR, "%s", op_errstr);
                 ret = glusterd_op_send_cli_response (cli_op, ret, 0, req,
                                                      dict, op_errstr);
         }
@@ -714,7 +994,8 @@ out:
 
 /* op-sm */
 int
-glusterd_op_stage_create_volume (dict_t *dict, char **op_errstr)
+glusterd_op_stage_create_volume (dict_t *dict, char **op_errstr,
+                                 dict_t *rsp_dict)
 {
         int                                     ret = 0;
         char                                    *volname = NULL;
@@ -722,9 +1003,12 @@ glusterd_op_stage_create_volume (dict_t *dict, char **op_errstr)
         char                                    *bricks = NULL;
         char                                    *brick_list = NULL;
         char                                    *free_ptr = NULL;
+        char                                    key[PATH_MAX] = "";
         glusterd_brickinfo_t                    *brick_info = NULL;
         int32_t                                 brick_count = 0;
+        int32_t                                 local_brick_count = 0;
         int32_t                                 i = 0;
+        int32_t                                 type = 0;
         char                                    *brick = NULL;
         char                                    *tmpptr = NULL;
         xlator_t                                *this = NULL;
@@ -738,6 +1022,7 @@ glusterd_op_stage_create_volume (dict_t *dict, char **op_errstr)
         GF_ASSERT (this);
         priv = this->private;
         GF_ASSERT (priv);
+        GF_ASSERT (rsp_dict);
 
         ret = dict_get_str (dict, "volname", &volname);
         if (ret) {
@@ -800,10 +1085,17 @@ glusterd_op_stage_create_volume (dict_t *dict, char **op_errstr)
                 brick= strtok_r (brick_list, " \n", &tmpptr);
                 brick_list = tmpptr;
 
-                if (!glusterd_store_is_valid_brickpath (volname, brick) ||
-                        !glusterd_is_valid_volfpath (volname, brick)) {
+                if (!glusterd_store_is_valid_brickpath (volname, brick)) {
                         snprintf (msg, sizeof (msg), "brick path %s is too "
                                   "long.", brick);
+                        ret = -1;
+                        goto out;
+                }
+
+                if (!glusterd_is_valid_volfpath (volname, brick)) {
+                        snprintf (msg, sizeof (msg), "Volume file path for "
+                                  "volume %s and brick path %s is too long.",
+                                   volname, brick);
                         ret = -1;
                         goto out;
                 }
@@ -837,10 +1129,70 @@ glusterd_op_stage_create_volume (dict_t *dict, char **op_errstr)
                                                           is_force);
                         if (ret)
                                 goto out;
+
+                        /* A bricks mount dir is required only by snapshots which were
+                         * introduced in gluster-3.6.0
+                         */
+                        if (priv->op_version >= GD_OP_VERSION_3_6_0) {
+                                ret = glusterd_get_brick_mount_dir
+                                        (brick_info->path, brick_info->hostname,
+                                         brick_info->mount_dir);
+                                if (ret) {
+                                        gf_log (this->name, GF_LOG_ERROR,
+                                                "Failed to get brick mount_dir");
+                                        goto out;
+                                }
+
+                                snprintf (key, sizeof(key), "brick%d.mount_dir",
+                                          i);
+                                ret = dict_set_dynstr_with_alloc
+                                        (rsp_dict, key, brick_info->mount_dir);
+                                if (ret) {
+                                        gf_log (this->name, GF_LOG_ERROR,
+                                                "Failed to set %s", key);
+                                        goto out;
+                                }
+                        }
+                        local_brick_count = i;
+
                         brick_list = tmpptr;
                 }
                 glusterd_brickinfo_delete (brick_info);
                 brick_info = NULL;
+        }
+
+        /*Check brick order if the volume type is replicate or disperse. If
+         * force at the end of command not given then check brick order.
+         */
+        if (is_origin_glusterd (dict)) {
+                ret = dict_get_int32 (dict, "type", &type);
+                if (ret) {
+                        snprintf (msg, sizeof (msg), "Unable to get type of "
+                                  "volume %s", volname);
+                        gf_log (this->name, GF_LOG_WARNING, "%s", msg);
+                        goto out;
+                }
+
+                if (!is_force) {
+                        if ((type == GF_CLUSTER_TYPE_REPLICATE) ||
+                            (type == GF_CLUSTER_TYPE_STRIPE_REPLICATE) ||
+                            (type == GF_CLUSTER_TYPE_DISPERSE)) {
+                                ret = glusterd_check_brick_order(dict, msg);
+                                if (ret) {
+                                        gf_log(this->name, GF_LOG_ERROR, "Not "
+                                               "creating volume because of bad "
+                                               "brick order");
+                                        goto out;
+                                }
+                        }
+                }
+        }
+
+        ret = dict_set_int32 (rsp_dict, "brick_count", local_brick_count);
+        if (ret) {
+                gf_log (this->name, GF_LOG_ERROR,
+                        "Failed to set local_brick_count");
+                goto out;
         }
 out:
         GF_FREE (free_ptr);
@@ -915,11 +1267,15 @@ out:
 }
 
 int
-glusterd_op_stage_start_volume (dict_t *dict, char **op_errstr)
+glusterd_op_stage_start_volume (dict_t *dict, char **op_errstr,
+                                dict_t *rsp_dict)
 {
         int                                     ret = 0;
         char                                    *volname = NULL;
+        char                                    key[PATH_MAX] = "";
         int                                     flags = 0;
+        int32_t                                 brick_count = 0;
+        int32_t                                 local_brick_count = 0;
         gf_boolean_t                            exists = _gf_false;
         glusterd_volinfo_t                      *volinfo = NULL;
         glusterd_brickinfo_t                    *brickinfo = NULL;
@@ -935,6 +1291,7 @@ glusterd_op_stage_start_volume (dict_t *dict, char **op_errstr)
         GF_ASSERT (this);
         priv = this->private;
         GF_ASSERT (priv);
+        GF_ASSERT (rsp_dict);
 
         ret = glusterd_op_start_volume_args_get (dict, &volname, &flags);
         if (ret)
@@ -969,6 +1326,7 @@ glusterd_op_stage_start_volume (dict_t *dict, char **op_errstr)
         }
 
         list_for_each_entry (brickinfo, &volinfo->bricks, brick_list) {
+                brick_count++;
                 ret = glusterd_resolve_brick (brickinfo);
                 if (ret) {
                         gf_log (this->name, GF_LOG_ERROR, FMTSTR_RESOLVE_BRICK,
@@ -976,7 +1334,8 @@ glusterd_op_stage_start_volume (dict_t *dict, char **op_errstr)
                         goto out;
                 }
 
-                if (uuid_compare (brickinfo->uuid, MY_UUID))
+                if ((uuid_compare (brickinfo->uuid, MY_UUID)) ||
+                    (brickinfo->snap_status == -1))
                         continue;
 
                 ret = gf_lstat_dir (brickinfo->path, NULL);
@@ -1003,7 +1362,7 @@ glusterd_op_stage_start_volume (dict_t *dict, char **op_errstr)
                                              GF_XATTR_VOL_ID_KEY,
                                              volinfo->volume_id, 16,
                                              XATTR_CREATE);
-                        if (ret) {
+                        if (ret == -1) {
                                 snprintf (msg, sizeof (msg), "Failed to set "
                                         "extended attribute %s on %s. Reason: "
                                         "%s", GF_XATTR_VOL_ID_KEY,
@@ -1023,6 +1382,34 @@ glusterd_op_stage_start_volume (dict_t *dict, char **op_errstr)
                         ret = -1;
                         goto out;
                 }
+
+                /* A bricks mount dir is required only by snapshots which were
+                 * introduced in gluster-3.6.0
+                 */
+                if (priv->op_version >= GD_OP_VERSION_3_6_0) {
+                        if (strlen(brickinfo->mount_dir) < 1) {
+                                ret = glusterd_get_brick_mount_dir
+                                        (brickinfo->path, brickinfo->hostname,
+                                         brickinfo->mount_dir);
+                                if (ret) {
+                                        gf_log (this->name, GF_LOG_ERROR,
+                                                "Failed to get brick mount_dir");
+                                        goto out;
+                                }
+
+                                snprintf (key, sizeof(key), "brick%d.mount_dir",
+                                          brick_count);
+                                ret = dict_set_dynstr_with_alloc
+                                        (rsp_dict, key, brickinfo->mount_dir);
+                                if (ret) {
+                                        gf_log (this->name, GF_LOG_ERROR,
+                                                "Failed to set %s", key);
+                                        goto out;
+                                }
+                                local_brick_count = brick_count;
+                        }
+                }
+
 #ifdef HAVE_BD_XLATOR
                 if (brickinfo->vg[0])
                         caps = CAPS_BD | CAPS_THIN |
@@ -1038,6 +1425,13 @@ glusterd_op_stage_start_volume (dict_t *dict, char **op_errstr)
                 } else
                         caps = 0;
 #endif
+        }
+
+        ret = dict_set_int32 (rsp_dict, "brick_count", local_brick_count);
+        if (ret) {
+                gf_log (this->name, GF_LOG_ERROR,
+                        "Failed to set local_brick_count");
+                goto out;
         }
 
         volinfo->caps = caps;
@@ -1121,7 +1515,7 @@ glusterd_op_stage_stop_volume (dict_t *dict, char **op_errstr)
         }
 
         if (is_run && param.is_active) {
-                gf_log (this->name, GF_LOG_WARNING, GEOREP" sessions active"
+                gf_log (this->name, GF_LOG_WARNING, GEOREP" sessions active "
                         "for the volume %s ", volname);
                 snprintf (msg, sizeof(msg), GEOREP" sessions are active "
                           "for the volume '%s'.\nUse 'volume "GEOREP" "
@@ -1213,7 +1607,7 @@ glusterd_op_stage_delete_volume (dict_t *dict, char **op_errstr)
 
         if (volinfo->snap_count > 0 || !list_empty(&volinfo->snap_volumes)) {
                 snprintf (msg, sizeof (msg), "Cannot delete Volume %s ,"
-                        "as it has %ld snapshots. "
+                        "as it has %"PRIu64" snapshots. "
                         "To delete the volume, "
                         "first delete all the snapshots under it.",
                           volname, volinfo->snap_count);
@@ -1319,6 +1713,16 @@ glusterd_op_stage_heal_volume (dict_t *dict, char **op_errstr)
         }
 
         switch (heal_op) {
+                case GF_AFR_OP_HEALED_FILES:
+                case GF_AFR_OP_HEAL_FAILED_FILES:
+                        ret = -1;
+                        snprintf (msg, sizeof (msg),"Command not supported. "
+                                  "Please use \"gluster volume heal %s info\" "
+                                  "and logs to find the heal information.",
+                                  volname);
+                        *op_errstr = gf_strdup (msg);
+                        goto out;
+
                 case GF_AFR_OP_INDEX_SUMMARY:
                 case GF_AFR_OP_STATISTICS_HEAL_COUNT:
                 case GF_AFR_OP_STATISTICS_HEAL_COUNT_PER_REPLICA:
@@ -1500,6 +1904,8 @@ glusterd_op_create_volume (dict_t *dict, char **op_errstr)
         int                   caps       = 0;
         int                   brickid    = 0;
         char                  msg[1024] __attribute__((unused)) = {0, };
+        char                 *brick_mount_dir = NULL;
+        char                  key[PATH_MAX]   = "";
 
         this = THIS;
         GF_ASSERT (this);
@@ -1522,7 +1928,7 @@ glusterd_op_create_volume (dict_t *dict, char **op_errstr)
                 goto out;
         }
 
-        strncpy (volinfo->volname, volname, GLUSTERD_MAX_VOLUME_NAME);
+        strncpy (volinfo->volname, volname, sizeof(volinfo->volname));
         GF_ASSERT (volinfo->volname);
 
         ret = dict_get_int32 (dict, "type", &volinfo->type);
@@ -1590,6 +1996,27 @@ glusterd_op_create_volume (dict_t *dict, char **op_errstr)
                                 "replica count for volume %s", volname);
                         goto out;
                 }
+        } else if (GF_CLUSTER_TYPE_DISPERSE == volinfo->type) {
+                ret = dict_get_int32 (dict, "disperse-count",
+                                      &volinfo->disperse_count);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_ERROR, "Failed to get "
+                                 "disperse count for volume %s", volname);
+                        goto out;
+                }
+                ret = dict_get_int32 (dict, "redundancy-count",
+                                      &volinfo->redundancy_count);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_ERROR, "Failed to get "
+                                 "redundancy count for volume %s", volname);
+                        goto out;
+                }
+                if (priv->op_version < GD_OP_VERSION_3_6_0) {
+                        gf_log (this->name, GF_LOG_ERROR, "Disperse volume "
+                                "needs op-version 3.6.0 or higher");
+                        ret = -1;
+                        goto out;
+                }
         }
 
         /* dist-leaf-count is the count of brick nodes for a given
@@ -1646,13 +2073,10 @@ glusterd_op_create_volume (dict_t *dict, char **op_errstr)
 
         if (strcasecmp (trans_type, "rdma") == 0) {
                 volinfo->transport_type = GF_TRANSPORT_RDMA;
-                volinfo->nfs_transport_type = GF_TRANSPORT_RDMA;
         } else if (strcasecmp (trans_type, "tcp") == 0) {
                 volinfo->transport_type = GF_TRANSPORT_TCP;
-                volinfo->nfs_transport_type = GF_TRANSPORT_TCP;
         } else {
                 volinfo->transport_type = GF_TRANSPORT_BOTH_TCP_RDMA;
-                volinfo->nfs_transport_type = GF_DEFAULT_NFS_TRANSPORT;
         }
 
         if (bricks) {
@@ -1682,29 +2106,51 @@ glusterd_op_create_volume (dict_t *dict, char **op_errstr)
                         goto out;
                 }
 
+                /* A bricks mount dir is required only by snapshots which were
+                 * introduced in gluster-3.6.0
+                 */
+                if (priv->op_version >= GD_OP_VERSION_3_6_0) {
+                        brick_mount_dir = NULL;
+                        snprintf (key, sizeof(key), "brick%d.mount_dir", i);
+                        ret = dict_get_str (dict, key, &brick_mount_dir);
+                        if (ret) {
+                                gf_log (this->name, GF_LOG_ERROR,
+                                        "%s not present", key);
+                                goto out;
+                        }
+                        strncpy (brickinfo->mount_dir, brick_mount_dir,
+                                 sizeof(brickinfo->mount_dir));
+                }
+
 #ifdef HAVE_BD_XLATOR
-                if (!uuid_compare (brickinfo->uuid, MY_UUID)) {
-                        if (brickinfo->vg[0]) {
-                                ret = glusterd_is_valid_vg (brickinfo, 0, msg);
-                                if (ret) {
-                                        gf_log (this->name, GF_LOG_ERROR, "%s",
-                                                msg);
-                                        goto out;
-                                }
+                if (!uuid_compare (brickinfo->uuid, MY_UUID)
+                    && brickinfo->vg[0]) {
+                        ret = glusterd_is_valid_vg (brickinfo, 0, msg);
+                        if (ret) {
+                                gf_log (this->name, GF_LOG_ERROR, "%s", msg);
+                                goto out;
+                        }
 
-                                /* if anyone of the brick does not have thin
-                                   support, disable it for entire volume */
-                                caps &= brickinfo->caps;
-
-
-                        } else
+                        /* if anyone of the brick does not have thin
+                           support, disable it for entire volume */
+                        caps &= brickinfo->caps;
+                } else {
                                 caps = 0;
                 }
+
 #endif
 
                 list_add_tail (&brickinfo->brick_list, &volinfo->bricks);
                 brick = strtok_r (NULL, " \n", &saveptr);
                 i++;
+        }
+
+        ret = glusterd_enable_default_options (volinfo, NULL);
+        if (ret) {
+                gf_msg (this->name, GF_LOG_ERROR, 0,
+                        GD_MSG_FAIL_DEFAULT_OPT_SET, "Failed to set default "
+                        "options on create for volume %s", volinfo->volname);
+                goto out;
         }
 
         gd_update_volume_op_versions (volinfo);
@@ -1737,17 +2183,70 @@ out:
 }
 
 int
-glusterd_op_start_volume (dict_t *dict, char **op_errstr)
+glusterd_start_volume (glusterd_volinfo_t *volinfo, int flags,
+                       gf_boolean_t wait)
+
 {
-        int                                     ret = 0;
-        char                                    *volname = NULL;
-        int                                     flags = 0;
-        glusterd_volinfo_t                      *volinfo = NULL;
-        glusterd_brickinfo_t                    *brickinfo = NULL;
-        xlator_t                                *this = NULL;
+        int                             ret             = 0;
+        glusterd_brickinfo_t           *brickinfo       = NULL;
+        xlator_t                       *this            = NULL;
+        glusterd_volinfo_ver_ac_t       verincrement    = 0;
 
         this = THIS;
         GF_ASSERT (this);
+        GF_ASSERT (volinfo);
+
+        list_for_each_entry (brickinfo, &volinfo->bricks, brick_list) {
+                ret = glusterd_brick_start (volinfo, brickinfo, wait);
+                /* If 'force' try to start all bricks regardless of success or
+                 * failure
+                 */
+                if (!(flags & GF_CLI_FLAG_OP_FORCE) && ret)
+                        goto out;
+        }
+
+        /* Increment the volinfo version only if there is a
+         * change in status. Force option can be used to start
+         * dead bricks even if the volume is in started state.
+         * In such case volume status will be GLUSTERD_STATUS_STARTED.
+         * Therefore we should not increment the volinfo version.*/
+        if (GLUSTERD_STATUS_STARTED != volinfo->status) {
+                verincrement = GLUSTERD_VOLINFO_VER_AC_INCREMENT;
+        } else {
+                verincrement = GLUSTERD_VOLINFO_VER_AC_NONE;
+        }
+
+        glusterd_set_volume_status (volinfo, GLUSTERD_STATUS_STARTED);
+
+        ret = glusterd_store_volinfo (volinfo, verincrement);
+        if (ret) {
+                gf_log (this->name, GF_LOG_ERROR, "Failed to store volinfo of "
+                        "%s volume", volinfo->volname);
+                goto out;
+        }
+out:
+        gf_log (this->name, GF_LOG_TRACE, "returning %d ", ret);
+        return ret;
+}
+
+int
+glusterd_op_start_volume (dict_t *dict, char **op_errstr)
+{
+        int                         ret             = 0;
+        int32_t                     brick_count     = 0;
+        char                       *brick_mount_dir = NULL;
+        char                        key[PATH_MAX]   = "";
+        char                       *volname         = NULL;
+        int                         flags           = 0;
+        glusterd_volinfo_t         *volinfo         = NULL;
+        glusterd_brickinfo_t       *brickinfo       = NULL;
+        xlator_t                   *this            = NULL;
+        glusterd_conf_t            *conf            = NULL;
+
+        this = THIS;
+        GF_ASSERT (this);
+        conf = this->private;
+        GF_ASSERT (conf);
 
         ret = glusterd_op_start_volume_args_get (dict, &volname, &flags);
         if (ret)
@@ -1760,25 +2259,45 @@ glusterd_op_start_volume (dict_t *dict, char **op_errstr)
                 goto out;
         }
 
-        list_for_each_entry (brickinfo, &volinfo->bricks, brick_list) {
-                ret = glusterd_brick_start (volinfo, brickinfo, _gf_true);
-                /* If 'force' try to start all bricks regardless of success or
-                 * failure
-                 */
-                if (!(flags & GF_CLI_FLAG_OP_FORCE) && ret)
-                        goto out;
+        /* A bricks mount dir is required only by snapshots which were
+         * introduced in gluster-3.6.0
+         */
+        if (conf->op_version >= GD_OP_VERSION_3_6_0) {
+                list_for_each_entry (brickinfo, &volinfo->bricks, brick_list) {
+                        brick_count++;
+                        /* Don't check bricks that are not owned by you
+                         */
+                        if (uuid_compare (brickinfo->uuid, MY_UUID))
+                                continue;
+                        if (strlen(brickinfo->mount_dir) < 1) {
+                                brick_mount_dir = NULL;
+                                snprintf (key, sizeof(key), "brick%d.mount_dir",
+                                          brick_count);
+                                ret = dict_get_str (dict, key,
+                                                    &brick_mount_dir);
+                                if (ret) {
+                                        gf_log (this->name, GF_LOG_ERROR,
+                                                "%s not present", key);
+                                        goto out;
+                                }
+                                strncpy (brickinfo->mount_dir, brick_mount_dir,
+                                         sizeof(brickinfo->mount_dir));
+                        }
+                }
         }
 
-        glusterd_set_volume_status (volinfo, GLUSTERD_STATUS_STARTED);
+        ret = glusterd_start_volume (volinfo, flags, _gf_true);
+        if (ret)
+                goto out;
 
-        ret = glusterd_store_volinfo (volinfo, GLUSTERD_VOLINFO_VER_AC_INCREMENT);
+        ret = glusterd_handle_snapd_option (volinfo);
         if (ret)
                 goto out;
 
         ret = glusterd_nodesvcs_handle_graph_change (volinfo);
 
 out:
-        gf_log (this->name, GF_LOG_DEBUG, "returning %d ", ret);
+        gf_log (this->name, GF_LOG_TRACE, "returning %d ", ret);
         return ret;
 }
 
@@ -1788,7 +2307,6 @@ glusterd_stop_volume (glusterd_volinfo_t *volinfo)
         int                     ret                     = -1;
         glusterd_brickinfo_t    *brickinfo              = NULL;
         char                    mountdir[PATH_MAX]      = {0,};
-        runner_t                runner                  = {0,};
         char                    pidfile[PATH_MAX]       = {0,};
         xlator_t                *this                   = NULL;
 
@@ -1825,25 +2343,22 @@ glusterd_stop_volume (glusterd_volinfo_t *volinfo)
                 GLUSTERD_GET_QUOTA_AUX_MOUNT_PATH (mountdir, volinfo->volname,
                                                    "/");
 
-                runinit (&runner);
-                runner_add_args (&runner, "umount",
-
-                #if GF_LINUX_HOST_OS
-                                "-l",
-                #endif
-                                mountdir, NULL);
-                ret = runner_run_reuse (&runner);
+                ret = gf_umount_lazy (this->name, mountdir, 0);
                 if (ret)
-                        gf_log (this->name, GF_LOG_ERROR, "umount on %s failed, "
-                                "reason : %s", mountdir, strerror (errno));
-
-                runner_end (&runner);
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "umount on %s failed, reason : %s",
+                                mountdir, strerror (errno));
         }
+
+        ret = glusterd_handle_snapd_option (volinfo);
+        if (ret)
+                goto out;
 
         ret = glusterd_nodesvcs_handle_graph_change (volinfo);
         if (ret) {
                 gf_log (this->name, GF_LOG_ERROR, "Failed to notify graph "
                         "change for %s volume", volinfo->volname);
+
                 goto out;
         }
 
@@ -2038,7 +2553,7 @@ glusterd_clearlocks_unmount (glusterd_volinfo_t *volinfo, char *mntpt)
          * stat() on mount can be due to network failures.*/
 
         runinit (&runner);
-        runner_add_args (&runner, "/bin/umount", "-f", NULL);
+        runner_add_args (&runner, _PATH_UMOUNT, "-f", NULL);
         runner_argprintf (&runner, "%s", mntpt);
 
         synclock_unlock (&priv->big_lock);
@@ -2134,12 +2649,13 @@ int
 glusterd_clearlocks_get_local_client_ports (glusterd_volinfo_t *volinfo,
                                             char **xl_opts)
 {
-        glusterd_brickinfo_t    *brickinfo      = NULL;
-        glusterd_conf_t         *priv           = NULL;
-        int                     index           = 0;
-        int                     ret             = -1;
-        int                     i               = 0;
-        int                     port            = 0;
+        glusterd_brickinfo_t    *brickinfo          = NULL;
+        glusterd_conf_t         *priv               = NULL;
+        char                    brickname[PATH_MAX] = {0,};
+        int                     index               = 0;
+        int                     ret                 = -1;
+        int                     i                   = 0;
+        int                     port                = 0;
 
         GF_ASSERT (xl_opts);
         if (!xl_opts) {
@@ -2156,7 +2672,14 @@ glusterd_clearlocks_get_local_client_ports (glusterd_volinfo_t *volinfo,
                 if (uuid_compare (brickinfo->uuid, MY_UUID))
                         continue;
 
-                port = pmap_registry_search (THIS, brickinfo->path,
+                if (volinfo->transport_type == GF_TRANSPORT_RDMA) {
+                        snprintf (brickname, sizeof(brickname), "%s.rdma",
+                                  brickinfo->path);
+                } else
+                        snprintf (brickname, sizeof(brickname), "%s",
+                                  brickinfo->path);
+
+                port = pmap_registry_search (THIS, brickname,
                                              GF_PMAP_PORT_BRICKSERVER);
                 if (!port) {
                         ret = -1;
