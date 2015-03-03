@@ -18,8 +18,12 @@
 #include "glusterfs.h"
 #include "glusterd.h"
 #include "glusterd-op-sm.h"
+#include "glusterd-geo-rep.h"
 #include "glusterd-store.h"
 #include "glusterd-utils.h"
+#include "glusterd-svc-mgmt.h"
+#include "glusterd-svc-helper.h"
+#include "glusterd-nfs-svc.h"
 #include "glusterd-volgen.h"
 #include "run.h"
 #include "syscall.h"
@@ -200,28 +204,29 @@ int
 glusterd_op_stage_replace_brick (dict_t *dict, char **op_errstr,
                                  dict_t *rsp_dict)
 {
-        int                                      ret           = 0;
-        int32_t                                  port          = 0;
-        char                                    *src_brick     = NULL;
-        char                                    *dst_brick     = NULL;
-        char                                    *volname       = NULL;
-        int                                      replace_op    = 0;
-        glusterd_volinfo_t                      *volinfo       = NULL;
-        glusterd_brickinfo_t                    *src_brickinfo = NULL;
-        char                                    *host          = NULL;
-        char                                    *path          = NULL;
-        char                                     msg[2048]     = {0};
-        char                                    *dup_dstbrick  = NULL;
-        glusterd_peerinfo_t                     *peerinfo = NULL;
-        glusterd_brickinfo_t                    *dst_brickinfo = NULL;
-        gf_boolean_t                             is_run        = _gf_false;
-        dict_t                                  *ctx           = NULL;
-        glusterd_conf_t                         *priv          = NULL;
-        char                                    *savetok       = NULL;
-        char                                     pidfile[PATH_MAX] = {0};
-        char                                    *task_id_str = NULL;
-        xlator_t                                *this = NULL;
-        gf_boolean_t                            is_force = _gf_false;
+        int                                      ret                = 0;
+        int32_t                                  port               = 0;
+        char                                    *src_brick          = NULL;
+        char                                    *dst_brick          = NULL;
+        char                                    *volname            = NULL;
+        int                                      replace_op         = 0;
+        glusterd_volinfo_t                      *volinfo            = NULL;
+        glusterd_brickinfo_t                    *src_brickinfo      = NULL;
+        char                                    *host               = NULL;
+        char                                    *path               = NULL;
+        char                                     msg[2048]          = {0};
+        char                                    *dup_dstbrick       = NULL;
+        glusterd_peerinfo_t                     *peerinfo           = NULL;
+        glusterd_brickinfo_t                    *dst_brickinfo      = NULL;
+        gf_boolean_t                             enabled            = _gf_false;
+        dict_t                                  *ctx                = NULL;
+        glusterd_conf_t                         *priv               = NULL;
+        char                                    *savetok            = NULL;
+        char                                     pidfile[PATH_MAX]  = {0};
+        char                                    *task_id_str        = NULL;
+        xlator_t                                *this               = NULL;
+        gf_boolean_t                             is_force           = _gf_false;
+        gsync_status_param_t                     param              = {0,};
 
         this = THIS;
         GF_ASSERT (this);
@@ -288,19 +293,10 @@ glusterd_op_stage_replace_brick (dict_t *dict, char **op_errstr,
                 goto out;
         }
 
-        ret = glusterd_check_gsync_running (volinfo, &is_run);
-        if (ret && (is_run == _gf_false))
-                gf_log (this->name, GF_LOG_WARNING, "Unable to get the status"
-                                " of active "GEOREP" session");
-        if (is_run) {
-                gf_log (this->name, GF_LOG_WARNING, GEOREP" sessions active"
-                        "for the volume %s ", volname);
-                snprintf (msg, sizeof(msg), GEOREP" sessions are active "
-                                "for the volume %s.\nStop "GEOREP " sessions "
-                                "involved in this volume. Use 'volume "GEOREP
-                                " status' command for more info.",
-                                volname);
-                *op_errstr = gf_strdup (msg);
+        /* If geo-rep is configured, for this volume, it should be stopped. */
+        param.volinfo = volinfo;
+        ret = glusterd_check_geo_rep_running (&param, op_errstr);
+        if (ret || param.is_active) {
                 ret = -1;
                 goto out;
         }
@@ -675,12 +671,20 @@ rb_src_brick_restart (glusterd_volinfo_t *volinfo,
                       glusterd_brickinfo_t *src_brickinfo,
                       int activate_pump)
 {
-        int                     ret = 0;
+        int              ret  = 0;
+        xlator_t        *this = NULL;
+        glusterd_conf_t *priv = NULL;
+
+        this = THIS;
+        GF_ASSERT (this);
+
+        priv = this->private;
+        GF_ASSERT (priv);
 
         gf_log ("", GF_LOG_DEBUG,
                 "Attempting to kill src");
 
-        ret = glusterd_nfs_server_stop (volinfo);
+        ret = priv->nfs_svc.stop (&(priv->nfs_svc), SIGKILL);
 
         if (ret) {
                 gf_log ("", GF_LOG_ERROR, "Unable to stop nfs, ret: %d",
@@ -724,7 +728,7 @@ rb_src_brick_restart (glusterd_volinfo_t *volinfo,
         }
 
 out:
-        ret = glusterd_nfs_server_start (volinfo);
+        ret = priv->nfs_svc.start (&(priv->nfs_svc), PROC_START_NO_WAIT);
         if (ret) {
                 gf_log ("", GF_LOG_ERROR, "Unable to start nfs, ret: %d",
                         ret);
@@ -1778,7 +1782,7 @@ glusterd_op_replace_brick (dict_t *dict, dict_t *rsp_dict)
                         }
                 }
 
-                ret = glusterd_nodesvcs_stop (volinfo);
+                ret = glusterd_svcs_stop (volinfo);
                 if (ret) {
                         gf_log (this->name, GF_LOG_ERROR,
                                 "Unable to stop nfs server, ret: %d", ret);
@@ -1790,13 +1794,13 @@ glusterd_op_replace_brick (dict_t *dict, dict_t *rsp_dict)
 			gf_log (this->name, GF_LOG_CRITICAL, "Unable to add "
 				"dst-brick: %s to volume: %s", dst_brick,
                                 volinfo->volname);
-		        (void) glusterd_nodesvcs_handle_graph_change (volinfo);
+		        (void) glusterd_svcs_manager (volinfo);
 			goto out;
 		}
 
 		volinfo->rebal.defrag_status = 0;
 
-		ret = glusterd_nodesvcs_handle_graph_change (volinfo);
+		ret = glusterd_svcs_manager (volinfo);
 		if (ret) {
                         gf_log (this->name, GF_LOG_CRITICAL,
                                 "Failed to generate nfs volume file");

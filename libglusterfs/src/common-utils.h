@@ -166,6 +166,21 @@ int  gf_set_log_ident (cmd_args_t *cmd_args);
                 }                                                       \
         }while (0)
 
+#define GF_CHECK_ALLOC(arg, retval, label)   do {                       \
+                if (!(arg)) {                                           \
+                        retval = -ENOMEM;                               \
+                        goto label;                                     \
+                }                                                       \
+        } while (0)                                                     \
+
+#define GF_CHECK_ALLOC_AND_LOG(name, item, retval, msg, errlabel) do {  \
+                if (!(item)) {                                          \
+                        (retval) = -ENOMEM;                             \
+                        gf_log (name, GF_LOG_CRITICAL, (msg));          \
+                        goto errlabel;                                  \
+                }                                                       \
+        } while (0)
+
 #define GF_ASSERT_AND_GOTO_WITH_ERROR(name, arg, label, errno, error) do { \
                 if (!arg) {                                             \
                         GF_ASSERT (0);                                  \
@@ -580,7 +595,7 @@ int gf_string2uint64_base10 (const char *str, uint64_t *n);
 int gf_string2bytesize (const char *str, uint64_t *n);
 int gf_string2bytesize_size (const char *str, size_t *n);
 int gf_string2bytesize_uint64 (const char *str, uint64_t *n);
-int gf_string2percent_or_bytesize (const char *str, uint64_t *n,
+int gf_string2percent_or_bytesize (const char *str, double *n,
 				   gf_boolean_t *is_percent);
 
 int gf_string2boolean (const char *str, gf_boolean_t *b);
@@ -679,4 +694,7 @@ recursive_rmdir (const char *delete_path);
 
 int
 gf_get_index_by_elem (char **array, char *elem);
+
+int
+glusterfs_is_local_pathinfo (char *pathinfo, gf_boolean_t *local);
 #endif /* _COMMON_UTILS_H */

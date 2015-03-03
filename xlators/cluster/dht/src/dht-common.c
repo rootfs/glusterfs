@@ -28,6 +28,8 @@
 #include <libgen.h>
 #include <signal.h>
 
+int dht_link2 (xlator_t *this, call_frame_t *frame, int op_ret);
+
 int
 dht_aggregate (dict_t *this, char *key, data_t *value, void *data)
 {
@@ -361,9 +363,18 @@ dht_discover_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 unlock:
         UNLOCK (&frame->lock);
 out:
+        /* Make sure, the thread executing dht_discover_complete is the one
+         * which calls STACK_DESTROY (frame). In the case of "attempt_unwind",
+         * this makes sure that the thread don't call dht_frame_return, till
+         * call to dht_discover_complete is done.
+         */
+        if (attempt_unwind) {
+                dht_discover_complete (this, frame);
+        }
+
         this_call_cnt = dht_frame_return (frame);
 
-        if (is_last_call (this_call_cnt) || attempt_unwind) {
+        if (is_last_call (this_call_cnt) && !attempt_unwind) {
                 dht_discover_complete (this, frame);
         }
 
@@ -2853,14 +2864,10 @@ dht_getxattr (call_frame_t *frame, xlator_t *this,
                         op_errno = ENODATA;
                         goto err;
                 }
-                if (hashed_subvol) {
-                        STACK_WIND (frame, dht_linkinfo_getxattr_cbk, hashed_subvol,
-                                    hashed_subvol->fops->getxattr, loc,
-                                    GF_XATTR_PATHINFO_KEY, xdata);
-                        return 0;
-                }
-                op_errno = ENODATA;
-                goto err;
+                STACK_WIND (frame, dht_linkinfo_getxattr_cbk, hashed_subvol,
+                            hashed_subvol->fops->getxattr, loc,
+                            GF_XATTR_PATHINFO_KEY, xdata);
+                return 0;
         }
 
         if (key && (!strcmp (GF_XATTR_MARKER_KEY, key))
@@ -2991,7 +2998,7 @@ dht_fgetxattr (call_frame_t *frame, xlator_t *this,
         if ((fd->inode->ia_type == IA_IFDIR)
 	    && key
             && (strncmp (key, GF_XATTR_LOCKINFO_KEY,
-                         strlen (GF_XATTR_LOCKINFO_KEY) != 0))) {
+                         strlen (GF_XATTR_LOCKINFO_KEY)) != 0)) {
                 cnt = local->call_cnt = layout->cnt;
         } else {
                 cnt = local->call_cnt  = 1;
@@ -3164,8 +3171,9 @@ dht_setxattr (call_frame_t *frame, xlator_t *this,
 
         local->call_cnt = call_cnt = layout->cnt;
 
-        tmp = dict_get (xattr, "distribute.migrate-data");
+        tmp = dict_get (xattr, GF_XATTR_FILE_MIGRATE_KEY);
         if (tmp) {
+
                 if (IA_ISDIR (loc->inode->ia_type)) {
                         op_errno = ENOTSUP;
                         goto err;
@@ -3181,7 +3189,25 @@ dht_setxattr (call_frame_t *frame, xlator_t *this,
                 if (conf->decommission_in_progress)
                         forced_rebalance = GF_DHT_MIGRATE_HARDLINK;
 
-                local->rebalance.target_node = dht_subvol_get_hashed (this, loc);
+                if (!loc->path) {
+                        op_errno = EINVAL;
+                        goto err;
+                }
+
+                if (!local->loc.name)
+                        local->loc.name = strrchr (local->loc.path, '/')+1;
+
+                if (!local->loc.parent)
+                        local->loc.parent =
+                                inode_parent(local->loc.inode, NULL, NULL);
+
+                if ((!local->loc.name) || (!local->loc.parent)) {
+                        op_errno = EINVAL;
+                        goto err;
+                }
+
+                local->rebalance.target_node =
+                        dht_subvol_get_hashed (this, &local->loc);
                 if (!local->rebalance.target_node) {
                         gf_msg (this->name, GF_LOG_ERROR, 0,
                                 DHT_MSG_HASHED_SUBVOL_GET_FAILED,
@@ -3768,6 +3794,12 @@ dht_readdirp_cbk (call_frame_t *frame, void *cookie, xlator_t *this, int op_ret,
 
         list_for_each_entry (orig_entry, (&orig_entries->list), list) {
                 next_offset = orig_entry->d_off;
+
+                if (IA_ISINVAL(orig_entry->d_stat.ia_type)) {
+                        /*stat failed somewhere- ignore this entry*/
+                        continue;
+                }
+
                 if (check_is_dir (NULL, (&orig_entry->d_stat), NULL)) {
 
                 /*Directory entries filtering :
@@ -4471,52 +4503,154 @@ err:
         return 0;
 }
 
-
 int
 dht_link_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
               int op_ret, int op_errno,
               inode_t *inode, struct iatt *stbuf, struct iatt *preparent,
               struct iatt *postparent, dict_t *xdata)
 {
-        call_frame_t *prev = NULL;
-        dht_layout_t *layout = NULL;
         dht_local_t  *local = NULL;
-
-        prev = cookie;
+        int           ret = -1;
+        gf_boolean_t  stbuf_merged = _gf_false;
+        xlator_t     *subvol = NULL;
 
         local = frame->local;
 
-        if (op_ret == -1)
-                goto out;
-
-        layout = dht_layout_for_subvol (this, prev->this);
-        if (!layout) {
-                gf_msg_debug (this->name, 0,
-                              "no pre-set layout for subvolume %s",
-                              prev->this->name);
-                op_ret   = -1;
-                op_errno = EINVAL;
+        if (op_ret == -1) {
+                /* No continuation on DHT inode missing errors, as we should
+                 * then have a good stbuf that states P2 happened. We would
+                 * get inode missing if, the file completed migrated between
+                 * the lookup and the link call */
                 goto out;
         }
 
+        /* Update parent on success, even if P1/2 checks are positve.
+         * The second call on success will further update the parent */
         if (local->loc.parent) {
                 dht_inode_ctx_time_update (local->loc.parent, this,
                                            preparent, 0);
                 dht_inode_ctx_time_update (local->loc.parent, this,
                                            postparent, 1);
         }
-        if (local->linked == _gf_true) {
-                local->stbuf = *stbuf;
+
+        /* Update linkto attrs, if this is the first call and non-P2,
+         * if we detect P2 then we need to trust the attrs from the
+         * second call, not the first */
+        if (local->linked == _gf_true &&
+            ((local->call_cnt == 1 && !IS_DHT_MIGRATION_PHASE2 (stbuf))
+             || (local->call_cnt != 1 &&
+                 IS_DHT_MIGRATION_PHASE2 (&local->stbuf)))) {
+                dht_iatt_merge (this, &local->stbuf, stbuf, NULL);
+                stbuf_merged = _gf_true;
                 dht_linkfile_attr_heal (frame, this);
+        }
+
+        /* No further P1/2 checks if we are in the second iteration of
+         * the call */
+        if (local->call_cnt != 1) {
+                goto out;
+        } else {
+                /* Preserve the return values, in case the migration decides
+                 * to recreate the link on the same subvol that the current
+                 * hased for the link was created on. */
+                dht_iatt_merge (this, &local->preparent,
+                                preparent, NULL);
+                dht_iatt_merge (this, &local->postparent,
+                                postparent, NULL);
+                if (!stbuf_merged) {
+                        dht_iatt_merge (this, &local->stbuf,
+                                        stbuf, NULL);
+                        stbuf_merged = _gf_true;
+                }
+
+                local->inode = inode_ref (inode);
+        }
+
+        local->op_errno = op_errno;
+        local->rebalance.target_op_fn = dht_link2;
+        /* Check if the rebalance phase2 is true */
+        if (IS_DHT_MIGRATION_PHASE2 (stbuf)) {
+                ret = dht_inode_ctx_get1 (this, local->loc.inode, &subvol);
+                if (!subvol) {
+                        /* Phase 2 of migration */
+                        ret = dht_rebalance_complete_check (this, frame);
+                        if (!ret)
+                                return 0;
+                } else {
+                        dht_link2 (this, frame, 0);
+                        return 0;
+                }
+        }
+
+        /* Check if the rebalance phase1 is true */
+        if (IS_DHT_MIGRATION_PHASE1 (stbuf)) {
+                ret = dht_inode_ctx_get1 (this, local->loc.inode, &subvol);
+                if (subvol) {
+                        dht_link2 (this, frame, 0);
+                        return 0;
+                }
+                ret = dht_rebalance_in_progress_check (this, frame);
+                if (!ret)
+                        return 0;
         }
 out:
         DHT_STRIP_PHASE1_FLAGS (stbuf);
-        DHT_STACK_UNWIND (link, frame, op_ret, op_errno, inode, stbuf, preparent,
-                          postparent, NULL);
+
+        DHT_STACK_UNWIND (link, frame, op_ret, op_errno, inode, stbuf,
+                          preparent, postparent, NULL);
 
         return 0;
 }
 
+
+int
+dht_link2 (xlator_t *this, call_frame_t *frame, int op_ret)
+{
+        dht_local_t *local  = NULL;
+        xlator_t    *subvol = NULL;
+        int          op_errno = EINVAL;
+
+        local = frame->local;
+        if (!local)
+                goto err;
+
+        op_errno = local->op_errno;
+        if (op_ret == -1)
+                goto err;
+
+        dht_inode_ctx_get1 (this, local->loc.inode, &subvol);
+        if (!subvol) {
+                subvol = local->cached_subvol;
+                if (!subvol) {
+                        op_errno = EINVAL;
+                        goto err;
+                }
+        }
+
+        /* Second call to create link file could result in EEXIST as the
+         * first call created the linkto in the currently
+         * migrating subvol, which could be the new hashed subvol */
+        if (local->link_subvol == subvol) {
+                DHT_STRIP_PHASE1_FLAGS (&local->stbuf);
+                DHT_STACK_UNWIND (link, frame, 0, 0, local->inode,
+                                  &local->stbuf, &local->preparent,
+                                  &local->postparent, NULL);
+
+                return 0;
+        }
+
+        local->call_cnt = 2;
+
+        STACK_WIND (frame, dht_link_cbk, subvol, subvol->fops->link,
+                    &local->loc, &local->loc2, NULL);
+
+        return 0;
+err:
+        DHT_STACK_UNWIND (link, frame, -1, op_errno, NULL, NULL, NULL,
+                          NULL, NULL);
+
+        return 0;
+}
 
 int
 dht_link_linkfile_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
@@ -4569,6 +4703,7 @@ dht_link (call_frame_t *frame, xlator_t *this,
 
                 goto err;
         }
+        local->call_cnt = 1;
 
         cached_subvol = local->cached_subvol;
         if (!cached_subvol) {
@@ -4816,6 +4951,7 @@ dht_mkdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         int           this_call_cnt = 0;
         int           ret = -1;
         gf_boolean_t subvol_filled = _gf_false;
+        gf_boolean_t dir_exists = _gf_false;
         call_frame_t *prev = NULL;
         dht_layout_t *layout = NULL;
 
@@ -4831,7 +4967,7 @@ dht_mkdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                         ret = dht_layout_merge (this, layout, prev->this,
                                                 -1, ENOSPC, NULL);
                 } else {
-			if (op_ret == -1 && op_errno == EEXIST)
+			if (op_ret == -1 && op_errno == EEXIST) {
 				/* Very likely just a race between mkdir and
 				   self-heal (from lookup of a concurrent mkdir
 				   attempt).
@@ -4840,6 +4976,8 @@ dht_mkdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 				   pre-existing different directory.
 				*/
 				op_ret = 0;
+                                dir_exists = _gf_true;
+                        }
                         ret = dht_layout_merge (this, layout, prev->this,
                                                 op_ret, op_errno, NULL);
                 }
@@ -4853,6 +4991,14 @@ dht_mkdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                         local->op_errno = op_errno;
                         goto unlock;
                 }
+
+                if (dir_exists)
+                        goto unlock;
+
+                dht_iatt_merge (this, &local->stbuf, stbuf, prev->this);
+                dht_iatt_merge (this, &local->preparent, preparent, prev->this);
+                dht_iatt_merge (this, &local->postparent, postparent,
+                                prev->this);
         }
 unlock:
         UNLOCK (&frame->lock);
@@ -4941,7 +5087,7 @@ err:
 }
 
 
- int
+int
 dht_mkdir (call_frame_t *frame, xlator_t *this,
            loc_t *loc, mode_t mode, mode_t umask, dict_t *params)
 {
@@ -5976,6 +6122,9 @@ dht_notify (xlator_t *this, int event, void *data, ...)
                 }
                 UNLOCK (&conf->subvolume_lock);
 
+                for (i = 0; i < conf->subvolume_cnt; i++)
+                        if (conf->last_event[i] != event)
+                                event = GF_EVENT_CHILD_MODIFIED;
                 break;
 
         case GF_EVENT_CHILD_CONNECTING:

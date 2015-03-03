@@ -291,6 +291,22 @@ ssl_do (rpc_transport_t *this, void *buf, size_t len, SSL_trinary_func *func)
 		case SSL_ERROR_NONE:
 			return r;
 		case SSL_ERROR_WANT_READ:
+                        /* If we are attempting to connect/accept then we
+                         * should wait here on the poll, for the SSL
+                         * (re)negotiation to complete, else we would error out
+                         * on the accept/connect.
+                         * If we are here when attempting to read/write
+                         * then we return r (or -1) as the socket is always
+                         * primed for the read event, and it would eventually
+                         * call one of the SSL routines */
+                        /* NOTE: Only way to determine this is a accept/connect
+                         * is to examine buf or func, which is not very
+                         * clean */
+                        if ((func == (SSL_trinary_func *)SSL_read)
+                            || (func == (SSL_trinary_func *) SSL_write)) {
+                                return r;
+                        }
+
 			pfd.fd = priv->sock;
 			pfd.events = POLLIN;
 			if (poll(&pfd,1,-1) < 0) {
@@ -394,10 +410,12 @@ done:
 static void
 ssl_teardown_connection (socket_private_t *priv)
 {
-        SSL_shutdown(priv->ssl_ssl);
-        SSL_clear(priv->ssl_ssl);
-        SSL_free(priv->ssl_ssl);
-        priv->ssl_ssl = NULL;
+        if (priv->ssl_ssl) {
+                SSL_shutdown(priv->ssl_ssl);
+                SSL_clear(priv->ssl_ssl);
+                SSL_free(priv->ssl_ssl);
+                priv->ssl_ssl = NULL;
+        }
         priv->use_ssl = _gf_false;
 }
 
@@ -560,12 +578,19 @@ __socket_rwv (rpc_transport_t *this, struct iovec *vector, int count,
                         --opcount;
                         continue;
                 }
-                if (write) {
+                if (priv->use_ssl && !priv->ssl_ssl) {
+                        /*
+                         * We could end up here with priv->ssl_ssl still NULL
+                         * if (a) the connection failed and (b) some fool
+                         * called other socket functions anyway.  Demoting to
+                         * non-SSL might be insecure, so just fail it outright.
+                         */
+                        ret = -1;
+                } else if (write) {
 			if (priv->use_ssl) {
-				ret = ssl_write_one(this,
-					opvector->iov_base, opvector->iov_len);
-			}
-			else {
+                                ret = ssl_write_one (this, opvector->iov_base,
+                                                     opvector->iov_len);
+			} else {
 				ret = writev (sock, opvector, IOV_MIN(opcount));
 			}
 
@@ -611,7 +636,7 @@ __socket_rwv (rpc_transport_t *this, struct iovec *vector, int count,
                                         strerror (errno));
                         }
 
-			if (priv->use_ssl) {
+			if (priv->use_ssl && priv->ssl_ssl) {
 				ssl_dump_error_stack(this->name);
 			}
                         opcount = -1;
@@ -935,9 +960,8 @@ __socket_reset (rpc_transport_t *this)
 
         memset (&priv->incoming, 0, sizeof (priv->incoming));
 
-        event_unregister (this->ctx->event_pool, priv->sock, priv->idx);
+        event_unregister_close (this->ctx->event_pool, priv->sock, priv->idx);
 
-        close (priv->sock);
         priv->sock = -1;
         priv->idx = -1;
         priv->connected = -1;
@@ -1880,6 +1904,7 @@ __socket_read_reply (rpc_transport_t *this)
                 /* release priv->lock, so as to avoid deadlock b/w conn->lock
                  * and priv->lock, since we are doing an upcall here.
                  */
+                frag->state = SP_STATE_NOTIFYING_XID;
                 pthread_mutex_unlock (&priv->lock);
                 {
                         ret = rpc_transport_notify (this,
@@ -1887,6 +1912,9 @@ __socket_read_reply (rpc_transport_t *this)
                                                     in->request_info);
                 }
                 pthread_mutex_lock (&priv->lock);
+
+                /* Transition back to externally visible state. */
+                frag->state = SP_STATE_READ_MSGTYPE;
 
                 if (ret == -1) {
                         gf_log (this->name, GF_LOG_WARNING,
@@ -1975,6 +2003,14 @@ __socket_read_frag (rpc_transport_t *this)
                 }
 
                 break;
+
+        case SP_STATE_NOTIFYING_XID:
+                /* Another epoll thread is notifying higher layers
+                 *of reply's xid. */
+                errno = EAGAIN;
+                return -1;
+                break;
+
         }
 
 out:
@@ -2227,9 +2263,9 @@ socket_event_poll_in (rpc_transport_t *this)
         rpc_transport_pollin_t *pollin = NULL;
         socket_private_t       *priv = this->private;
 
-        ret = socket_proto_state_machine (this, &pollin);
+	ret = socket_proto_state_machine (this, &pollin);
 
-        if (pollin != NULL) {
+	if (pollin) {
                 priv->ot_state = OT_CALLBACK;
                 ret = rpc_transport_notify (this, RPC_TRANSPORT_MSG_RECEIVED,
                                             pollin);
@@ -3050,7 +3086,6 @@ handler:
                         if (priv->own_thread) {
                                 close(priv->sock);
                                 priv->sock = -1;
-                                goto unlock;
                         }
                         else {
                                 /* Ignore error from connect. epoll events

@@ -22,12 +22,17 @@
 #include "xdr-generic.h"
 #include "glusterd.h"
 #include "glusterd-op-sm.h"
+#include "glusterd-geo-rep.h"
 #include "glusterd-store.h"
 #include "glusterd-utils.h"
 #include "glusterd-volgen.h"
 #include "glusterd-messages.h"
 #include "run.h"
 #include "glusterd-snapshot-utils.h"
+#include "glusterd-svc-mgmt.h"
+#include "glusterd-svc-helper.h"
+#include "glusterd-shd-svc.h"
+#include "glusterd-snapd-svc.h"
 
 #include <stdint.h>
 #include <sys/socket.h>
@@ -38,9 +43,6 @@
 
 #define glusterd_op_start_volume_args_get(dict, volname, flags) \
         glusterd_op_stop_volume_args_get (dict, volname, flags)
-
-extern int
-_get_slave_status (dict_t *this, char *key, data_t *value, void *data);
 
 gf_ai_compare_t
 glusterd_compare_addrinfo (struct addrinfo *first, struct addrinfo *next)
@@ -88,6 +90,7 @@ glusterd_check_brick_order(dict_t *dict, char *err_str)
         char            *brick          = NULL;
         char            *brick_list     = NULL;
         char            *brick_list_dup = NULL;
+        char            *brick_list_ptr = NULL;
         char            *tmpptr         = NULL;
         char            *volname        = NULL;
         int32_t         brick_count     = 0;
@@ -160,12 +163,12 @@ glusterd_check_brick_order(dict_t *dict, char *err_str)
                         " found. Checking brick order.");
         }
 
-        brick_list_dup = gf_strdup(brick_list);
+        brick_list_dup = brick_list_ptr = gf_strdup(brick_list);
         /* Resolve hostnames and get addrinfo */
         while (i < brick_count) {
                 ++i;
                 brick = strtok_r (brick_list_dup, " \n", &tmpptr);
-                brick_list = tmpptr;
+                brick_list_dup = tmpptr;
                 if (brick == NULL)
                         goto check_failed;
                 brick = strtok_r (brick, ":", &tmpptr);
@@ -234,7 +237,7 @@ found_bad_brick_order:
         ret = -1;
 out:
         ai_list_tmp2 = NULL;
-        GF_FREE (brick_list_dup);
+        GF_FREE (brick_list_ptr);
         list_for_each_entry (ai_list_tmp1, &ai_list->list, list) {
                 if (ai_list_tmp1->info)
                           freeaddrinfo (ai_list_tmp1->info);
@@ -1451,7 +1454,6 @@ glusterd_op_stage_stop_volume (dict_t *dict, char **op_errstr)
         char                                    *volname = NULL;
         int                                     flags = 0;
         gf_boolean_t                            exists = _gf_false;
-        gf_boolean_t                            is_run = _gf_false;
         glusterd_volinfo_t                      *volinfo = NULL;
         char                                    msg[2048] = {0};
         xlator_t                                *this = NULL;
@@ -1495,33 +1497,11 @@ glusterd_op_stage_stop_volume (dict_t *dict, char **op_errstr)
                 ret = -1;
                 goto out;
         }
-        ret = glusterd_check_gsync_running (volinfo, &is_run);
-        if (ret && (is_run == _gf_false))
-                gf_log (this->name, GF_LOG_WARNING, "Unable to get the status"
-                        " of active "GEOREP" session");
 
+        /* If geo-rep is configured, for this volume, it should be stopped. */
         param.volinfo = volinfo;
-        ret = dict_foreach (volinfo->gsync_slaves, _get_slave_status, &param);
-
-        if (ret) {
-                gf_log (this->name, GF_LOG_WARNING, "_get_slave_satus failed");
-                snprintf (msg, sizeof(msg), GEOREP" Unable to get the status "
-                          "of active "GEOREP" session for the volume '%s'.\n"
-                          "Please check the log file for more info. Use "
-                          "'force' option to ignore and stop the volume.",
-                          volname);
-                ret = -1;
-                goto out;
-        }
-
-        if (is_run && param.is_active) {
-                gf_log (this->name, GF_LOG_WARNING, GEOREP" sessions active "
-                        "for the volume %s ", volname);
-                snprintf (msg, sizeof(msg), GEOREP" sessions are active "
-                          "for the volume '%s'.\nUse 'volume "GEOREP" "
-                          "status' command for more info. Use 'force' "
-                          "option to ignore and stop the volume.",
-                          volname);
+        ret = glusterd_check_geo_rep_running (&param, op_errstr);
+        if (ret || param.is_active) {
                 ret = -1;
                 goto out;
         }
@@ -1641,6 +1621,8 @@ glusterd_op_stage_heal_volume (dict_t *dict, char **op_errstr)
         xlator_t                                *this = NULL;
 
         this = THIS;
+        GF_ASSERT (this);
+
         priv = this->private;
         if (!priv) {
                 ret = -1;
@@ -1728,7 +1710,7 @@ glusterd_op_stage_heal_volume (dict_t *dict, char **op_errstr)
                 case GF_AFR_OP_STATISTICS_HEAL_COUNT_PER_REPLICA:
                         break;
                 default:
-                        if (!glusterd_is_nodesvc_online("glustershd")){
+                        if (!priv->shd_svc.online) {
                                 ret = -1;
                                 *op_errstr = gf_strdup ("Self-heal daemon is "
                                                 "not running. Check self-heal "
@@ -2157,6 +2139,12 @@ glusterd_op_create_volume (dict_t *dict, char **op_errstr)
 
         volinfo->caps = caps;
 
+        ret = glusterd_snapdsvc_init (volinfo);
+        if (ret) {
+                *op_errstr = gf_strdup ("Failed to initialize snapd service");
+                goto out;
+        }
+
         ret = glusterd_store_volinfo (volinfo, GLUSTERD_VOLINFO_VER_AC_INCREMENT);
         if (ret) {
                 glusterd_store_delete_volume (volinfo);
@@ -2242,6 +2230,7 @@ glusterd_op_start_volume (dict_t *dict, char **op_errstr)
         glusterd_brickinfo_t       *brickinfo       = NULL;
         xlator_t                   *this            = NULL;
         glusterd_conf_t            *conf            = NULL;
+        glusterd_svc_t             *svc             = NULL;
 
         this = THIS;
         GF_ASSERT (this);
@@ -2290,11 +2279,14 @@ glusterd_op_start_volume (dict_t *dict, char **op_errstr)
         if (ret)
                 goto out;
 
-        ret = glusterd_handle_snapd_option (volinfo);
-        if (ret)
-                goto out;
+        if (!volinfo->is_snap_volume) {
+                svc = &(volinfo->snapd.svc);
+                ret = svc->manager (svc, volinfo, PROC_START_NO_WAIT);
+                if (ret)
+                        goto out;
+        }
 
-        ret = glusterd_nodesvcs_handle_graph_change (volinfo);
+        ret = glusterd_svcs_manager (volinfo);
 
 out:
         gf_log (this->name, GF_LOG_TRACE, "returning %d ", ret);
@@ -2309,6 +2301,7 @@ glusterd_stop_volume (glusterd_volinfo_t *volinfo)
         char                    mountdir[PATH_MAX]      = {0,};
         char                    pidfile[PATH_MAX]       = {0,};
         xlator_t                *this                   = NULL;
+        glusterd_svc_t          *svc                    = NULL;
 
         this = THIS;
         GF_ASSERT (this);
@@ -2350,11 +2343,14 @@ glusterd_stop_volume (glusterd_volinfo_t *volinfo)
                                 mountdir, strerror (errno));
         }
 
-        ret = glusterd_handle_snapd_option (volinfo);
-        if (ret)
-                goto out;
+        if (!volinfo->is_snap_volume) {
+                svc = &(volinfo->snapd.svc);
+                ret = svc->manager (svc, volinfo, PROC_START_NO_WAIT);
+                if (ret)
+                        goto out;
+        }
 
-        ret = glusterd_nodesvcs_handle_graph_change (volinfo);
+        ret = glusterd_svcs_manager (volinfo);
         if (ret) {
                 gf_log (this->name, GF_LOG_ERROR, "Failed to notify graph "
                         "change for %s volume", volinfo->volname);

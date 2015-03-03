@@ -232,6 +232,16 @@ void ec_fop_set_error(ec_fop_data_t * fop, int32_t error)
     UNLOCK(&fop->lock);
 }
 
+void ec_sleep(ec_fop_data_t *fop)
+{
+    LOCK(&fop->lock);
+
+    fop->refs++;
+    fop->jobs++;
+
+    UNLOCK(&fop->lock);
+}
+
 int32_t ec_check_complete(ec_fop_data_t * fop, ec_resume_f resume)
 {
     int32_t error = -1;
@@ -435,12 +445,7 @@ int32_t ec_child_select(ec_fop_data_t * fop)
         return 0;
     }
 
-    LOCK(&fop->lock);
-
-    fop->jobs++;
-    fop->refs++;
-
-    UNLOCK(&fop->lock);
+    ec_sleep(fop);
 
     return 1;
 }
@@ -637,22 +642,23 @@ int32_t ec_lock_compare(ec_lock_t * lock1, ec_lock_t * lock2)
 ec_lock_link_t *ec_lock_insert(ec_fop_data_t *fop, ec_lock_t *lock,
                                int32_t update)
 {
-    ec_lock_t * tmp;
+    ec_lock_t *new_lock, *tmp;
     ec_lock_link_t *link = NULL;
     int32_t tmp_update;
 
+    new_lock = lock;
     if ((fop->lock_count > 0) &&
-        (ec_lock_compare(fop->locks[0].lock, lock) > 0))
+        (ec_lock_compare(fop->locks[0].lock, new_lock) > 0))
     {
         tmp = fop->locks[0].lock;
-        fop->locks[0].lock = lock;
-        lock = tmp;
+        fop->locks[0].lock = new_lock;
+        new_lock = tmp;
 
         tmp_update = fop->locks_update;
         fop->locks_update = update;
         update = tmp_update;
     }
-    fop->locks[fop->lock_count].lock = lock;
+    fop->locks[fop->lock_count].lock = new_lock;
     fop->locks[fop->lock_count].fop = fop;
 
     fop->locks_update |= update << fop->lock_count;
@@ -692,6 +698,16 @@ void ec_lock_prepare_entry(ec_fop_data_t *fop, loc_t *loc, int32_t update)
             ec_fop_set_error(fop, EIO);
 
             return;
+        }
+
+        /* If there's another lock, make sure that it's not the same. Otherwise
+         * do not insert it.
+         *
+         * This can only happen on renames where source and target names are
+         * in the same directory. */
+        if ((fop->lock_count > 0) &&
+            (fop->locks[0].lock->loc.inode == tmp.inode)) {
+            goto wipe;
         }
     } else {
         if (ec_loc_from_loc(fop->xl, &tmp, loc) != 0) {
@@ -742,6 +758,7 @@ insert:
 unlock:
     UNLOCK(&tmp.inode->lock);
 
+wipe:
     loc_wipe(&tmp);
 
     if (link != NULL) {
@@ -870,12 +887,7 @@ void ec_lock(ec_fop_data_t * fop)
 
             list_add_tail(&fop->locks[fop->locked].wait_list, &lock->waiting);
 
-            LOCK(&fop->lock);
-
-            fop->jobs++;
-            fop->refs++;
-
-            UNLOCK(&fop->lock);
+            ec_sleep(fop);
 
             UNLOCK(&lock->loc.inode->lock);
 
@@ -924,78 +936,77 @@ void ec_lock(ec_fop_data_t * fop)
     }
 }
 
+gf_boolean_t
+ec_config_check (ec_fop_data_t *fop, dict_t *xdata)
+{
+    ec_t *ec;
+
+    if (ec_dict_del_config(xdata, EC_XATTR_CONFIG, &fop->config) < 0) {
+        gf_log(fop->xl->name, GF_LOG_ERROR, "Failed to get a valid "
+                                            "config");
+
+        ec_fop_set_error(fop, EIO);
+
+        return _gf_false;
+    }
+
+    ec = fop->xl->private;
+    if ((fop->config.version != EC_CONFIG_VERSION) ||
+        (fop->config.algorithm != EC_CONFIG_ALGORITHM) ||
+        (fop->config.gf_word_size != EC_GF_BITS) ||
+        (fop->config.bricks != ec->nodes) ||
+        (fop->config.redundancy != ec->redundancy) ||
+        (fop->config.chunk_size != EC_METHOD_CHUNK_SIZE)) {
+        uint32_t data_bricks;
+
+        /* This combination of version/algorithm requires the following
+           values. Incorrect values for these fields are a sign of
+           corruption:
+
+             redundancy > 0
+             redundancy * 2 < bricks
+             gf_word_size must be a power of 2
+             chunk_size (in bits) must be a multiple of gf_word_size *
+                 (bricks - redundancy) */
+
+        data_bricks = fop->config.bricks - fop->config.redundancy;
+        if ((fop->config.redundancy < 1) ||
+            (fop->config.redundancy * 2 >= fop->config.bricks) ||
+            !ec_is_power_of_2(fop->config.gf_word_size) ||
+            ((fop->config.chunk_size * 8) % (fop->config.gf_word_size *
+                                             data_bricks) != 0)) {
+            gf_log(fop->xl->name, GF_LOG_ERROR, "Invalid or corrupted config");
+        } else {
+            gf_log(fop->xl->name, GF_LOG_ERROR, "Unsupported config "
+                                                "(V=%u, A=%u, W=%u, "
+                                                "N=%u, R=%u, S=%u)",
+                   fop->config.version, fop->config.algorithm,
+                   fop->config.gf_word_size, fop->config.bricks,
+                   fop->config.redundancy, fop->config.chunk_size);
+        }
+
+        ec_fop_set_error(fop, EIO);
+
+        return _gf_false;
+    }
+
+    return _gf_true;
+}
+
 int32_t ec_get_size_version_set(call_frame_t * frame, void * cookie,
                                 xlator_t * this, int32_t op_ret,
                                 int32_t op_errno, inode_t * inode,
                                 struct iatt * buf, dict_t * xdata,
                                 struct iatt * postparent)
 {
-    ec_t * ec;
     ec_fop_data_t * fop = cookie;
     ec_inode_t * ctx;
     ec_lock_t *lock = NULL;
 
     if (op_ret >= 0)
     {
-        if (buf->ia_type == IA_IFREG)
-        {
-            if (ec_dict_del_config(xdata, EC_XATTR_CONFIG, &fop->config) < 0)
-            {
-                gf_log(this->name, GF_LOG_ERROR, "Failed to get a valid "
-                                                 "config");
-
-                ec_fop_set_error(fop, EIO);
-
-                return 0;
-            }
-            ec = this->private;
-            if ((fop->config.version != EC_CONFIG_VERSION) ||
-                (fop->config.algorithm != EC_CONFIG_ALGORITHM) ||
-                (fop->config.gf_word_size != EC_GF_BITS) ||
-                (fop->config.bricks != ec->nodes) ||
-                (fop->config.redundancy != ec->redundancy) ||
-                (fop->config.chunk_size != EC_METHOD_CHUNK_SIZE))
-            {
-                uint32_t data_bricks;
-
-                // This combination of version/algorithm requires the following
-                // values. Incorrect values for these fields are a sign of
-                // corruption:
-                //
-                //   redundancy > 0
-                //   redundancy * 2 < bricks
-                //   gf_word_size must be a power of 2
-                //   chunk_size (in bits) must be a multiple of gf_word_size *
-                //       (bricks - redundancy)
-
-                data_bricks = fop->config.bricks - fop->config.redundancy;
-                if ((fop->config.redundancy < 1) ||
-                    (fop->config.redundancy * 2 >= fop->config.bricks) ||
-                    !ec_is_power_of_2(fop->config.gf_word_size) ||
-                    ((fop->config.chunk_size * 8) % (fop->config.gf_word_size *
-                                                     data_bricks) != 0))
-                {
-                    gf_log(this->name, GF_LOG_ERROR, "Invalid or corrupted "
-                                                     "config (V=%u, A=%u, "
-                                                     "W=%u, N=%u, R=%u, S=%u)",
-                           fop->config.version, fop->config.algorithm,
-                           fop->config.gf_word_size, fop->config.bricks,
-                           fop->config.redundancy, fop->config.chunk_size);
-                }
-                else
-                {
-                    gf_log(this->name, GF_LOG_ERROR, "Unsupported config "
-                                                     "(V=%u, A=%u, W=%u, "
-                                                     "N=%u, R=%u, S=%u)",
-                           fop->config.version, fop->config.algorithm,
-                           fop->config.gf_word_size, fop->config.bricks,
-                           fop->config.redundancy, fop->config.chunk_size);
-                }
-
-                ec_fop_set_error(fop, EIO);
-
-                return 0;
-            }
+        if ((buf->ia_type == IA_IFREG) && !ec_config_check(fop, xdata)) {
+            return 0;
         }
 
         LOCK(&inode->lock);
@@ -1041,6 +1052,58 @@ int32_t ec_get_size_version_set(call_frame_t * frame, void * cookie,
     return 0;
 }
 
+int32_t ec_prepare_update_cbk(call_frame_t *frame, void *cookie,
+                              xlator_t *this, int32_t op_ret, int32_t op_errno,
+                              dict_t *dict, dict_t *xdata)
+{
+    ec_fop_data_t *fop = cookie, *parent;
+    ec_lock_t *lock = NULL;
+
+    if (op_ret >= 0) {
+        parent = fop->parent;
+        while ((parent != NULL) && (parent->locks[0].lock == NULL)) {
+            parent = parent->parent;
+        }
+        if (parent == NULL) {
+            return 0;
+        }
+
+        lock = parent->locks[0].lock;
+        lock->is_dirty = _gf_true;
+
+        if (!ec_config_check(fop, dict)) {
+            return 0;
+        }
+
+        LOCK(&lock->loc.inode->lock);
+
+        if ((ec_dict_del_number(dict, EC_XATTR_VERSION, &lock->version) != 0) ||
+            (ec_dict_del_number(dict, EC_XATTR_SIZE, &lock->size) != 0)) {
+            UNLOCK(&lock->loc.inode->lock);
+
+            ec_fop_set_error(fop, EIO);
+
+            return 0;
+        }
+
+        lock->have_size = 1;
+
+        UNLOCK(&lock->loc.inode->lock);
+
+        fop->parent->mask &= fop->good;
+
+        fop->parent->pre_size = fop->parent->post_size = lock->size;
+        fop->parent->have_size = 1;
+    } else {
+        gf_log(this->name, GF_LOG_WARNING,
+               "Failed to get size and version (error %d: %s)", op_errno,
+               strerror (op_errno));
+        ec_fop_set_error(fop, op_errno);
+    }
+
+    return 0;
+}
+
 void ec_get_size_version(ec_fop_data_t * fop)
 {
     loc_t loc;
@@ -1073,7 +1136,8 @@ void ec_get_size_version(ec_fop_data_t * fop)
     }
     if ((dict_set_uint64(xdata, EC_XATTR_VERSION, 0) != 0) ||
         (dict_set_uint64(xdata, EC_XATTR_SIZE, 0) != 0) ||
-        (dict_set_uint64(xdata, EC_XATTR_CONFIG, 0) != 0))
+        (dict_set_uint64(xdata, EC_XATTR_CONFIG, 0) != 0) ||
+        (dict_set_uint64(xdata, EC_XATTR_DIRTY, 0) != 0))
     {
         goto out;
     }
@@ -1129,7 +1193,84 @@ out:
         dict_unref(xdata);
     }
 
-    ec_fop_set_error(fop, error);
+    if (error != 0) {
+        ec_fop_set_error(fop, error);
+    }
+}
+
+void ec_prepare_update(ec_fop_data_t *fop)
+{
+    loc_t loc;
+    dict_t *xdata;
+    ec_fop_data_t *tmp;
+    ec_lock_t *lock;
+    uid_t uid;
+    gid_t gid;
+    int32_t error = ENOMEM;
+
+    tmp = fop;
+    while ((tmp != NULL) && (tmp->locks[0].lock == NULL)) {
+        tmp = tmp->parent;
+    }
+    if ((tmp != NULL) && tmp->locks[0].lock->is_dirty) {
+        lock = tmp->locks[0].lock;
+
+        fop->pre_size = fop->post_size = lock->size;
+        fop->have_size = 1;
+
+        return;
+    }
+
+    memset(&loc, 0, sizeof(loc));
+
+    xdata = dict_new();
+    if (xdata == NULL) {
+        goto out;
+    }
+    if ((ec_dict_set_number(xdata, EC_XATTR_VERSION, 0) != 0) ||
+        (ec_dict_set_number(xdata, EC_XATTR_SIZE, 0) != 0) ||
+        (ec_dict_set_number(xdata, EC_XATTR_CONFIG, 0) != 0) ||
+        (ec_dict_set_number(xdata, EC_XATTR_DIRTY, 1) != 0)) {
+        goto out;
+    }
+
+    uid = fop->frame->root->uid;
+    gid = fop->frame->root->gid;
+
+    fop->frame->root->uid = 0;
+    fop->frame->root->gid = 0;
+
+    error = EIO;
+
+    if (!fop->use_fd) {
+        if (ec_loc_from_loc(fop->xl, &loc, &fop->loc[0]) != 0) {
+            goto out;
+        }
+
+        ec_xattrop(fop->frame, fop->xl, fop->mask, fop->minimum,
+                   ec_prepare_update_cbk, NULL, &loc, GF_XATTROP_ADD_ARRAY64,
+                   xdata, NULL);
+    } else {
+        ec_fxattrop(fop->frame, fop->xl, fop->mask, fop->minimum,
+                   ec_prepare_update_cbk, NULL, fop->fd,
+                   GF_XATTROP_ADD_ARRAY64, xdata, NULL);
+    }
+
+    fop->frame->root->uid = uid;
+    fop->frame->root->gid = gid;
+
+    error = 0;
+
+out:
+    loc_wipe(&loc);
+
+    if (xdata != NULL) {
+        dict_unref(xdata);
+    }
+
+    if (error != 0) {
+        ec_fop_set_error(fop, error);
+    }
 }
 
 int32_t ec_unlocked(call_frame_t *frame, void *cookie, xlator_t *this,
@@ -1209,7 +1350,7 @@ int32_t ec_update_size_version_done(call_frame_t * frame, void * cookie,
 }
 
 void ec_update_size_version(ec_fop_data_t *fop, loc_t *loc, uint64_t version,
-                            uint64_t size, ec_lock_t *lock)
+                            uint64_t size, gf_boolean_t dirty, ec_lock_t *lock)
 {
     dict_t * dict;
     uid_t uid;
@@ -1222,7 +1363,8 @@ void ec_update_size_version(ec_fop_data_t *fop, loc_t *loc, uint64_t version,
         return;
     }
 
-    ec_trace("UPDATE", fop, "version=%ld, size=%ld", version, size);
+    ec_trace("UPDATE", fop, "version=%ld, size=%ld, dirty=%u", version, size,
+             dirty);
 
     dict = dict_new();
     if (dict == NULL)
@@ -1230,14 +1372,18 @@ void ec_update_size_version(ec_fop_data_t *fop, loc_t *loc, uint64_t version,
         goto out;
     }
 
-    if (ec_dict_set_number(dict, EC_XATTR_VERSION, version) != 0)
-    {
-        goto out;
+    if (version != 0) {
+        if (ec_dict_set_number(dict, EC_XATTR_VERSION, version) != 0) {
+            goto out;
+        }
     }
-    if (size != 0)
-    {
-        if (ec_dict_set_number(dict, EC_XATTR_SIZE, size) != 0)
-        {
+    if (size != 0) {
+        if (ec_dict_set_number(dict, EC_XATTR_SIZE, size) != 0) {
+            goto out;
+        }
+    }
+    if (dirty) {
+        if (ec_dict_set_number(dict, EC_XATTR_DIRTY, -1) != 0) {
             goto out;
         }
     }
@@ -1274,9 +1420,9 @@ void ec_unlock_now(ec_fop_data_t *fop, ec_lock_t *lock)
 {
     ec_trace("UNLOCK_NOW", fop, "lock=%p", lock);
 
-    if (lock->version_delta != 0) {
+    if ((lock->version_delta != 0) || lock->is_dirty) {
         ec_update_size_version(fop, &lock->loc, lock->version_delta,
-                               lock->size_delta, lock);
+                               lock->size_delta, lock->is_dirty, lock);
     } else {
         ec_unlock_lock(fop, lock);
     }
@@ -1332,12 +1478,7 @@ void ec_unlock_timer_add(ec_lock_link_t *link)
         delay.tv_sec = 1;
         delay.tv_nsec = 0;
 
-        LOCK(&fop->lock);
-
-        fop->jobs++;
-        fop->refs++;
-
-        UNLOCK(&fop->lock);
+        ec_sleep(fop);
 
         /* If healing is needed, do not delay lock release to let self-heal
          * start working as soon as possible. */
@@ -1356,6 +1497,7 @@ void ec_unlock_timer_add(ec_lock_link_t *link)
                 refs = 0;
             }
         } else {
+            ec_trace("UNLOCK_FORCE", fop, "lock=%p", lock);
             *lock->plock = NULL;
             refs = 0;
         }
@@ -1405,7 +1547,8 @@ void ec_flush_size_version(ec_fop_data_t * fop)
 
     if (version > 0)
     {
-        ec_update_size_version(fop, &lock->loc, version, delta, NULL);
+        ec_update_size_version(fop, &lock->loc, version, delta, _gf_false,
+                               NULL);
     }
 }
 

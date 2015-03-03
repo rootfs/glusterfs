@@ -25,6 +25,7 @@
 #include "statedump.h"
 #include "defaults.h"
 #include "authenticate.h"
+#include "event.h"
 
 void
 grace_time_handler (void *data)
@@ -674,6 +675,18 @@ out:
 }
 
 int
+server_check_event_threads (xlator_t *this, server_conf_t *conf, int32_t old,
+                            int32_t new)
+{
+        if (old == new)
+                return 0;
+
+        conf->event_threads = new;
+        return event_reconfigure_threads (this->ctx->event_pool,
+                                          conf->event_threads);
+}
+
+int
 reconfigure (xlator_t *this, dict_t *options)
 {
 
@@ -686,6 +699,7 @@ reconfigure (xlator_t *this, dict_t *options)
         int                       ret = 0;
         char                     *statedump_path = NULL;
         xlator_t                 *xl     = NULL;
+        int32_t                   new_nthread = 0;
 
         conf = this->private;
 
@@ -693,6 +707,7 @@ reconfigure (xlator_t *this, dict_t *options)
                 gf_log_callingfn (this->name, GF_LOG_DEBUG, "conf == null!!!");
                 goto out;
         }
+
         if (dict_get_int32 ( options, "inode-lru-limit", &inode_lru_limit) == 0){
                 conf->inode_lru_limit = inode_lru_limit;
                 gf_log (this->name, GF_LOG_TRACE, "Reconfigured inode-lru-limit"
@@ -790,6 +805,13 @@ reconfigure (xlator_t *this, dict_t *options)
                                         "Reconfigure not found for transport" );
                 }
         }
+
+        GF_OPTION_RECONF ("event-threads", new_nthread, options, int32, out);
+        ret = server_check_event_threads (this, conf, conf->event_threads,
+                                          new_nthread);
+        if (ret)
+                goto out;
+
         ret = server_init_grace_timer (this, options, conf);
 
 out:
@@ -823,7 +845,10 @@ init (xlator_t *this)
         int32_t            ret      = -1;
         server_conf_t     *conf     = NULL;
         rpcsvc_listener_t *listener = NULL;
+        char              *transport_type = NULL;
         char              *statedump_path = NULL;
+        int               total_transport = 0;
+
         GF_VALIDATE_OR_GOTO ("init", this, out);
 
         if (this->children == NULL) {
@@ -845,6 +870,13 @@ init (xlator_t *this)
 
         INIT_LIST_HEAD (&conf->xprt_list);
         pthread_mutex_init (&conf->mutex, NULL);
+
+         /* Set event threads to the configured default */
+        GF_OPTION_INIT("event-threads", conf->event_threads, int32, out);
+        ret = server_check_event_threads (this, conf, STARTING_EVENT_THREADS,
+                                          conf->event_threads);
+        if (ret)
+                goto out;
 
         ret = server_init_grace_timer (this, this->options, conf);
         if (ret)
@@ -927,6 +959,20 @@ init (xlator_t *this)
          */
         this->ctx->secure_srvr = MGMT_SSL_COPY_IO;
 
+        ret = dict_get_str (this->options, "transport-type", &transport_type);
+        if (ret) {
+                gf_log (this->name, GF_LOG_ERROR,
+                        "option transport-type not set");
+                ret = -1;
+                goto out;
+        }
+        total_transport = rpc_transport_count (transport_type);
+        if (total_transport <= 0) {
+                gf_log (this->name, GF_LOG_ERROR,
+                        "failed to get total number of available tranpsorts");
+                ret = -1;
+                goto out;
+        }
         ret = rpcsvc_create_listeners (conf->rpc, this->options,
                                        this->name);
         if (ret < 1) {
@@ -934,6 +980,10 @@ init (xlator_t *this)
                         "creation of listener failed");
                 ret = -1;
                 goto out;
+        } else if (ret < total_transport) {
+                gf_log (this->name, GF_LOG_ERROR,
+                        "creation of %d listeners failed, continuing with "
+                        "succeeded transport", (total_transport - ret));
         }
 
         ret = rpcsvc_register_notify (conf->rpc, server_rpc_notify, this);
@@ -1144,7 +1194,7 @@ struct volume_options options[] = {
           .type          = GF_OPTION_TYPE_PATH,
           .default_value = DEFAULT_VAR_RUN_DIRECTORY,
           .description = "Specifies directory in which gluster should save its"
-                         " statedumps. By default it is the /tmp directory"
+                         " statedumps."
         },
         { .key   = {"lk-heal"},
           .type  = GF_OPTION_TYPE_BOOL,
@@ -1198,6 +1248,16 @@ struct volume_options options[] = {
           .type = GF_OPTION_TYPE_INT,
           .default_value = "2",
           .description = "Timeout in seconds for the cached groups to expire."
+        },
+        { .key   = {"event-threads"},
+          .type  = GF_OPTION_TYPE_INT,
+          .min   = 1,
+          .max   = 32,
+          .default_value = "2",
+          .description = "Specifies the number of event threads to execute in"
+                         "in parallel. Larger values would help process"
+                         " responses faster, depending on available processing"
+                         " power. Range 1-32 threads."
         },
 
         { .key   = {NULL} },

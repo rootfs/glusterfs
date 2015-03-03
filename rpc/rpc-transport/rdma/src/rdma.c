@@ -15,6 +15,7 @@
 
 #include "dict.h"
 #include "glusterfs.h"
+#include "iobuf.h"
 #include "logging.h"
 #include "rdma.h"
 #include "name.h"
@@ -361,6 +362,135 @@ gf_rdma_post_recv (struct ibv_srq *srq,
         return ibv_post_srq_recv (srq, &wr, &bad_wr);
 }
 
+int
+gf_rdma_deregister_arena (struct list_head **mr_list,
+                          struct iobuf_arena *iobuf_arena)
+{
+        gf_rdma_arena_mr *tmp     = NULL;
+        int               count   = 0, i = 0;
+
+        count = iobuf_arena->iobuf_pool->rdma_device_count;
+        for (i = 0; i < count; i++) {
+                list_for_each_entry(tmp, mr_list[i], list) {
+                        if (tmp->iobuf_arena == iobuf_arena) {
+                                if (ibv_dereg_mr(tmp->mr)) {
+                                        gf_log("rdma", GF_LOG_WARNING,
+                                        "deallocation of memory region "
+                                        "failed");
+                                        return -1;
+                                }
+                                list_del(&tmp->list);
+                                GF_FREE(tmp);
+                                break;
+                        }
+                }
+        }
+
+        return 0;
+}
+
+
+int
+gf_rdma_register_arena (void **arg1, void *arg2)
+{
+        struct ibv_mr       *mr          = NULL;
+        gf_rdma_arena_mr    *new         = NULL;
+        struct iobuf_pool   *iobuf_pool  = NULL;
+        gf_rdma_device_t    **device     = (gf_rdma_device_t **)arg1;
+        struct iobuf_arena  *iobuf_arena = arg2;
+        int                  count       = 0, i = 0;
+
+        iobuf_pool = iobuf_arena->iobuf_pool;
+        count = iobuf_pool->rdma_device_count;
+        for (i = 0; i < count; i++) {
+                new = GF_CALLOC(1, sizeof(gf_rdma_arena_mr),
+                                gf_common_mt_rdma_arena_mr);
+                INIT_LIST_HEAD (&new->list);
+                new->iobuf_arena = iobuf_arena;
+
+                mr = ibv_reg_mr(device[i]->pd, iobuf_arena->mem_base,
+                                         iobuf_arena->arena_size,
+                                         IBV_ACCESS_REMOTE_READ |
+                                         IBV_ACCESS_LOCAL_WRITE |
+                                         IBV_ACCESS_REMOTE_WRITE
+                                         );
+                if (!mr)
+                        gf_log("rdma", GF_LOG_WARNING,
+                               "allocation of mr failed");
+
+                new->mr = mr;
+                list_add (&new->list, &device[i]->all_mr);
+                new = NULL;
+        }
+
+        return 0;
+
+}
+
+static void
+gf_rdma_register_iobuf_pool (rpc_transport_t *this)
+{
+        struct iobuf_pool   *iobuf_pool = NULL;
+        struct iobuf_arena  *tmp        = NULL;
+        gf_rdma_private_t   *priv       = NULL;
+        gf_rdma_device_t    *device     = NULL;
+        struct ibv_mr       *mr         = NULL;
+        gf_rdma_arena_mr    *new        = NULL;
+
+        priv = this->private;
+        device = priv->device;
+        iobuf_pool = this->ctx->iobuf_pool;
+
+        if (!list_empty(&iobuf_pool->all_arenas)) {
+
+                list_for_each_entry (tmp, &iobuf_pool->all_arenas, all_list) {
+                        new = GF_CALLOC(1, sizeof(gf_rdma_arena_mr),
+                                        gf_common_mt_rdma_arena_mr);
+                        INIT_LIST_HEAD (&new->list);
+                        new->iobuf_arena = tmp;
+
+                        mr = ibv_reg_mr(device->pd, tmp->mem_base,
+                                        tmp->arena_size,
+                                        IBV_ACCESS_REMOTE_READ |
+                                        IBV_ACCESS_LOCAL_WRITE |
+                                        IBV_ACCESS_REMOTE_WRITE);
+                        if (!mr) {
+                                gf_log ("rdma", GF_LOG_WARNING, "failed to pre"
+                                        " register buffers with rdma "
+                                        "devices.");
+
+                        }
+                        new->mr = mr;
+                        list_add (&new->list, &device->all_mr);
+
+                        new = NULL;
+                }
+        }
+
+       return;
+}
+
+static struct ibv_mr*
+gf_rdma_get_pre_registred_mr(rpc_transport_t *this, void *ptr, int size)
+{
+        gf_rdma_arena_mr  *tmp        = NULL;
+        gf_rdma_private_t  *priv       = NULL;
+        gf_rdma_device_t   *device     = NULL;
+
+        priv = this->private;
+        device = priv->device;
+
+        if (!list_empty(&device->all_mr)) {
+                list_for_each_entry (tmp, &device->all_mr, list) {
+                        if (tmp->iobuf_arena->mem_base <= ptr &&
+                            ptr < tmp->iobuf_arena->mem_base +
+                            tmp->iobuf_arena->arena_size)
+                                return tmp->mr;
+                        }
+        }
+
+        return NULL;
+}
 
 static int32_t
 gf_rdma_create_posts (rpc_transport_t *this)
@@ -510,11 +640,13 @@ gf_rdma_get_device (rpc_transport_t *this, struct ibv_context *ibctx,
         int32_t            i        = 0;
         gf_rdma_device_t  *trav     = NULL, *device = NULL;
         gf_rdma_ctx_t     *rdma_ctx = NULL;
+        struct iobuf_pool *iobuf_pool = NULL;
 
         priv        = this->private;
         options     = &priv->options;
         ctx         = this->ctx;
         rdma_ctx    = ctx->ib;
+        iobuf_pool = ctx->iobuf_pool;
 
         trav = rdma_ctx->device;
 
@@ -530,10 +662,10 @@ gf_rdma_get_device (rpc_transport_t *this, struct ibv_context *ibctx,
                 if (trav == NULL) {
                         goto out;
                 }
-
                 priv->device = trav;
                 trav->context = ibctx;
-
+                iobuf_pool->device[iobuf_pool->rdma_device_count] = trav;
+                iobuf_pool->mr_list[iobuf_pool->rdma_device_count++] = &trav->all_mr;
                 trav->request_ctx_pool
                         = mem_pool_new (gf_rdma_request_context_t,
                                         GF_RDMA_POOL_SIZE);
@@ -613,6 +745,9 @@ gf_rdma_get_device (rpc_transport_t *this, struct ibv_context *ibctx,
                 gf_rdma_queue_init (&trav->sendq);
                 gf_rdma_queue_init (&trav->recvq);
 
+                INIT_LIST_HEAD (&trav->all_mr);
+                gf_rdma_register_iobuf_pool(this);
+
                 if (gf_rdma_create_posts (this) < 0) {
                         gf_log (this->name, GF_LOG_ERROR,
                                 "could not allocate posts for device (%s)",
@@ -667,7 +802,9 @@ out:
                 mem_pool_destroy (trav->ioq_pool);
                 mem_pool_destroy (trav->request_ctx_pool);
                 mem_pool_destroy (trav->reply_info_pool);
-                ibv_dealloc_pd (trav->pd);
+                if (trav->pd != NULL) {
+                        ibv_dealloc_pd (trav->pd);
+                }
                 gf_rdma_destroy_cq (this);
                 ibv_destroy_comp_channel (trav->recv_chan);
                 ibv_destroy_comp_channel (trav->send_chan);
@@ -1239,9 +1376,13 @@ __gf_rdma_create_read_chunks_from_vector (gf_rdma_peer_t *peer,
                 readch->rc_discrim = hton32 (1);
                 readch->rc_position = hton32 (*pos);
 
+                mr = gf_rdma_get_pre_registred_mr(peer->trans,
+                                (void *)vector[i].iov_base, vector[i].iov_len);
+                if (!mr) {
                 mr = ibv_reg_mr (device->pd, vector[i].iov_base,
                                  vector[i].iov_len,
                                  IBV_ACCESS_REMOTE_READ);
+                }
                 if (!mr) {
                         gf_log (GF_RDMA_LOG_NAME, GF_LOG_WARNING,
                                 "memory registration failed (%s) (peer:%s)",
@@ -1374,10 +1515,16 @@ __gf_rdma_create_write_chunks_from_vector (gf_rdma_peer_t *peer,
         device = priv->device;
 
         for (i = 0; i < count; i++) {
+
+                mr = gf_rdma_get_pre_registred_mr(peer->trans,
+                                (void *)vector[i].iov_base, vector[i].iov_len);
+                if (!mr) {
                 mr = ibv_reg_mr (device->pd, vector[i].iov_base,
                                  vector[i].iov_len,
                                  IBV_ACCESS_REMOTE_WRITE
                                  | IBV_ACCESS_LOCAL_WRITE);
+                }
+
                 if (!mr) {
                         gf_log (GF_RDMA_LOG_NAME, GF_LOG_WARNING,
                                 "memory registration failed (%s) (peer:%s)",
@@ -1504,16 +1651,30 @@ out:
 
 
 static inline void
-__gf_rdma_deregister_mr (struct ibv_mr **mr, int count)
+__gf_rdma_deregister_mr (gf_rdma_device_t *device,
+                         struct ibv_mr **mr, int count)
 {
-        int i = 0;
+        gf_rdma_arena_mr    *tmp   = NULL;
+        int                  i     = 0;
+        int                  found = 0;
 
-        if (mr == NULL) {
+               if (mr == NULL) {
                 goto out;
         }
 
         for (i = 0; i < count; i++) {
-                ibv_dereg_mr (mr[i]);
+                 found = 0;
+                 if (!list_empty(&device->all_mr)) {
+                 list_for_each_entry(tmp, &device->all_mr, list) {
+                        if (tmp->mr == mr[i]) {
+                                found = 1;
+                                break;
+                        }
+                 }
+                 }
+                if (!found)
+                        ibv_dereg_mr (mr[i]);
+
         }
 
 out:
@@ -1558,9 +1719,10 @@ gf_rdma_quota_put (gf_rdma_peer_t *peer)
 void
 __gf_rdma_request_context_destroy (gf_rdma_request_context_t *context)
 {
-        gf_rdma_peer_t    *peer = NULL;
-        gf_rdma_private_t *priv = NULL;
-        int32_t            ret  = 0;
+        gf_rdma_peer_t    *peer   = NULL;
+        gf_rdma_private_t *priv   = NULL;
+        gf_rdma_device_t  *device = NULL;
+        int32_t            ret    = 0;
 
         if (context == NULL) {
                 goto out;
@@ -1568,9 +1730,10 @@ __gf_rdma_request_context_destroy (gf_rdma_request_context_t *context)
 
         peer = context->peer;
 
-        __gf_rdma_deregister_mr (context->mr, context->mr_count);
-
         priv = peer->trans->private;
+        device = priv->device;
+        __gf_rdma_deregister_mr (device, context->mr, context->mr_count);
+
 
         if (priv->connected) {
                 ret = __gf_rdma_quota_put (peer);
@@ -1602,13 +1765,14 @@ out:
 
 
 void
-gf_rdma_post_context_destroy (gf_rdma_post_context_t *ctx)
+gf_rdma_post_context_destroy (gf_rdma_device_t *device,
+                              gf_rdma_post_context_t *ctx)
 {
         if (ctx == NULL) {
                 goto out;
         }
 
-        __gf_rdma_deregister_mr (ctx->mr, ctx->mr_count);
+        __gf_rdma_deregister_mr (device, ctx->mr, ctx->mr_count);
 
         if (ctx->iobref != NULL) {
                 iobref_unref (ctx->iobref);
@@ -1640,7 +1804,7 @@ gf_rdma_post_unref (gf_rdma_post_t *post)
         pthread_mutex_unlock (&post->lock);
 
         if (refcount == 0) {
-                gf_rdma_post_context_destroy (&post->ctx);
+                gf_rdma_post_context_destroy (post->device, &post->ctx);
                 if (post->type == GF_RDMA_SEND_POST) {
                         gf_rdma_put_post (&post->device->sendq, post);
                 } else {
@@ -2060,10 +2224,16 @@ __gf_rdma_register_local_mr_for_rdma (gf_rdma_peer_t *peer,
                  * Infiniband Architecture Specification Volume 1
                  * (Release 1.2.1)
                  */
+                ctx->mr[ctx->mr_count] = gf_rdma_get_pre_registred_mr(
+                                peer->trans, (void *)vector[i].iov_base,
+                                vector[i].iov_len);
+
+                if (!ctx->mr[ctx->mr_count]) {
                 ctx->mr[ctx->mr_count] = ibv_reg_mr (device->pd,
                                                      vector[i].iov_base,
                                                      vector[i].iov_len,
                                                      IBV_ACCESS_LOCAL_WRITE);
+                }
                 if (ctx->mr[ctx->mr_count] == NULL) {
                         gf_log (GF_RDMA_LOG_NAME, GF_LOG_WARNING,
                                 "registering memory for IBV_ACCESS_LOCAL_WRITE "
@@ -3329,57 +3499,17 @@ gf_rdma_decode_header (gf_rdma_peer_t *peer, gf_rdma_post_t *post,
 
 
 int32_t
-__gf_rdma_read (gf_rdma_peer_t *peer, gf_rdma_post_t *post, struct iovec *to,
-                gf_rdma_read_chunk_t *readch)
-{
-        int32_t            ret  = -1;
-        struct ibv_sge     list = {0, };
-        struct ibv_send_wr wr   = {0, }, *bad_wr = NULL;
-
-        ret = __gf_rdma_register_local_mr_for_rdma (peer, to, 1, &post->ctx);
-        if (ret == -1) {
-                gf_log (GF_RDMA_LOG_NAME, GF_LOG_WARNING,
-                        "registering local memory for rdma read failed");
-                goto out;
-        }
-
-        list.addr = (unsigned long) to->iov_base;
-        list.length = to->iov_len;
-        list.lkey = post->ctx.mr[post->ctx.mr_count - 1]->lkey;
-
-        wr.wr_id      = (unsigned long) gf_rdma_post_ref (post);
-        wr.sg_list    = &list;
-        wr.num_sge    = 1;
-        wr.opcode     = IBV_WR_RDMA_READ;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = readch->rc_target.rs_offset;
-        wr.wr.rdma.rkey = readch->rc_target.rs_handle;
-
-        ret = ibv_post_send (peer->qp, &wr, &bad_wr);
-        if (ret) {
-                gf_log (GF_RDMA_LOG_NAME, GF_LOG_WARNING,
-                        "rdma read from client "
-                        "(%s) failed with ret = %d (%s)",
-                        peer->trans->peerinfo.identifier,
-                        ret, (ret > 0) ? strerror (ret) : "");
-                ret = -1;
-                gf_rdma_post_unref (post);
-        }
-out:
-        return ret;
-}
-
-
-int32_t
 gf_rdma_do_reads (gf_rdma_peer_t *peer, gf_rdma_post_t *post,
                   gf_rdma_read_chunk_t *readch)
 {
-        int32_t            ret   = -1, i = 0, count = 0;
-        size_t             size  = 0;
-        char              *ptr   = NULL;
-        struct iobuf      *iobuf = NULL;
-        gf_rdma_private_t *priv  = NULL;
-
+        int32_t             ret       = -1, i = 0, count = 0;
+        size_t              size      = 0;
+        char               *ptr       = NULL;
+        struct iobuf       *iobuf     = NULL;
+        gf_rdma_private_t  *priv      = NULL;
+        struct ibv_sge     *list      = NULL;
+        struct ibv_send_wr *wr        = NULL, *bad_wr = NULL;
+        int                 total_ref = 0;
         priv = peer->trans->private;
 
         for (i = 0; readch[i].rc_discrim != 0; i++) {
@@ -3394,7 +3524,7 @@ gf_rdma_do_reads (gf_rdma_peer_t *peer, gf_rdma_post_t *post,
         }
 
         post->ctx.gf_rdma_reads = i;
-
+        i = 0;
         iobuf = iobuf_get2 (peer->trans->ctx->iobuf_pool, size);
         if (iobuf == NULL) {
                 goto out;
@@ -3424,32 +3554,82 @@ gf_rdma_do_reads (gf_rdma_peer_t *peer, gf_rdma_post_t *post,
                         goto unlock;
                 }
 
+                list = GF_CALLOC (post->ctx.gf_rdma_reads,
+                                sizeof (struct ibv_sge), gf_common_mt_sge);
+                wr   = GF_CALLOC (post->ctx.gf_rdma_reads,
+                                sizeof (struct ibv_send_wr), gf_common_mt_wr);
                 for (i = 0; readch[i].rc_discrim != 0; i++) {
                         count = post->ctx.count++;
                         post->ctx.vector[count].iov_base = ptr;
                         post->ctx.vector[count].iov_len
                                 = readch[i].rc_target.rs_length;
 
-                        ret = __gf_rdma_read (peer, post,
-                                              &post->ctx.vector[count],
-                                              &readch[i]);
+                        ret = __gf_rdma_register_local_mr_for_rdma (peer,
+                                &post->ctx.vector[count], 1, &post->ctx);
                         if (ret == -1) {
                                 gf_log (GF_RDMA_LOG_NAME, GF_LOG_WARNING,
-                                        "rdma read from peer (%s) failed",
-                                        peer->trans->peerinfo.identifier);
+                                        "registering local memory"
+                                       " for rdma read failed");
                                 goto unlock;
                         }
 
+                        list[i].addr = (unsigned long)
+                                       post->ctx.vector[count].iov_base;
+                        list[i].length = post->ctx.vector[count].iov_len;
+                        list[i].lkey =
+                                post->ctx.mr[post->ctx.mr_count - 1]->lkey;
+
+                        wr[i].wr_id      =
+                                (unsigned long) gf_rdma_post_ref (post);
+                        wr[i].sg_list    = &list[i];
+                        wr[i].next       = &wr[i+1];
+                        wr[i].num_sge    = 1;
+                        wr[i].opcode     = IBV_WR_RDMA_READ;
+                        wr[i].send_flags = IBV_SEND_SIGNALED;
+                        wr[i].wr.rdma.remote_addr =
+                                readch->rc_target.rs_offset;
+                        wr[i].wr.rdma.rkey = readch->rc_target.rs_handle;
+
                         ptr += readch[i].rc_target.rs_length;
+                        total_ref++;
+                }
+                wr[i-1].next = NULL;
+                ret = ibv_post_send (peer->qp, wr, &bad_wr);
+                if (ret) {
+                        gf_log (GF_RDMA_LOG_NAME, GF_LOG_WARNING,
+                                "rdma read from client "
+                                "(%s) failed with ret = %d (%s)",
+                                peer->trans->peerinfo.identifier,
+                                ret, (ret > 0) ? strerror (ret) : "");
+
+                        if (!bad_wr) {
+                                ret = -1;
+                                goto out;
+                        }
+
+                        for (i = 0; i < post->ctx.gf_rdma_reads; i++) {
+                                if (&wr[i] != bad_wr)
+                                        total_ref--;
+                                else
+                                        break;
+                        }
+
+                        ret = -1;
                 }
 
-                ret = 0;
         }
 unlock:
         pthread_mutex_unlock (&priv->write_mutex);
 out:
+        if (list)
+                GF_FREE (list);
+        if (wr)
+                GF_FREE (wr);
 
         if (ret == -1) {
+                while (total_ref-- > 0)
+                        gf_rdma_post_unref (post);
+
                 if (iobuf != NULL) {
                         iobuf_unref (iobuf);
                 }
@@ -3826,13 +4006,16 @@ gf_rdma_recv_completion_proc (void *data)
         gf_rdma_post_t          *post      = NULL;
         gf_rdma_peer_t          *peer      = NULL;
         struct ibv_cq           *event_cq  = NULL;
-        struct ibv_wc            wc        = {0, };
+        struct ibv_wc            wc[10]    = {{0},};
         void                    *event_ctx = NULL;
         int32_t                  ret       = 0;
+        int32_t                  num_wr    = 0, index = 0;
+        uint8_t                  failed    = 0;
 
         chan = data;
 
         while (1) {
+                failed = 0;
                 ret = ibv_get_cq_event (chan, &event_cq, &event_ctx);
                 if (ret) {
                         gf_log (GF_RDMA_LOG_NAME, GF_LOG_ERROR,
@@ -3854,32 +4037,40 @@ gf_rdma_recv_completion_proc (void *data)
 
                 device = (gf_rdma_device_t *) event_ctx;
 
-                while ((ret = ibv_poll_cq (event_cq, 1, &wc)) > 0) {
-                        post = (gf_rdma_post_t *) (long) wc.wr_id;
+                while (!failed &&
+                       (num_wr = ibv_poll_cq (event_cq, 10, wc)) > 0) {
 
-                        pthread_mutex_lock (&device->qpreg.lock);
-                        {
-                                peer = __gf_rdma_lookup_peer (device,
-                                                              wc.qp_num);
+                        for (index = 0; index < num_wr && !failed; index++) {
+                                post = (gf_rdma_post_t *) (long)
+                                        wc[index].wr_id;
+
+                                pthread_mutex_lock (&device->qpreg.lock);
+                                {
+                                        peer = __gf_rdma_lookup_peer (device,
+                                                           wc[index].qp_num);
 
                                 /*
                                  * keep a refcount on transport so that it
                                  * does not get freed because of some error
                                  * indicated by wc.status till we are done
-                                 * with usage of peer and thereby that of trans.
+                                 * with usage of peer and thereby that of
+                                 * trans.
                                  */
                                 if (peer != NULL) {
                                         rpc_transport_ref (peer->trans);
                                 }
-                        }
-                        pthread_mutex_unlock (&device->qpreg.lock);
+                                }
+                                pthread_mutex_unlock (&device->qpreg.lock);
 
-                        if (wc.status != IBV_WC_SUCCESS) {
-                                gf_log (GF_RDMA_LOG_NAME, GF_LOG_ERROR,
-                                        "recv work request on `%s' returned "
-                                        "error (%d)", device->device_name,
-                                        wc.status);
+                                if (wc[index].status != IBV_WC_SUCCESS) {
+                                        gf_log (GF_RDMA_LOG_NAME,
+                                        GF_LOG_ERROR, "recv work request "
+                                        "on `%s' returned error (%d)",
+                                        device->device_name,
+                                        wc[index].status);
+                                        failed = 1;
                                 if (peer) {
+                                        ibv_ack_cq_events (event_cq, num_wr);
                                         rpc_transport_unref (peer->trans);
                                         rpc_transport_disconnect (peer->trans);
                                 }
@@ -3888,19 +4079,21 @@ gf_rdma_recv_completion_proc (void *data)
                                         gf_rdma_post_unref (post);
                                 }
                                 continue;
-                        }
+                                }
 
-                        if (peer) {
-                                gf_rdma_process_recv (peer, &wc);
-                                rpc_transport_unref (peer->trans);
-                        } else {
-                                gf_log (GF_RDMA_LOG_NAME,
+                                if (peer) {
+                                        gf_rdma_process_recv (peer,
+                                                        &wc[index]);
+                                        rpc_transport_unref (peer->trans);
+                                } else {
+                                        gf_log (GF_RDMA_LOG_NAME,
                                         GF_LOG_DEBUG,
                                         "could not lookup peer for qp_num: %d",
-                                        wc.qp_num);
-                        }
+                                        wc[index].qp_num);
+                                }
 
-                        gf_rdma_post_unref (post);
+                                gf_rdma_post_unref (post);
+                        }
                 }
 
                 if (ret < 0) {
@@ -3911,7 +4104,8 @@ gf_rdma_recv_completion_proc (void *data)
                                 device->device_name, ret, errno);
                         continue;
                 }
-                ibv_ack_cq_events (event_cq, 1);
+                if (!failed)
+                        ibv_ack_cq_events (event_cq, num_wr);
         }
 
         return NULL;
@@ -3990,6 +4184,16 @@ gf_rdma_handle_successful_send_completion (gf_rdma_peer_t *peer,
                 post->ctx.count = 1;
                 post->ctx.vector[0].iov_len += post->ctx.vector[1].iov_len;
         }
+        /*
+         * if reads performed as vectored, then all the buffers are actually
+         * contiguous memory, so that we can use it as single vector, instead
+         * of multiple.
+         */
+        while (post->ctx.count > 2) {
+                post->ctx.vector[1].iov_len +=
+                        post->ctx.vector[post->ctx.count-1].iov_len;
+                post->ctx.count--;
+        }
 
         ret = gf_rdma_pollin_notify (peer, post);
         if ((ret == -1) && (peer != NULL)) {
@@ -4010,12 +4214,13 @@ gf_rdma_send_completion_proc (void *data)
         struct ibv_cq           *event_cq   = NULL;
         void                    *event_ctx  = NULL;
         gf_rdma_device_t        *device     = NULL;
-        struct ibv_wc            wc         = {0, };
+        struct ibv_wc            wc[10]     = {{0},};
         char                     is_request = 0;
-        int32_t                  ret        = 0, quota_ret = 0;
-
+        int32_t                  ret        = 0, quota_ret = 0, num_wr = 0;
+        int32_t                  index      = 0, failed = 0;
         chan = data;
         while (1) {
+                failed = 0;
                 ret = ibv_get_cq_event (chan, &event_cq, &event_ctx);
                 if (ret) {
                         gf_log (GF_RDMA_LOG_NAME, GF_LOG_ERROR,
@@ -4035,12 +4240,16 @@ gf_rdma_send_completion_proc (void *data)
                         continue;
                 }
 
-                while ((ret = ibv_poll_cq (event_cq, 1, &wc)) > 0) {
-                        post = (gf_rdma_post_t *) (long) wc.wr_id;
+                while (!failed &&
+                       (num_wr = ibv_poll_cq (event_cq, 10, wc)) > 0) {
+                        for (index = 0; index < num_wr && !failed; index++) {
+                                post = (gf_rdma_post_t *) (long)
+                                        wc[index].wr_id;
 
-                        pthread_mutex_lock (&device->qpreg.lock);
-                        {
-                                peer = __gf_rdma_lookup_peer (device, wc.qp_num);
+                                pthread_mutex_lock (&device->qpreg.lock);
+                                {
+                                        peer = __gf_rdma_lookup_peer (device,
+                                                        wc[index].qp_num);
 
                                 /*
                                  * keep a refcount on transport so that it
@@ -4048,28 +4257,31 @@ gf_rdma_send_completion_proc (void *data)
                                  * indicated by wc.status, till we are done
                                  * with usage of peer and thereby that of trans.
                                  */
-                                if (peer != NULL) {
-                                        rpc_transport_ref (peer->trans);
+                                        if (peer != NULL) {
+                                                rpc_transport_ref (peer->trans);
+                                        }
                                 }
-                        }
-                        pthread_mutex_unlock (&device->qpreg.lock);
+                                pthread_mutex_unlock (&device->qpreg.lock);
 
-                        if (wc.status != IBV_WC_SUCCESS) {
-                                gf_rdma_handle_failed_send_completion (peer, &wc);
-                        } else {
-                                gf_rdma_handle_successful_send_completion (peer,
-                                                                           &wc);
-                        }
+                                if (wc[index].status != IBV_WC_SUCCESS) {
+                                        ibv_ack_cq_events (event_cq, num_wr);
+                                        failed = 1;
+                                        gf_rdma_handle_failed_send_completion
+                                                (peer, &wc[index]);
+                                } else {
+                                      gf_rdma_handle_successful_send_completion
+                                                (peer, &wc[index]);
+                                }
 
-                        if (post) {
-                                is_request = post->ctx.is_request;
+                                if (post) {
+                                        is_request = post->ctx.is_request;
 
-                                ret = gf_rdma_post_unref (post);
-                                if ((ret == 0)
-                                    && (wc.status == IBV_WC_SUCCESS)
-                                    && !is_request
-                                    && (post->type == GF_RDMA_SEND_POST)
-                                    && (peer != NULL)) {
+                                        ret = gf_rdma_post_unref (post);
+                                        if ((ret == 0)
+                                        && (wc[index].status == IBV_WC_SUCCESS)
+                                        && !is_request
+                                        && (post->type == GF_RDMA_SEND_POST)
+                                        && (peer != NULL)) {
                                         /* An GF_RDMA_RECV_POST can end up in
                                          * gf_rdma_send_completion_proc for
                                          * rdma-reads, and we do not take
@@ -4080,33 +4292,37 @@ gf_rdma_send_completion_proc (void *data)
                                          * if it is request, quota is returned
                                          * after reply has come.
                                          */
-                                        quota_ret = gf_rdma_quota_put (peer);
-                                        if (quota_ret < 0) {
-                                                gf_log ("rdma", GF_LOG_DEBUG,
-                                                        "failed to send "
-                                                        "message");
+                                                quota_ret = gf_rdma_quota_put
+                                                        (peer);
+                                                if (quota_ret < 0) {
+                                                        gf_log ("rdma",
+                                                                GF_LOG_DEBUG,
+                                                            "failed to send "
+                                                            "message");
+                                                }
                                         }
                                 }
-                        }
 
-                        if (peer) {
-                                rpc_transport_unref (peer->trans);
-                        } else {
-                                gf_log (GF_RDMA_LOG_NAME, GF_LOG_DEBUG,
+                                if (peer) {
+                                        rpc_transport_unref (peer->trans);
+                                } else {
+                                        gf_log (GF_RDMA_LOG_NAME, GF_LOG_DEBUG,
                                         "could not lookup peer for qp_num: %d",
-                                        wc.qp_num);
+                                        wc[index].qp_num);
+
+                                }
                         }
                 }
 
                 if (ret < 0) {
                         gf_log (GF_RDMA_LOG_NAME, GF_LOG_ERROR,
-                                "ibv_poll_cq on `%s' returned error (ret = %d,"
-                                " errno = %d)",
-                                device->device_name, ret, errno);
+                        "ibv_poll_cq on `%s' returned error (ret = %d,"
+                        " errno = %d)",
+                        device->device_name, ret, errno);
                         continue;
-                }
-
-                ibv_ack_cq_events (event_cq, 1);
+               }
+               if (!failed)
+                       ibv_ack_cq_events (event_cq, num_wr);
         }
 
         return NULL;
@@ -4507,6 +4723,7 @@ int32_t
 init (rpc_transport_t *this)
 {
         gf_rdma_private_t *priv = NULL;
+        struct iobuf_pool *iobuf_pool = NULL;
 
         priv = GF_CALLOC (1, sizeof (*priv), gf_common_mt_rdma_private_t);
         if (!priv)
@@ -4515,10 +4732,15 @@ init (rpc_transport_t *this)
         this->private = priv;
 
         if (gf_rdma_init (this)) {
-                gf_log (this->name, GF_LOG_ERROR,
+                gf_log (this->name, GF_LOG_WARNING,
                         "Failed to initialize IB Device");
+                this->private = NULL;
+                GF_FREE (priv);
                 return -1;
         }
+        iobuf_pool = this->ctx->iobuf_pool;
+        iobuf_pool->rdma_registration = gf_rdma_register_arena;
+        iobuf_pool->rdma_deregistration = gf_rdma_deregister_arena;
 
         return 0;
 }

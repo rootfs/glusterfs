@@ -1003,9 +1003,6 @@ afr_inodelk_init (afr_inodelk_t *lk, char *dom, size_t child_count);
 void
 afr_handle_open_fd_count (call_frame_t *frame, xlator_t *this);
 
-int
-afr_local_pathinfo (char *pathinfo, gf_boolean_t *is_local);
-
 void
 afr_remove_eager_lock_stub (afr_local_t *local);
 
@@ -1025,4 +1022,6 @@ afr_get_heal_info (call_frame_t *frame, xlator_t *this, loc_t *loc,
 int
 afr_heal_splitbrain_file(call_frame_t *frame, xlator_t *this, loc_t *loc);
 
+int
+afr_get_split_brain_status (call_frame_t *frame, xlator_t *this, loc_t *loc);
 #endif /* __AFR_H__ */

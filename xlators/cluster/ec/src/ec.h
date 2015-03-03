@@ -19,6 +19,7 @@
 #define EC_XATTR_SIZE    EC_XATTR_PREFIX"size"
 #define EC_XATTR_VERSION EC_XATTR_PREFIX"version"
 #define EC_XATTR_HEAL    EC_XATTR_PREFIX"heal"
+#define EC_XATTR_DIRTY   EC_XATTR_PREFIX"dirty"
 
 struct _ec;
 typedef struct _ec ec_t;
@@ -36,6 +37,8 @@ struct _ec
     uint32_t          idx;
     uint32_t          xl_up_count;
     uintptr_t         xl_up;
+    uint32_t          xl_notify_count;
+    uintptr_t         xl_notify;
     uintptr_t         node_mask;
     xlator_t **       xl_list;
     gf_lock_t         lock;

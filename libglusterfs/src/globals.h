@@ -63,13 +63,16 @@ void *synctask_get ();
 int synctask_set (void *);
 
 /* uuid_buf */
-char *glusterfs_uuid_buf_get();
+char *glusterfs_uuid_buf_get ();
 /* lkowner_buf */
-char *glusterfs_lkowner_buf_get();
+char *glusterfs_lkowner_buf_get ();
 
 /* init */
 int glusterfs_globals_init (glusterfs_ctx_t *ctx);
 
 extern const char *gf_fop_list[];
 
+/* mem acct enable/disable */
+int gf_global_mem_acct_enable_get (void);
+int gf_global_mem_acct_enable_set (int val);
 #endif /* !_GLOBALS_H */

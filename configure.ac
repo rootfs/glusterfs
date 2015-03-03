@@ -758,10 +758,10 @@ AC_SUBST(UNITTEST_LDFLAGS)
 
 dnl Check for argp
 AC_CHECK_HEADER([argp.h], AC_DEFINE(HAVE_ARGP, 1, [have argp]))
-AC_CONFIG_SUBDIRS(contrib/argp-standalone)
 
 BUILD_ARGP_STANDALONE=no
 if test "x${ac_cv_header_argp_h}" = "xno"; then
+   AC_CONFIG_SUBDIRS(contrib/argp-standalone)
    BUILD_ARGP_STANDALONE=yes
    ARGP_STANDALONE_CPPFLAGS='-I${top_srcdir}/contrib/argp-standalone'
    ARGP_STANDALONE_LDADD='${top_builddir}/contrib/argp-standalone/libargp.a'
@@ -966,7 +966,6 @@ if test "x${GF_HOST_OS}" != "xGF_LINUX_HOST_OS" ; then
         UMOUNTD_SUBDIR="contrib/umountd"
 fi
 AC_SUBST(UMOUNTD_SUBDIR)
-        
 
 # enable/disable QEMU
 AM_CONDITIONAL([ENABLE_QEMU_BLOCK], [test x$BUILD_QEMU_BLOCK = xyes])
@@ -1098,6 +1097,13 @@ if test "x$BUILD_GLUPY" = "xyes"; then
    AC_SUBST(GLUPY_SUBDIR_SRC_MAKEFILE)
 fi
 # end glupy section
+
+dnl Check for userspace-rcu
+PKG_CHECK_MODULES([URCU], [liburcu-bp])
+PKG_CHECK_MODULES([URCU_CDS], [liburcu-cds >= 0.8], [],
+  [PKG_CHECK_MODULES([URCU_CDS], [liburcu-cds >= 0.7],
+    [AC_DEFINE(URCU_0_7, 1, [Define if liburcu 0.7 is found])],
+    [AC_MSG_ERROR([liburcu >= 0.7 required])])])
 
 AC_SUBST(CFLAGS)
 # end enable debug section

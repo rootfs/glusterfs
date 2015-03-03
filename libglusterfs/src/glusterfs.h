@@ -139,6 +139,7 @@
 
 #define GF_AFR_HEAL_INFO "glusterfs.heal-info"
 #define GF_AFR_HEAL_SBRAIN "glusterfs.heal-sbrain"
+#define GF_AFR_SBRAIN_STATUS "afr.split-brain-status"
 
 #define GF_GFIDLESS_LOOKUP "gfidless-lookup"
 /* replace-brick and pump related internal xattrs */
@@ -156,6 +157,8 @@
                                                        */
 
 #define GLUSTERFS_RPC_REPLY_SIZE               24
+
+#define STARTING_EVENT_THREADS                 1
 
 #define ZR_FILE_CONTENT_REQUEST(key) (!strncmp(key, ZR_FILE_CONTENT_STR, \
                                                ZR_FILE_CONTENT_STRLEN))
@@ -420,6 +423,7 @@ struct _cmd_args {
         int              background_qlen;
         int              congestion_threshold;
         char             *fuse_mountopts;
+        int              mem_acct;
 
         /* key args */
         char            *mount_point;
@@ -530,6 +534,10 @@ struct _glusterfs_ctx {
         /* Buffer to 'save' backtrace even under OOM-kill like situations*/
         char btbuf[GF_BACKTRACE_LEN];
 
+        pthread_mutex_t notify_lock;
+        pthread_cond_t notify_cond;
+        int notifying;
+
 };
 typedef struct _glusterfs_ctx glusterfs_ctx_t;
 
@@ -595,6 +603,8 @@ struct gf_flock {
 #define SECURE_ACCESS_FILE     GLUSTERD_DEFAULT_WORKDIR "/secure-access"
 
 int glusterfs_graph_prepare (glusterfs_graph_t *graph, glusterfs_ctx_t *ctx);
+int glusterfs_graph_destroy_residual (glusterfs_graph_t *graph);
+int glusterfs_graph_deactivate (glusterfs_graph_t *graph);
 int glusterfs_graph_destroy (glusterfs_graph_t *graph);
 int glusterfs_graph_activate (glusterfs_graph_t *graph, glusterfs_ctx_t *ctx);
 glusterfs_graph_t *glusterfs_graph_construct (FILE *fp);

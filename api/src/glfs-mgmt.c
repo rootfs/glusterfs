@@ -377,6 +377,12 @@ glfs_get_volume_info (struct glfs *fs)
 
         ctx = fs->ctx;
         frame = create_frame (THIS, ctx->pool);
+        if (!frame) {
+                gf_log ("glfs", GF_LOG_ERROR, "failed to create the frame");
+                ret = -1;
+                goto out;
+        }
+
         frame->local = &args;
 
         __yawn ((&args));
@@ -820,7 +826,7 @@ glfs_mgmt_init (struct glfs *fs)
 	if (ret)
 		goto out;
 
-	rpc = rpc_clnt_new (options, THIS->ctx, THIS->name, 8);
+	rpc = rpc_clnt_new (options, ctx, THIS->name, 8);
 	if (!rpc) {
 		ret = -1;
 		gf_log (THIS->name, GF_LOG_WARNING,

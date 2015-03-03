@@ -1449,8 +1449,7 @@ gf_string2bytesize_uint64 (const char *str, uint64_t *n)
 }
 
 int
-gf_string2percent_or_bytesize (const char *str,
-			       uint64_t *n,
+gf_string2percent_or_bytesize (const char *str, double *n,
 			       gf_boolean_t *is_percent)
 {
         double value = 0ULL;
@@ -1485,6 +1484,7 @@ gf_string2percent_or_bytesize (const char *str,
         if (errno == 0)
                 errno = old_errno;
 
+        /*Maximum accepted value for 64 bit OS will be (2^14 -1)PB*/
         if (tail[0] != '\0') {
                 if (strcasecmp (tail, GF_UNIT_KB_STRING) == 0)
                         value *= GF_UNIT_KB;
@@ -1508,7 +1508,7 @@ gf_string2percent_or_bytesize (const char *str,
                 return -1;
         }
 
-        *n = (uint64_t) value;
+        *n = value;
 
         return 0;
 }
@@ -2154,7 +2154,7 @@ mask_match(const uint32_t a, const uint32_t b, const uint32_t m)
 char *
 uuid_utoa (uuid_t uuid)
 {
-        char *uuid_buffer = glusterfs_uuid_buf_get(THIS->ctx);
+        char *uuid_buffer = glusterfs_uuid_buf_get ();
         uuid_unparse (uuid, uuid_buffer);
         return uuid_buffer;
 }
@@ -2173,7 +2173,7 @@ uuid_utoa_r (uuid_t uuid, char *dst)
 char *
 lkowner_utoa (gf_lkowner_t *lkowner)
 {
-        char *lkowner_buffer = glusterfs_lkowner_buf_get(THIS->ctx);
+        char *lkowner_buffer = glusterfs_lkowner_buf_get ();
         lkowner_unparse (lkowner, lkowner_buffer, GF_LKOWNER_BUF_SIZE);
         return lkowner_buffer;
 }
@@ -3647,4 +3647,55 @@ gf_get_index_by_elem (char **array, char *elem)
         }
 
         return -1;
+}
+
+static int
+get_pathinfo_host (char *pathinfo, char *hostname, size_t size)
+{
+        char    *start = NULL;
+        char    *end = NULL;
+        int     ret  = -1;
+        int     i    = 0;
+
+        if (!pathinfo)
+                goto out;
+
+        start = strchr (pathinfo, ':');
+        if (!start)
+                goto out;
+
+        end = strrchr (pathinfo, ':');
+        if (start == end)
+                goto out;
+
+        memset (hostname, 0, size);
+        i = 0;
+        while (++start != end)
+                hostname[i++] = *start;
+        ret = 0;
+out:
+        return ret;
+}
+
+/*Note: 'pathinfo' should be gathered only from one brick*/
+int
+glusterfs_is_local_pathinfo (char *pathinfo, gf_boolean_t *is_local)
+{
+        int             ret   = 0;
+        char            pathinfohost[1024] = {0};
+        char            localhost[1024] = {0};
+
+        *is_local = _gf_false;
+        ret = get_pathinfo_host (pathinfo, pathinfohost, sizeof (pathinfohost));
+        if (ret)
+                goto out;
+
+        ret = gethostname (localhost, sizeof (localhost));
+        if (ret)
+                goto out;
+
+        if (!strcmp (localhost, pathinfohost))
+                *is_local = _gf_true;
+out:
+        return ret;
 }

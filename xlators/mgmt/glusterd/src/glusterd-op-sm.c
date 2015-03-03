@@ -44,6 +44,11 @@
 #include "common-utils.h"
 #include "run.h"
 #include "glusterd-snapshot-utils.h"
+#include "glusterd-svc-mgmt.h"
+#include "glusterd-svc-helper.h"
+#include "glusterd-shd-svc.h"
+#include "glusterd-nfs-svc.h"
+#include "glusterd-quotad-svc.h"
 
 #include <sys/types.h>
 #include <signal.h>
@@ -388,13 +393,6 @@ glusterd_set_volume_status (glusterd_volinfo_t  *volinfo,
 {
         GF_ASSERT (volinfo);
         volinfo->status = status;
-}
-
-gf_boolean_t
-glusterd_is_volume_started (glusterd_volinfo_t  *volinfo)
-{
-        GF_ASSERT (volinfo);
-        return (volinfo->status == GLUSTERD_STATUS_STARTED);
 }
 
 static int
@@ -1526,7 +1524,7 @@ glusterd_options_reset (glusterd_volinfo_t *volinfo, char *key,
                 goto out;
 
         if (GLUSTERD_STATUS_STARTED == volinfo->status) {
-                ret = glusterd_nodesvcs_handle_reconfigure (volinfo);
+                ret = glusterd_svcs_reconfigure (volinfo);
                 if (ret)
                         goto out;
         }
@@ -1878,7 +1876,8 @@ glusterd_op_set_volume (dict_t *dict)
         int32_t                                  dict_count = 0;
         gf_boolean_t                             check_op_version = _gf_false;
         uint32_t                                 new_op_version = 0;
-        gf_boolean_t                            quorum_action  = _gf_false;
+        gf_boolean_t                             quorum_action  = _gf_false;
+        glusterd_svc_t                          *svc            = NULL;
 
         this = THIS;
         GF_ASSERT (this);
@@ -2043,14 +2042,15 @@ glusterd_op_set_volume (dict_t *dict)
                         goto out;
                 }
         }
-
         if (!global_opts_set) {
                 gd_update_volume_op_versions (volinfo);
 
-                ret = glusterd_handle_snapd_option (volinfo);
-                if (ret)
-                        goto out;
-
+                if (!volinfo->is_snap_volume) {
+                        svc = &(volinfo->snapd.svc);
+                        ret = svc->manager (svc, volinfo, PROC_START_NO_WAIT);
+                        if (ret)
+                                goto out;
+                }
                 ret = glusterd_create_volfiles_and_notify_services (volinfo);
                 if (ret) {
                         gf_log (this->name, GF_LOG_ERROR,
@@ -2065,10 +2065,10 @@ glusterd_op_set_volume (dict_t *dict)
                         goto out;
 
                 if (GLUSTERD_STATUS_STARTED == volinfo->status) {
-                        ret = glusterd_nodesvcs_handle_reconfigure (volinfo);
+                        ret = glusterd_svcs_reconfigure (volinfo);
                         if (ret) {
-                                gf_log (this->name, GF_LOG_WARNING,
-                                         "Unable to restart NFS-Server");
+                                gf_log (this->name, GF_LOG_ERROR,
+                                         "Unable to restart services");
                                 goto out;
                         }
                 }
@@ -2078,9 +2078,13 @@ glusterd_op_set_volume (dict_t *dict)
                         volinfo = voliter;
                         gd_update_volume_op_versions (volinfo);
 
-                        ret = glusterd_handle_snapd_option (volinfo);
-                        if (ret)
-                                goto out;
+                        if (!volinfo->is_snap_volume) {
+                                svc = &(volinfo->snapd.svc);
+                                ret = svc->manager (svc, volinfo,
+                                                    PROC_START_NO_WAIT);
+                                if (ret)
+                                        goto out;
+                        }
 
                         ret = glusterd_create_volfiles_and_notify_services (volinfo);
                         if (ret) {
@@ -2097,7 +2101,7 @@ glusterd_op_set_volume (dict_t *dict)
                                 goto out;
 
                         if (GLUSTERD_STATUS_STARTED == volinfo->status) {
-                                ret = glusterd_nodesvcs_handle_reconfigure (volinfo);
+                                ret = glusterd_svcs_reconfigure (volinfo);
                                 if (ret) {
                                         gf_log (this->name, GF_LOG_WARNING,
                                                 "Unable to restart NFS-Server");
@@ -2303,7 +2307,7 @@ glusterd_op_stats_volume (dict_t *dict, char **op_errstr,
                 goto out;
 
         if (GLUSTERD_STATUS_STARTED == volinfo->status)
-                ret = glusterd_nodesvcs_handle_reconfigure (volinfo);
+                ret = glusterd_svcs_reconfigure (volinfo);
 
         ret = 0;
 
@@ -2614,23 +2618,24 @@ glusterd_op_status_volume (dict_t *dict, char **op_errstr,
         vol_opts = volinfo->dict;
 
         if ((cmd & GF_CLI_STATUS_NFS) != 0) {
-                ret = glusterd_add_node_to_dict ("nfs", rsp_dict, 0, vol_opts);
+                ret = glusterd_add_node_to_dict (priv->nfs_svc.name, rsp_dict,
+                                                 0, vol_opts);
                 if (ret)
                         goto out;
                 other_count++;
                 node_count++;
 
         } else if ((cmd & GF_CLI_STATUS_SHD) != 0) {
-                ret = glusterd_add_node_to_dict ("glustershd", rsp_dict, 0,
-                                                 vol_opts);
+                ret = glusterd_add_node_to_dict (priv->shd_svc.name, rsp_dict,
+                                                 0, vol_opts);
                 if (ret)
                         goto out;
                 other_count++;
                 node_count++;
 
         } else if ((cmd & GF_CLI_STATUS_QUOTAD) != 0) {
-                ret = glusterd_add_node_to_dict ("quotad", rsp_dict, 0,
-                                                 vol_opts);
+                ret = glusterd_add_node_to_dict (priv->quotad_svc.name,
+                                                 rsp_dict, 0, vol_opts);
                 if (ret)
                         goto out;
                 other_count++;
@@ -2703,10 +2708,11 @@ glusterd_op_status_volume (dict_t *dict, char **op_errstr,
                                                              "nfs.disable",
                                                              _gf_false);
                         if (!nfs_disabled) {
-                                ret = glusterd_add_node_to_dict ("nfs",
-                                                                 rsp_dict,
-                                                                 other_index,
-                                                                 vol_opts);
+                                ret = glusterd_add_node_to_dict
+                                                           (priv->nfs_svc.name,
+                                                            rsp_dict,
+                                                            other_index,
+                                                            vol_opts);
                                 if (ret)
                                         goto out;
                                 other_index++;
@@ -2719,10 +2725,9 @@ glusterd_op_status_volume (dict_t *dict, char **op_errstr,
                                          _gf_true);
                         if (glusterd_is_volume_replicate (volinfo)
                             && shd_enabled) {
-                                ret = glusterd_add_node_to_dict ("glustershd",
-                                                                 rsp_dict,
-                                                                 other_index,
-                                                                 vol_opts);
+                                ret = glusterd_add_node_to_dict
+                                        (priv->shd_svc.name, rsp_dict,
+                                         other_index, vol_opts);
                                 if (ret)
                                         goto out;
                                 other_count++;
@@ -2730,10 +2735,11 @@ glusterd_op_status_volume (dict_t *dict, char **op_errstr,
                                 other_index++;
                         }
                         if (glusterd_is_volume_quota_enabled (volinfo)) {
-                                ret = glusterd_add_node_to_dict ("quotad",
-                                                                 rsp_dict,
-                                                                 other_index,
-                                                                 vol_opts);
+                                ret = glusterd_add_node_to_dict
+                                                        (priv->quotad_svc.name,
+                                                         rsp_dict,
+                                                         other_index,
+                                                         vol_opts);
                                 if (ret)
                                         goto out;
                                 other_count++;
@@ -3390,108 +3396,6 @@ out:
         return ret;
 }
 
-gf_boolean_t
-glusterd_is_get_op (xlator_t *this, glusterd_op_t op, dict_t *dict)
-{
-        char            *key = NULL;
-        char            *volname = NULL;
-        int             ret = 0;
-
-        if (op == GD_OP_STATUS_VOLUME)
-                return _gf_true;
-
-        if (op == GD_OP_SET_VOLUME) {
-                //check for set volume help
-                ret = dict_get_str (dict, "volname", &volname);
-                if (volname &&
-                    ((strcmp (volname, "help") == 0) ||
-                     (strcmp (volname, "help-xml") == 0))) {
-                        ret = dict_get_str (dict, "key1", &key);
-                        if (ret < 0)
-                                return _gf_true;
-                }
-        }
-
-        return _gf_false;
-}
-
-gf_boolean_t
-glusterd_is_op_quorum_validation_required (xlator_t *this, glusterd_op_t op,
-                                           dict_t *dict)
-{
-        gf_boolean_t    required = _gf_true;
-        char            *key = NULL;
-        char            *key_fixed = NULL;
-        int             ret = -1;
-
-        if (glusterd_is_get_op (this, op, dict)) {
-                required = _gf_false;
-                goto out;
-        }
-        if ((op != GD_OP_SET_VOLUME) && (op != GD_OP_RESET_VOLUME))
-                goto out;
-        if (op == GD_OP_SET_VOLUME)
-                ret = dict_get_str (dict, "key1", &key);
-        else if (op == GD_OP_RESET_VOLUME)
-                ret = dict_get_str (dict, "key", &key);
-        if (ret)
-                goto out;
-        ret = glusterd_check_option_exists (key, &key_fixed);
-        if (ret <= 0)
-                goto out;
-        if (key_fixed)
-                key = key_fixed;
-        if (glusterd_is_quorum_option (key))
-                required = _gf_false;
-out:
-        GF_FREE (key_fixed);
-        return required;
-}
-
-/* This function should not be used when the quorum validation needs to happen
- * on non-global peer list */
-static int
-glusterd_op_validate_quorum (xlator_t *this, glusterd_op_t op,
-                             dict_t *dict, char **op_errstr)
-{
-        int                      ret     = 0;
-        char                    *volname = NULL;
-        glusterd_volinfo_t      *volinfo = NULL;
-        char                    *errstr  = NULL;
-
-        errstr = "Quorum not met. Volume operation not allowed.";
-        if (!glusterd_is_op_quorum_validation_required (this, op, dict))
-                goto out;
-
-        ret = dict_get_str (dict, "volname", &volname);
-        if (ret) {
-                ret = 0;
-                goto out;
-        }
-
-        ret = glusterd_volinfo_find (volname, &volinfo);
-        if (ret) {
-                ret = 0;
-                goto out;
-        }
-
-        /* Passing NULL implies quorum calculation will happen on global peer
-         * list */
-        if (does_gd_meet_server_quorum (this, NULL, _gf_false)) {
-                ret = 0;
-                goto out;
-        }
-
-        if (glusterd_is_volume_in_server_quorum (volinfo)) {
-                ret = -1;
-                *op_errstr = gf_strdup (errstr);
-                goto out;
-        }
-        ret = 0;
-out:
-        return ret;
-}
-
 static int
 glusterd_op_ac_send_stage_op (glusterd_op_sm_event_t *event, void *ctx)
 {
@@ -3530,7 +3434,7 @@ glusterd_op_ac_send_stage_op (glusterd_op_sm_event_t *event, void *ctx)
                 goto out;
         }
 
-        ret = glusterd_op_validate_quorum (this, op, dict, &op_errstr);
+        ret = glusterd_validate_quorum (this, op, dict, &op_errstr);
         if (ret) {
                 gf_msg (this->name, GF_LOG_CRITICAL, 0,
                         GD_MSG_SERVER_QUORUM_NOT_MET,
@@ -3854,6 +3758,42 @@ glusterd_is_volume_status_modify_op_ctx (uint32_t cmd)
         return _gf_false;
 }
 
+int
+glusterd_op_modify_port_key (dict_t *op_ctx, int brick_index_max)
+{
+        char      *port         = NULL;
+        int       i             = 0;
+        int       ret = -1;
+        char      key[1024]     = {0};
+        char      old_key[1024] = {0};
+
+        for (i = 0; i <= brick_index_max; i++) {
+
+               memset (key, 0, sizeof (key));
+               snprintf (key, sizeof (key), "brick%d.rdma_port", i);
+               ret = dict_get_str (op_ctx, key, &port);
+
+               if (ret) {
+
+                       memset (old_key, 0, sizeof (old_key));
+                       snprintf (old_key, sizeof (old_key),
+                                           "brick%d.port", i);
+                       ret = dict_get_str (op_ctx, old_key, &port);
+                       if (ret)
+                               goto out;
+
+                       ret = dict_set_str (op_ctx, key, port);
+                       if (ret)
+                               goto out;
+                       ret = dict_set_str (op_ctx, old_key, "\0");
+                       if (ret)
+                               goto out;
+               }
+        }
+out:
+        return ret;
+}
+
 /* This function is used to modify the op_ctx dict before sending it back
  * to cli. This is useful in situations like changing the peer uuids to
  * hostnames etc.
@@ -3868,9 +3808,13 @@ glusterd_op_modify_op_ctx (glusterd_op_t op, void *ctx)
         int             count = 0;
         uint32_t        cmd = GF_CLI_STATUS_NONE;
         xlator_t        *this = NULL;
+        glusterd_conf_t    *conf    = NULL;
+        char               *volname = NULL;
+        glusterd_volinfo_t *volinfo = NULL;
 
         this = THIS;
         GF_ASSERT (this);
+        conf = this->private;
 
         if (ctx)
                 op_ctx = ctx;
@@ -3916,6 +3860,23 @@ glusterd_op_modify_op_ctx (glusterd_op_t op, void *ctx)
 
                 count = brick_index_max + other_count + 1;
 
+                /*
+                 * a glusterd lesser than version 3.7 will be sending the
+                 * rdma port in older key. Changing that value from here
+                 * to support backward compatibility
+                 */
+                 ret = dict_get_str (op_ctx, "volname", &volname);
+                 if (ret)
+                        goto out;
+
+                 glusterd_volinfo_find (volname, &volinfo);
+                 if (conf->op_version < GD_OP_VERSION_3_7_0 &&
+                     volinfo->transport_type == GF_TRANSPORT_RDMA) {
+                         ret = glusterd_op_modify_port_key (op_ctx,
+                                                            brick_index_max);
+                         if (ret)
+                                 goto out;
+                 }
                 /* add 'brick%d.peerid' into op_ctx with value of 'brick%d.path'.
                    nfs/sshd like services have this additional uuid */
                 {
@@ -5167,7 +5128,7 @@ glusterd_bricks_select_profile_volume (dict_t *dict, char **op_errstr,
         case GF_CLI_STATS_INFO:
                 ret = dict_get_str_boolean (dict, "nfs", _gf_false);
                 if (ret) {
-                        if (!glusterd_is_nodesvc_online ("nfs")) {
+                        if (!priv->nfs_svc.online) {
                                 ret = -1;
                                 gf_log (this->name, GF_LOG_ERROR, "NFS server"
                                         " is not running");
@@ -5179,7 +5140,7 @@ glusterd_bricks_select_profile_volume (dict_t *dict, char **op_errstr,
                                 ret = -1;
                                 goto out;
                         }
-                        pending_node->node = priv->nfs;
+                        pending_node->node = &(priv->nfs_svc);
                         pending_node->type = GD_NODE_NFS;
                         list_add_tail (&pending_node->list, selected);
                         pending_node = NULL;
@@ -5209,7 +5170,7 @@ glusterd_bricks_select_profile_volume (dict_t *dict, char **op_errstr,
         case GF_CLI_STATS_TOP:
                 ret = dict_get_str_boolean (dict, "nfs", _gf_false);
                 if (ret) {
-                        if (!glusterd_is_nodesvc_online ("nfs")) {
+                        if (!priv->nfs_svc.online) {
                                 ret = -1;
                                 gf_log (this->name, GF_LOG_ERROR, "NFS server"
                                         " is not running");
@@ -5221,7 +5182,7 @@ glusterd_bricks_select_profile_volume (dict_t *dict, char **op_errstr,
                                 ret = -1;
                                 goto out;
                         }
-                        pending_node->node = priv->nfs;
+                        pending_node->node = &(priv->nfs_svc);
                         pending_node->type = GD_NODE_NFS;
                         list_add_tail (&pending_node->list, selected);
                         pending_node = NULL;
@@ -5626,7 +5587,7 @@ glusterd_bricks_select_heal_volume (dict_t *dict, char **op_errstr,
         switch (heal_op) {
                 case GF_AFR_OP_INDEX_SUMMARY:
                 case GF_AFR_OP_STATISTICS_HEAL_COUNT:
-                if (!glusterd_is_nodesvc_online ("glustershd")) {
+                if (!priv->shd_svc.online) {
                         if (!rsp_dict) {
                                 gf_log (this->name, GF_LOG_ERROR, "Received "
                                         "empty ctx.");
@@ -5646,7 +5607,7 @@ glusterd_bricks_select_heal_volume (dict_t *dict, char **op_errstr,
                 }
                 break;
                 case GF_AFR_OP_STATISTICS_HEAL_COUNT_PER_REPLICA:
-                if (!glusterd_is_nodesvc_online ("glustershd")) {
+                if (!priv->shd_svc.online) {
                         if (!rsp_dict) {
                                 gf_log (this->name, GF_LOG_ERROR, "Received "
                                         "empty ctx.");
@@ -5707,7 +5668,7 @@ glusterd_bricks_select_heal_volume (dict_t *dict, char **op_errstr,
                 ret = -1;
                 goto out;
         } else {
-                pending_node->node = priv->shd;
+                pending_node->node = &(priv->shd_svc);
                 pending_node->type = GD_NODE_SHD;
                 list_add_tail (&pending_node->list, selected);
                 pending_node = NULL;
@@ -5779,7 +5740,7 @@ glusterd_bricks_select_status_volume (dict_t *dict, char **op_errstr,
         glusterd_pending_node_t *pending_node = NULL;
         xlator_t                *this = NULL;
         glusterd_conf_t         *priv = NULL;
-        glusterd_snapd_t        *snapd = NULL;
+        glusterd_snapdsvc_t     *snapd = NULL;
 
         GF_ASSERT (dict);
 
@@ -5851,7 +5812,7 @@ glusterd_bricks_select_status_volume (dict_t *dict, char **op_errstr,
 
                 ret = 0;
         } else if ((cmd & GF_CLI_STATUS_NFS) != 0) {
-                if (!glusterd_is_nodesvc_online ("nfs")) {
+                if (!priv->nfs_svc.online) {
                         ret = -1;
                         gf_log (this->name, GF_LOG_ERROR,
                                 "NFS server is not running");
@@ -5863,14 +5824,14 @@ glusterd_bricks_select_status_volume (dict_t *dict, char **op_errstr,
                         ret = -1;
                         goto out;
                 }
-                pending_node->node = priv->nfs;
+                pending_node->node = &(priv->nfs_svc);
                 pending_node->type = GD_NODE_NFS;
                 pending_node->index = 0;
                 list_add_tail (&pending_node->list, selected);
 
                 ret = 0;
         } else if ((cmd & GF_CLI_STATUS_SHD) != 0) {
-                if (!glusterd_is_nodesvc_online ("glustershd")) {
+                if (!priv->shd_svc.online) {
                         ret = -1;
                         gf_log (this->name, GF_LOG_ERROR,
                                 "Self-heal daemon is not running");
@@ -5882,14 +5843,14 @@ glusterd_bricks_select_status_volume (dict_t *dict, char **op_errstr,
                         ret = -1;
                         goto out;
                 }
-                pending_node->node = priv->shd;
+                pending_node->node = &(priv->shd_svc);
                 pending_node->type = GD_NODE_SHD;
                 pending_node->index = 0;
                 list_add_tail (&pending_node->list, selected);
 
                 ret = 0;
         } else if ((cmd & GF_CLI_STATUS_QUOTAD) != 0) {
-                if (!glusterd_is_nodesvc_online ("quotad")) {
+                if (!priv->quotad_svc.online) {
                         gf_log (this->name, GF_LOG_ERROR, "Quotad is not "
                                 "running");
                         ret = -1;
@@ -5901,14 +5862,14 @@ glusterd_bricks_select_status_volume (dict_t *dict, char **op_errstr,
                         ret = -1;
                         goto out;
                 }
-                pending_node->node = priv->quotad;
+                pending_node->node = &(priv->quotad_svc);
                 pending_node->type = GD_NODE_QUOTAD;
                 pending_node->index = 0;
                 list_add_tail (&pending_node->list, selected);
 
                 ret = 0;
         } else if ((cmd & GF_CLI_STATUS_SNAPD) != 0) {
-                if (!glusterd_is_snapd_online (volinfo)) {
+                if (!volinfo->snapd.svc.online) {
                         gf_log (this->name, GF_LOG_ERROR, "snapd is not "
                                 "running");
                         ret = -1;

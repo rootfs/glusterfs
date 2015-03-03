@@ -1699,7 +1699,6 @@ gf_defrag_fix_layout (xlator_t *this, gf_defrag_info_t *defrag, loc_t *loc,
         gf_dirent_t             *tmp            = NULL;
         gf_dirent_t             *entry          = NULL;
         gf_boolean_t             free_entries   = _gf_false;
-        dict_t                  *dict           = NULL;
         off_t                    offset         = 0;
         struct iatt              iatt           = {0,};
         inode_t                 *linked_inode   = NULL, *inode = NULL;
@@ -1855,9 +1854,6 @@ out:
 
         loc_wipe (&entry_loc);
 
-        if (dict)
-                dict_unref(dict);
-
         if (fd)
                 fd_unref (fd);
 
@@ -1952,10 +1948,11 @@ gf_defrag_start_crawl (void *data)
                 }
                 if (defrag->cmd == GF_DEFRAG_CMD_START_FORCE)
                         ret = dict_set_str (migrate_data,
-                                            "distribute.migrate-data", "force");
+                                            GF_XATTR_FILE_MIGRATE_KEY,
+                                            "force");
                 else
                         ret = dict_set_str (migrate_data,
-                                            "distribute.migrate-data",
+                                            GF_XATTR_FILE_MIGRATE_KEY,
                                             "non-force");
                 if (ret)
                         goto out;

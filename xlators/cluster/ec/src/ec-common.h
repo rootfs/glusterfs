@@ -84,6 +84,7 @@ void ec_lock_reuse(ec_fop_data_t *fop);
 void ec_unlock(ec_fop_data_t * fop);
 
 void ec_get_size_version(ec_fop_data_t * fop);
+void ec_prepare_update(ec_fop_data_t *fop);
 void ec_flush_size_version(ec_fop_data_t * fop);
 
 void ec_dispatch_all(ec_fop_data_t * fop);
@@ -93,6 +94,7 @@ void ec_dispatch_one(ec_fop_data_t * fop);
 
 void ec_wait_winds(ec_fop_data_t * fop);
 
+void ec_sleep(ec_fop_data_t *fop);
 void ec_resume(ec_fop_data_t * fop, int32_t error);
 void ec_resume_parent(ec_fop_data_t * fop, int32_t error);
 

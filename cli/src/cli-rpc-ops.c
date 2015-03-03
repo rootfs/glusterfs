@@ -484,9 +484,10 @@ gf_cli_list_friends_cbk (struct rpc_req *req, struct iovec *iov,
         ret = 0;
 
 out:
-        cli_cmd_broadcast_response (ret);
         if (ret)
                 cli_err ("%s: failed", cmd);
+
+        cli_cmd_broadcast_response (ret);
 
         if (dict)
                 dict_destroy (dict);
@@ -850,9 +851,10 @@ next:
 
         ret = 0;
 out:
-        cli_cmd_broadcast_response (ret);
         if (ret)
                 cli_err ("%s", err_str);
+
+        cli_cmd_broadcast_response (ret);
 
         if (dict)
                 dict_destroy (dict);
@@ -2408,7 +2410,8 @@ out:
 }
 
 static int
-print_quota_list_output (char *mountdir, char *default_sl, char *path)
+print_quota_list_output (cli_local_t *local, char *mountdir,
+                         char *default_sl, char *path)
 {
         int64_t used_space       = 0;
         int64_t avail            = 0;
@@ -2441,10 +2444,30 @@ print_quota_list_output (char *mountdir, char *default_sl, char *path)
 #if defined(ENOATTR) && (ENOATTR != ENODATA)
                 case ENOATTR:
 #endif
-                        cli_err ("%-40s %s", path, "Limit not set");
+                      if (global_state->mode & GLUSTER_MODE_XML) {
+                                ret = cli_quota_list_xml_error
+                                        (local, path, "Limit not set");
+                                if (ret) {
+                                        gf_log ("cli", GF_LOG_ERROR, "Failed "
+                                                "to print xml output");
+                                        goto out;
+                                }
+                        } else {
+                                cli_err ("%-40s %s", path, strerror (errno));
+                        }
                         break;
                 default:
-                        cli_err ("%-40s %s", path, strerror (errno));
+                      if (global_state->mode & GLUSTER_MODE_XML) {
+                                ret = cli_quota_list_xml_error
+                                        (local, path, strerror (errno));
+                                if (ret) {
+                                        gf_log ("cli", GF_LOG_ERROR, "Failed "
+                                                "to print xml output");
+                                        goto out;
+                                }
+                        } else {
+                                cli_err ("%-40s %s", path, strerror (errno));
+                        }
                         break;
                 }
 
@@ -2471,9 +2494,21 @@ print_quota_list_output (char *mountdir, char *default_sl, char *path)
                              &used_space, sizeof (used_space));
 
         if (ret < 0) {
-                cli_out ("%-40s %7s %9s %11s %7s %15s %20s",
-                         path, hl_str, sl_final,
-                         "N/A", "N/A", "N/A", "N/A");
+                if (global_state->mode & GLUSTER_MODE_XML) {
+                        ret = cli_quota_xml_output (local, path, hl_str,
+                                                    sl_final, "N/A",
+                                                    "N/A", "N/A", "N/A");
+                        if (ret) {
+                                gf_log ("cli", GF_LOG_ERROR, "Failed to "
+                                        "output in xml format for quota "
+                                        "list command");
+                        }
+                        goto out;
+                } else {
+                        cli_out ("%-40s %7s %9s %11s %7s %15s %20s",
+                                 path, hl_str, sl_final,
+                                 "N/A", "N/A", "N/A", "N/A");
+                }
         } else {
                 used_space = ntoh64 (used_space);
 
@@ -2492,6 +2527,20 @@ print_quota_list_output (char *mountdir, char *default_sl, char *path)
                 }
 
                 avail_str = gf_uint64_2human_readable (avail);
+
+                if (global_state->mode & GLUSTER_MODE_XML) {
+                        ret = cli_quota_xml_output (local, path, hl_str,
+                                                 sl_final, used_str,
+                                                 avail_str, sl ? "Yes" : "No",
+                                                 hl ? "Yes" : "No");
+                        if (ret) {
+                                gf_log ("cli", GF_LOG_ERROR, "Failed to "
+                                        "output in xml format for quota "
+                                        "list command");
+                        }
+                        goto out;
+                }
+
                 if (used_str == NULL) {
                         cli_out ("%-40s %7s %9s %11"PRIu64
                                  "%9"PRIu64" %15s %18s", path, hl_str,
@@ -2512,14 +2561,17 @@ out:
 }
 
 int
-gf_cli_print_limit_list_from_dict (char *volname, dict_t *dict,
-                                   char *default_sl, int count, char *op_errstr)
+gf_cli_print_limit_list_from_dict (cli_local_t *local, char *volname,
+                                   dict_t *dict, char *default_sl, int count,
+                                   int op_ret, int op_errno, char *op_errstr)
 {
-        int  ret               = -1;
-        int  i                 = 0;
-        char key[1024]         = {0,};
-        char mountdir[PATH_MAX] = {0,};
-        char *path              = NULL;
+        int             ret                     = -1;
+        int             i                       = 0;
+        char            key[1024]               = {0,};
+        char            mountdir[PATH_MAX]      = {0,};
+        char            *path                   = NULL;
+        gf_boolean_t    xml_err_flag            = _gf_false;
+        char            err_str[NAME_MAX]       = {0,};
 
         if (!dict|| count <= 0)
                 goto out;
@@ -2528,8 +2580,14 @@ gf_cli_print_limit_list_from_dict (char *volname, dict_t *dict,
          * to list them
          */
         if (!_limits_set_on_volume (volname)) {
+                snprintf (err_str, sizeof (err_str), "No quota configured on "
+                          "volume %s", volname);
+                if (global_state->mode & GLUSTER_MODE_XML) {
+                        xml_err_flag = _gf_true;
+                } else {
+                        cli_out ("quota: %s", err_str);
+                }
                 ret = 0;
-                cli_out ("quota: No quota configured on volume %s", volname);
                 goto out;
         }
 
@@ -2539,12 +2597,22 @@ gf_cli_print_limit_list_from_dict (char *volname, dict_t *dict,
                 goto out;
         }
 
-        cli_out ("                  Path                   Hard-limit "
-                 "Soft-limit   Used  Available  Soft-limit exceeded?"
-                 "  Hard-limit exceeded?");
-        cli_out ("--------------------------------------------------------"
-                 "--------------------------------------------------------"
-                 "-----------");
+        if (global_state->mode & GLUSTER_MODE_XML) {
+                ret = cli_xml_output_vol_quota_limit_list_begin
+                                (local, op_ret, op_errno, op_errstr);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR,
+                                "Error outputting xml begin");
+                        goto out;
+                }
+        } else {
+                cli_out ("                  Path                   Hard-limit "
+                         "Soft-limit   Used  Available  Soft-limit exceeded?"
+                         "  Hard-limit exceeded?");
+                cli_out ("-----------------------------------------------------"
+                         "-----------------------------------------------------"
+                         "-----------------");
+        }
 
         while (count--) {
                 snprintf (key, sizeof (key), "path%d", i++);
@@ -2560,10 +2628,18 @@ gf_cli_print_limit_list_from_dict (char *volname, dict_t *dict,
                 if (ret)
                         goto out;
                 GLUSTERD_GET_QUOTA_AUX_MOUNT_PATH (mountdir, volname, path);
-                ret = print_quota_list_output (mountdir, default_sl, path);
-
+                ret = print_quota_list_output (local, mountdir, default_sl,
+                                               path);
         }
+
 out:
+        if (xml_err_flag) {
+                ret = cli_xml_output_str ("volQuota", NULL, -1, 0, err_str);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "Error outputting in xml "
+                                "format");
+                }
+        }
         return ret;
 }
 
@@ -2655,6 +2731,20 @@ print_quota_list_from_quotad (call_frame_t *frame, dict_t *rsp_dict)
                         hl = sl = _gf_true;
                 }
                 avail_str = gf_uint64_2human_readable (avail);
+
+                if (global_state->mode & GLUSTER_MODE_XML) {
+                        ret = cli_quota_xml_output (local, path, hl_str,
+                                                sl_final, used_str,
+                                                avail_str, sl ? "Yes" : "No",
+                                                hl ? "Yes" : "No");
+                        if (ret) {
+                                gf_log ("cli", GF_LOG_ERROR, "Failed in "
+                                        "printing xml output for quota list "
+                                        "command");
+                        }
+                        goto out;
+                }
+
                 if (used_str == NULL)
                         cli_out ("%-40s %7s %9s %11"PRIu64
                                  "%9"PRIu64" %15s %20s", path, hl_str,
@@ -2766,8 +2856,9 @@ out:
 }
 
 void
-gf_cli_quota_list (char *volname, dict_t *dict, int count, char *op_errstr,
-                   char *default_sl)
+gf_cli_quota_list (cli_local_t *local, char *volname, dict_t *dict,
+                   char *default_sl, int count, int op_ret,
+                   int op_errno, char *op_errstr)
 {
         GF_VALIDATE_OR_GOTO ("cli", volname, out);
 
@@ -2775,8 +2866,9 @@ gf_cli_quota_list (char *volname, dict_t *dict, int count, char *op_errstr,
                 goto out;
 
         if (count > 0)
-                gf_cli_print_limit_list_from_dict (volname, dict, default_sl,
-                                                   count, op_errstr);
+                gf_cli_print_limit_list_from_dict (local, volname, dict,
+                                                   default_sl, count, op_ret,
+                                                   op_errno, op_errstr);
 out:
         return;
 }
@@ -2879,18 +2971,19 @@ gf_cli_quota_cbk (struct rpc_req *req, struct iovec *iov,
                 gf_log (frame->this->name, GF_LOG_TRACE, "failed to get count");
 
         if (type == GF_QUOTA_OPTION_TYPE_LIST) {
+                gf_cli_quota_list (local, volname, dict, default_sl,
+                                   entry_count, rsp.op_ret,
+                                   rsp.op_errno, rsp.op_errstr);
+
                 if (global_state->mode & GLUSTER_MODE_XML) {
-                        ret = cli_xml_output_vol_quota_limit_list
-                                (volname, limit_list, rsp.op_ret,
-                                 rsp.op_errno, rsp.op_errstr);
-                        if (ret)
-                                gf_log ("cli", GF_LOG_ERROR,
-                                        "Error outputting to xml");
+                        ret = cli_xml_output_vol_quota_limit_list_end (local);
+                        if (ret < 0) {
+                                ret = -1;
+                                gf_log ("cli", GF_LOG_ERROR, "Error in printing"
+                                       " xml output");
+                        }
                         goto out;
                 }
-
-                gf_cli_quota_list (volname, dict, entry_count, rsp.op_errstr,
-                                   default_sl);
         }
 
 xml_output:
@@ -4025,18 +4118,19 @@ get_struct_variable (int mem_num, gf_gsync_status_t *sts_val)
         case 0:  return (sts_val->node);
         case 1:  return (sts_val->master);
         case 2:  return (sts_val->brick);
-        case 3:  return (sts_val->slave_node);
-        case 4:  return (sts_val->worker_status);
-        case 5:  return (sts_val->checkpoint_status);
-        case 6:  return (sts_val->crawl_status);
-        case 7:  return (sts_val->files_syncd);
-        case 8:  return (sts_val->files_remaining);
-        case 9:  return (sts_val->bytes_remaining);
-        case 10: return (sts_val->purges_remaining);
-        case 11: return (sts_val->total_files_skipped);
-        case 12: return (sts_val->brick_host_uuid);
-        case 13: return (sts_val->slavekey);
-        case 14: return (sts_val->session_slave);
+        case 3:  return (sts_val->slave_user);
+        case 4:  return (sts_val->slave_node);
+        case 5:  return (sts_val->worker_status);
+        case 6:  return (sts_val->checkpoint_status);
+        case 7:  return (sts_val->crawl_status);
+        case 8:  return (sts_val->files_syncd);
+        case 9:  return (sts_val->files_remaining);
+        case 10:  return (sts_val->bytes_remaining);
+        case 11: return (sts_val->purges_remaining);
+        case 12: return (sts_val->total_files_skipped);
+        case 13: return (sts_val->brick_host_uuid);
+        case 14: return (sts_val->slavekey);
+        case 15: return (sts_val->session_slave);
         default:
                  goto out;
         }
@@ -4054,7 +4148,7 @@ gf_cli_print_status (char **title_values,
         int     i                        = 0;
         int     j                        = 0;
         int     ret                      = 0;
-        int     status_fields            = 6; /* Indexed at 0 */
+        int     status_fields            = 7; /* Indexed at 0 */
         int     total_spacing            = 0;
         char  **output_values            = NULL;
         char   *tmp                      = NULL;
@@ -4216,12 +4310,13 @@ gf_cli_gsync_status_output (dict_t *dict, gf_boolean_t is_detail)
         int                     i              = 0;
         int                     ret            = 0;
         int                     spacing[13]    = {0};
-        int                     num_of_fields  = 12;
+        int                     num_of_fields  = 13;
         char                    errmsg[1024]   = "";
         char                   *master         = NULL;
         char                   *slave          = NULL;
         char                   *title_values[] = {"MASTER NODE", "MASTER VOL",
-                                                  "MASTER BRICK", "SLAVE",
+                                                  "MASTER BRICK", "SLAVE USER",
+                                                  "SLAVE",
                                                   "STATUS", "CHECKPOINT STATUS",
                                                   "CRAWL STATUS", "FILES SYNCD",
                                                   "FILES PENDING", "BYTES PENDING",
@@ -6718,12 +6813,15 @@ gf_cli_status_cbk (struct rpc_req *req, struct iovec *iov,
         cli_out ("Status of volume: %s", volname);
 
         if ((cmd & GF_CLI_STATUS_DETAIL) == 0) {
-                cli_out ("Gluster process\t\t\t\t\t\tPort\tOnline\tPid");
+                cli_out ("%-*s %s  %s  %s  %s", CLI_VOL_STATUS_BRICK_LEN,
+                         "Gluster process", "TCP Port", "RDMA Port",
+                         "Online", "Pid");
                 cli_print_line (CLI_BRICK_STATUS_LINE_LEN);
         }
 
         for (i = 0; i <= index_max; i++) {
 
+                status.rdma_port = 0;
 
                 memset (key, 0, sizeof (key));
                 snprintf (key, sizeof (key), "brick%d.hostname", i);
@@ -6747,9 +6845,15 @@ gf_cli_status_cbk (struct rpc_req *req, struct iovec *iov,
                     !strcmp (hostname, "Snapshot Daemon"))
                         snprintf (status.brick, PATH_MAX + 255, "%s on %s",
                                   hostname, path);
-                else
+                else {
+                        memset (key, 0, sizeof (key));
+                        snprintf (key, sizeof (key), "brick%d.rdma_port", i);
+                        ret = dict_get_int32 (dict, key, &(status.rdma_port));
+                        if (ret)
+                                continue;
                         snprintf (status.brick, PATH_MAX + 255, "Brick %s:%s",
                                   hostname, path);
+                }
 
                 memset (key, 0, sizeof (key));
                 snprintf (key, sizeof (key), "brick%d.port", i);
@@ -6782,10 +6886,10 @@ gf_cli_status_cbk (struct rpc_req *req, struct iovec *iov,
                                 goto out;
                         cli_print_line (CLI_BRICK_STATUS_LINE_LEN);
                         cli_print_detailed_status (&status);
-
                 } else {
                         cli_print_brick_status (&status);
                 }
+
         }
         cli_out (" ");
 

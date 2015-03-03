@@ -17,9 +17,11 @@
 #include "xdr-generic.h"
 #include "glusterd.h"
 #include "glusterd-op-sm.h"
+#include "glusterd-geo-rep.h"
 #include "glusterd-store.h"
 #include "glusterd-utils.h"
 #include "glusterd-volgen.h"
+#include "glusterd-svc-helper.h"
 #include "run.h"
 #include "syscall.h"
 
@@ -1327,8 +1329,9 @@ out:
         return ret;
 }
 
-int
-glusterd_check_gsync_running (glusterd_volinfo_t *volinfo, gf_boolean_t *flag)
+void
+glusterd_check_geo_rep_configured (glusterd_volinfo_t *volinfo,
+                                   gf_boolean_t *flag)
 {
 
         GF_ASSERT (volinfo);
@@ -1339,7 +1342,7 @@ glusterd_check_gsync_running (glusterd_volinfo_t *volinfo, gf_boolean_t *flag)
         else
                 *flag = _gf_false;
 
-        return 0;
+        return;
 }
 
 /*
@@ -1494,6 +1497,63 @@ _get_slave_status (dict_t *dict, char *key, data_t *value, void *data)
                                  &param->is_active);
 out:
         GF_FREE(errmsg);
+        return ret;
+}
+
+/* glusterd_check_geo_rep_running:
+ *          Checks if any geo-rep session is running for the volume.
+ *
+ *    RETURN VALUE:
+ *          Sets param.active to true if any geo-rep session is active.
+ *    This function sets op_errstr during some error and when any geo-rep
+ *    session is active. It is caller's responsibility to free op_errstr
+ *    in above cases.
+ */
+
+int
+glusterd_check_geo_rep_running (gsync_status_param_t *param, char **op_errstr)
+{
+        char                    msg[2048]   = {0,};
+        gf_boolean_t            enabled     = _gf_false;
+        int                     ret         = 0;
+        xlator_t               *this        = NULL;
+
+        this = THIS;
+        GF_ASSERT (this);
+        GF_ASSERT (param);
+        GF_ASSERT (param->volinfo);
+        GF_ASSERT (op_errstr);
+
+        glusterd_check_geo_rep_configured (param->volinfo, &enabled);
+
+        if (enabled) {
+                ret = dict_foreach (param->volinfo->gsync_slaves,
+                                    _get_slave_status, param);
+                if (ret) {
+                        gf_log (this->name, GF_LOG_ERROR,
+                                "_get_slave_satus failed");
+                        snprintf (msg, sizeof(msg), GEOREP" Unable to"
+                                  " get the status of active "GEOREP""
+                                  " session for the volume '%s'.\n"
+                                  " Please check the log file for"
+                                  " more info.", param->volinfo->volname);
+                        *op_errstr = gf_strdup (msg);
+                        ret = -1;
+                        goto out;
+                }
+
+                if (param->is_active) {
+                        snprintf (msg, sizeof(msg), GEOREP" sessions"
+                                  " are active for the volume %s.\nStop"
+                                  " "GEOREP " sessions involved in this"
+                                  " volume. Use 'volume "GEOREP
+                                  " status' command for more info.",
+                                  param->volinfo->volname);
+                        *op_errstr = gf_strdup (msg);
+                        goto out;
+                 }
+         }
+ out:
         return ret;
 }
 
@@ -3487,6 +3547,10 @@ glusterd_read_status_file (glusterd_volinfo_t *volinfo, char *slave,
         dict_t                 *confd                      = NULL;
         char                   *slavekey                   = NULL;
         char                   *slaveentry                 = NULL;
+        char                   *slaveuser                  = NULL;
+        char                   *saveptr                    = NULL;
+        char                   *temp                       = NULL;
+        char                   *temp_inp                   = NULL;
         char                   *brick_host_uuid            = NULL;
         int                     brick_host_uuid_length     = 0;
         int                     gsync_count                = 0;
@@ -3718,9 +3782,26 @@ store_status:
                         GF_FREE (sts_val);
                         goto out;
                 }
+
+
                 memcpy (sts_val->session_slave, slaveentry,
                         strlen(slaveentry));
                 sts_val->session_slave[strlen(slaveentry)] = '\0';
+
+                temp_inp = gf_strdup(slaveentry);
+                if (!temp_inp)
+                        goto out;
+
+                if (strstr(temp_inp, "@") == NULL) {
+                        slaveuser = "root";
+                } else {
+                        temp = strtok_r(temp_inp, "//", &saveptr);
+                        temp = strtok_r(NULL, "/", &saveptr);
+                        slaveuser = strtok_r(temp, "@", &saveptr);
+                }
+                memcpy (sts_val->slave_user, slaveuser,
+                        strlen(slaveuser));
+                sts_val->slave_user[strlen(slaveuser)] = '\0';
 
                 snprintf (sts_val_name, sizeof (sts_val_name), "status_value%d", gsync_count);
                 ret = dict_set_bin (dict, sts_val_name, sts_val, sizeof(gf_gsync_status_t));
@@ -3738,6 +3819,7 @@ store_status:
                 goto out;
 
 out:
+        GF_FREE (temp_inp);
         dict_unref (confd);
 
         return 0;
@@ -3822,7 +3904,7 @@ glusterd_marker_changelog_create_volfile (glusterd_volinfo_t *volinfo)
                 goto out;
 
         if (GLUSTERD_STATUS_STARTED == volinfo->status)
-                ret = glusterd_nodesvcs_handle_graph_change (volinfo);
+                ret = glusterd_svcs_manager (volinfo);
         ret = 0;
 out:
         return ret;
@@ -5294,9 +5376,9 @@ glusterd_op_gsync_create (dict_t *dict, char **op_errstr, dict_t *rsp_dict)
                         is_pem_push = 0;
 
                 snprintf(hooks_args, sizeof(hooks_args),
-                         "is_push_pem=%d,pub_file=%s,slave_user=%s,slave_ip=%s",
-                         is_pem_push, common_pem_file, slave_user, slave_ip);
-
+                         "is_push_pem=%d,pub_file=%s,slave_user=%s,slave_ip=%s,"
+                         "slave_vol=%s", is_pem_push, common_pem_file,
+                         slave_user, slave_ip, slave_vol);
         } else
                 snprintf(hooks_args, sizeof(hooks_args),
                          "This argument will stop the hooks script");

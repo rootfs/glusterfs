@@ -95,7 +95,8 @@ glusterfs_ctx_defaults_init (glusterfs_ctx_t *ctx)
 		goto err;
 	}
 
-	ctx->event_pool = event_pool_new (DEFAULT_EVENT_POOL_SIZE);
+	ctx->event_pool = event_pool_new (DEFAULT_EVENT_POOL_SIZE,
+                                          STARTING_EVENT_THREADS);
 	if (!ctx->event_pool) {
 		goto err;
 	}
@@ -563,7 +564,8 @@ pub_glfs_new (const char *volname)
 	if (ret)
 		return NULL;
 
-	THIS->ctx = ctx;
+        if (!THIS->ctx)
+                THIS->ctx = ctx;
 
 	/* then ctx_defaults_init, for xlator_mem_acct_init(THIS) */
 	ret = glusterfs_ctx_defaults_init (ctx);
@@ -800,6 +802,11 @@ pub_glfs_init (struct glfs *fs)
 		return ret;
 
 	ret = glfs_init_wait (fs);
+
+        /* Set the initial current working directory to "/" */
+        if (ret >= 0) {
+                ret = glfs_chdir (fs, "/");
+        }
 
 	return ret;
 }

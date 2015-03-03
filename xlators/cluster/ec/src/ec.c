@@ -195,151 +195,199 @@ failed:
         return -1;
 }
 
-void ec_up(xlator_t * this, ec_t * ec)
+glusterfs_event_t
+ec_get_event_from_state (ec_t *ec)
 {
-    if (ec->timer != NULL)
-    {
-        gf_timer_call_cancel(this->ctx, ec->timer);
-        ec->timer = NULL;
-    }
+        int               down_count = 0;
 
-    if (!ec->up && (ec->xl_up_count >= ec->fragments))
-    {
-        if (ec->xl_up_count < ec->nodes)
-        {
-            gf_log("ec", GF_LOG_WARNING, "Starting volume with only %d bricks",
-                   ec->xl_up_count);
+        if (ec->xl_up_count >= ec->fragments) {
+                /* If ec is up but some subvolumes are yet to notify, give
+                 * grace time for other subvols to notify to prevent start of
+                 * I/O which may result in self-heals */
+                if (ec->timer && ec->xl_notify_count < ec->nodes)
+                        return GF_EVENT_MAXVAL;
+
+                return GF_EVENT_CHILD_UP;
+        } else {
+                down_count = ec->xl_notify_count - ec->xl_up_count;
+                if (down_count > ec->redundancy)
+                        return GF_EVENT_CHILD_DOWN;
+        }
+
+        return GF_EVENT_MAXVAL;
+}
+
+void
+ec_up (xlator_t *this, ec_t *ec)
+{
+        if (ec->timer != NULL) {
+                gf_timer_call_cancel (this->ctx, ec->timer);
+                ec->timer = NULL;
         }
 
         ec->up = 1;
         gf_log(this->name, GF_LOG_INFO, "Going UP");
-
-        default_notify(this, GF_EVENT_CHILD_UP, NULL);
-    }
 }
 
-void ec_down(xlator_t * this, ec_t * ec)
+void
+ec_down (xlator_t *this, ec_t *ec)
 {
-    if (ec->timer != NULL)
-    {
-        gf_timer_call_cancel(this->ctx, ec->timer);
-        ec->timer = NULL;
-    }
+        if (ec->timer != NULL) {
+                gf_timer_call_cancel(this->ctx, ec->timer);
+                ec->timer = NULL;
+        }
 
-    if (ec->up)
-    {
         ec->up = 0;
         gf_log(this->name, GF_LOG_INFO, "Going DOWN");
-
-        default_notify(this, GF_EVENT_CHILD_DOWN, NULL);
-    }
 }
 
-void ec_notify_up_cbk(void * data)
+void
+ec_notify_cbk (void *data)
 {
-    ec_t * ec = data;
+        ec_t *ec = data;
+        glusterfs_event_t event = GF_EVENT_MAXVAL;
 
-    LOCK(&ec->lock);
+        LOCK(&ec->lock);
+        {
+                if (!ec->timer) {
+                        /*
+                         * Either child_up/child_down is already sent to parent
+                         * This is a spurious wake up.
+                         */
+                        goto unlock;
+                }
 
-    if (ec->timer != NULL)
-    {
-        ec_up(ec->xl, ec);
-    }
+                gf_timer_call_cancel (ec->xl->ctx, ec->timer);
+                ec->timer = NULL;
 
-    UNLOCK(&ec->lock);
+                event = ec_get_event_from_state (ec);
+                /* If event is still MAXVAL then enough subvolumes didn't
+                 * notify, treat it as CHILD_DOWN. */
+                if (event == GF_EVENT_MAXVAL) {
+                        event = GF_EVENT_CHILD_DOWN;
+                        ec->xl_notify = (1ULL << ec->nodes) - 1ULL;
+                        ec->xl_notify_count = ec->nodes;
+                } else if (event == GF_EVENT_CHILD_UP) {
+                        /* Rest of the bricks are still not coming up,
+                         * notify that ec is up. Files/directories will be
+                         * healed as in when they come up. */
+                        ec_up (ec->xl, ec);
+                }
+
+                /* CHILD_DOWN should not come here as no grace period is given
+                 * for notifying CHILD_DOWN. */
+
+                default_notify (ec->xl, event, NULL);
+        }
+unlock:
+        UNLOCK(&ec->lock);
 }
 
-int32_t ec_notify_up(xlator_t * this, ec_t * ec, int32_t idx)
+void
+ec_launch_notify_timer (xlator_t *this, ec_t *ec)
 {
-    struct timespec delay = {0, };
+        struct timespec delay = {0, };
 
-    if (((ec->xl_up >> idx) & 1) == 0)
-    {
-        ec->xl_up |= 1ULL << idx;
-        ec->xl_up_count++;
-
-        gf_log("ec", GF_LOG_DEBUG, "Child %d is UP (%lX, %u)", idx, ec->xl_up,
-               ec->xl_up_count);
-
-        if (ec->xl_up_count == ec->fragments)
-        {
-            gf_log("ec", GF_LOG_DEBUG, "Initiating up timer");
-
-            delay.tv_sec = 5;
-            delay.tv_nsec = 0;
-            ec->timer = gf_timer_call_after(this->ctx, delay, ec_notify_up_cbk,
-                                            ec);
-            if (ec->timer == NULL)
-            {
-                gf_log(this->name, GF_LOG_ERROR, "Cannot create timer for "
-                                                 "delayed initialization");
-
-                return ENOMEM;
-            }
+        gf_log (this->name, GF_LOG_DEBUG, "Initiating child-down timer");
+        delay.tv_sec = 10;
+        delay.tv_nsec = 0;
+        ec->timer = gf_timer_call_after (this->ctx, delay, ec_notify_cbk, ec);
+        if (ec->timer == NULL) {
+                gf_log(this->name, GF_LOG_ERROR, "Cannot create timer "
+                       "for delayed initialization");
         }
-        else if (ec->xl_up_count == ec->nodes)
-        {
-            ec_up(this, ec);
-        }
-    }
-
-    return EAGAIN;
 }
 
-int32_t ec_notify_down(xlator_t * this, ec_t * ec, int32_t idx)
+void
+ec_handle_up (xlator_t *this, ec_t *ec, int32_t idx)
 {
-    if (((ec->xl_up >> idx) & 1) != 0)
-    {
-        gf_log("ec", GF_LOG_DEBUG, "Child %d is DOWN", idx);
-
-        ec->xl_up ^= 1ULL << idx;
-        if (ec->xl_up_count-- == ec->fragments)
-        {
-            ec_down(this, ec);
+        if (((ec->xl_notify >> idx) & 1) == 0) {
+                ec->xl_notify |= 1ULL << idx;
+                ec->xl_notify_count++;
         }
-    }
 
-    return EAGAIN;
+        if (((ec->xl_up >> idx) & 1) == 0) { /* Duplicate event */
+                ec->xl_up |= 1ULL << idx;
+                ec->xl_up_count++;
+        }
 }
 
-int32_t notify(xlator_t * this, int32_t event, void * data, ...)
+void
+ec_handle_down (xlator_t *this, ec_t *ec, int32_t idx)
+{
+        if (((ec->xl_notify >> idx) & 1) == 0) {
+                ec->xl_notify |= 1ULL << idx;
+                ec->xl_notify_count++;
+        }
+
+        if (((ec->xl_up >> idx) & 1) != 0) { /* Duplicate event */
+                gf_log(this->name, GF_LOG_DEBUG, "Child %d is DOWN", idx);
+
+                ec->xl_up ^= 1ULL << idx;
+                ec->xl_up_count--;
+        }
+}
+
+int32_t
+notify (xlator_t *this, int32_t event, void *data, ...)
 {
     ec_t * ec = this->private;
     int32_t idx = 0;
     int32_t error = 0;
+    glusterfs_event_t old_event = GF_EVENT_MAXVAL;
+    glusterfs_event_t new_event = GF_EVENT_MAXVAL;
 
-    LOCK(&ec->lock);
+        LOCK (&ec->lock);
 
-    for (idx = 0; idx < ec->nodes; idx++)
-    {
-        if (ec->xl_list[idx] == data)
-        {
-            break;
+        if (event == GF_EVENT_PARENT_UP) {
+                /*
+                 * Start a timer which sends appropriate event to parent
+                 * xlator to prevent the 'mount' syscall from hanging.
+                 */
+                ec_launch_notify_timer (this, ec);
+                goto unlock;
         }
-    }
 
-    gf_log("ec", GF_LOG_TRACE, "NOTIFY(%d): %p, %d", event, data, idx);
-
-    if (idx < ec->nodes)
-    {
-        if (event == GF_EVENT_CHILD_UP)
-        {
-            error = ec_notify_up(this, ec, idx);
+        for (idx = 0; idx < ec->nodes; idx++) {
+                if (ec->xl_list[idx] == data)
+                        break;
         }
-        else if (event == GF_EVENT_CHILD_DOWN)
-        {
-            error = ec_notify_down(this, ec, idx);
+
+        gf_log (this->name, GF_LOG_TRACE, "NOTIFY(%d): %p, %d",
+                event, data, idx);
+
+        if (idx < ec->nodes) { /* CHILD_* events */
+
+                old_event = ec_get_event_from_state (ec);
+
+                if (event == GF_EVENT_CHILD_UP) {
+                        ec_handle_up (this, ec, idx);
+                } else if (event == GF_EVENT_CHILD_DOWN) {
+                        ec_handle_down (this, ec, idx);
+                }
+
+                new_event = ec_get_event_from_state (ec);
+
+                if (new_event == GF_EVENT_CHILD_UP && !ec->up) {
+                        ec_up (this, ec);
+                } else if (new_event == GF_EVENT_CHILD_DOWN && ec->up) {
+                        ec_down (this, ec);
+                }
+
+                if ((new_event == old_event) && (new_event != GF_EVENT_MAXVAL))
+                        new_event = GF_EVENT_CHILD_MODIFIED;
+
+                event = GF_EVENT_MAXVAL;/* Take care of notifying inside lock */
+                if (new_event != GF_EVENT_MAXVAL)
+                        error = default_notify (this, new_event, data);
         }
-    }
+unlock:
+        UNLOCK (&ec->lock);
 
-    UNLOCK(&ec->lock);
+        if (event != GF_EVENT_MAXVAL)
+                return default_notify (this, event, data);
 
-    if (error == 0)
-    {
-        return default_notify(this, event, data);
-    }
-
-    return 0;
+        return error;
 }
 
 int32_t

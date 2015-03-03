@@ -20,6 +20,7 @@
 #include "glusterfs.h"
 #include "statedump.h"
 #include "compat-errno.h"
+#include "event.h"
 
 #include "xdr-rpc.h"
 #include "glusterfs3.h"
@@ -32,6 +33,74 @@ int client_handshake (xlator_t *this, struct rpc_clnt *rpc);
 int client_init_rpc (xlator_t *this);
 int client_destroy_rpc (xlator_t *this);
 int client_mark_fd_bad (xlator_t *this);
+
+static int
+client_fini_complete (xlator_t *this)
+{
+        GF_VALIDATE_OR_GOTO (this->name, this->private, out);
+
+        clnt_conf_t *conf = this->private;
+
+        if (!conf->destroy)
+                return 0;
+
+        this->private = NULL;
+
+        pthread_mutex_destroy (&conf->lock);
+        GF_FREE (conf);
+
+out:
+        return 0;
+}
+
+static int
+client_notify_dispatch_uniq (xlator_t *this, int32_t event, void *data, ...)
+{
+        clnt_conf_t     *conf = this->private;
+
+        if (conf->last_sent_event == event)
+                return 0;
+
+        return client_notify_dispatch (this, event, data);
+}
+
+int
+client_notify_dispatch (xlator_t *this, int32_t event, void *data, ...)
+{
+       int              ret  = -1;
+       glusterfs_ctx_t *ctx  = this->ctx;
+       clnt_conf_t     *conf = this->private;
+
+       pthread_mutex_lock (&ctx->notify_lock);
+       {
+                while (ctx->notifying)
+                        pthread_cond_wait (&ctx->notify_cond,
+                                           &ctx->notify_lock);
+               ctx->notifying = 1;
+       }
+       pthread_mutex_unlock (&ctx->notify_lock);
+
+       /* We assume that all translators in the graph handle notification
+        * events in sequence.
+        * */
+       ret = default_notify (this, event, data);
+
+       /* NB (Even) with MT-epoll and EPOLLET|EPOLLONESHOT we are guaranteed
+        * that there would be atmost one poller thread executing this
+        * notification function. This allows us to update last_sent_event
+        * without explicit synchronization. See epoll(7).
+        */
+       conf->last_sent_event = event;
+
+       pthread_mutex_lock (&ctx->notify_lock);
+       {
+               ctx->notifying = 0;
+               pthread_cond_signal (&ctx->notify_cond);
+       }
+       pthread_mutex_unlock (&ctx->notify_lock);
+
+       return ret;
+}
 
 int32_t
 client_type_to_gf_type (short l_type)
@@ -2168,14 +2237,12 @@ client_rpc_notify (struct rpc_clnt *rpc, void *mydata, rpc_clnt_event_t event,
                                         "handshake msg returned %d", ret);
                 } else {
                         //conf->rpc->connected = 1;
-                        if (conf->last_sent_event != GF_EVENT_CHILD_UP) {
-                                ret = default_notify (this, GF_EVENT_CHILD_UP,
-                                                      NULL);
-                                if (ret)
-                                        gf_log (this->name, GF_LOG_INFO,
-                                                "CHILD_UP notify failed");
-                                conf->last_sent_event = GF_EVENT_CHILD_UP;
-                        }
+                        ret = client_notify_dispatch_uniq (this,
+                                                           GF_EVENT_CHILD_UP,
+                                                           NULL);
+                        if (ret)
+                                gf_log (this->name, GF_LOG_INFO,
+                                        "CHILD_UP notify failed");
                 }
 
                 /* Cancel grace timer if set */
@@ -2223,14 +2290,13 @@ client_rpc_notify (struct rpc_clnt *rpc, void *mydata, rpc_clnt_event_t event,
                            may get screwed up.. (eg. CHILD_MODIFIED event in
                            replicate), hence make sure events which are passed
                            to parent are genuine */
-                        if (conf->last_sent_event != GF_EVENT_CHILD_DOWN) {
-                                ret = default_notify (this, GF_EVENT_CHILD_DOWN,
-                                                      NULL);
-                                if (ret)
-                                        gf_log (this->name, GF_LOG_INFO,
-                                                "CHILD_DOWN notify failed");
-                                conf->last_sent_event = GF_EVENT_CHILD_DOWN;
-                        }
+                        ret = client_notify_dispatch_uniq (this,
+                                                           GF_EVENT_CHILD_DOWN,
+                                                           NULL);
+                        if (ret)
+                                gf_log (this->name, GF_LOG_INFO,
+                                        "CHILD_DOWN notify failed");
+
                 } else {
                         if (conf->connected)
                                 gf_log (this->name, GF_LOG_DEBUG,
@@ -2249,6 +2315,10 @@ client_rpc_notify (struct rpc_clnt *rpc, void *mydata, rpc_clnt_event_t event,
 
                 }
 
+                break;
+
+        case RPC_CLNT_DESTROY:
+                ret = client_fini_complete (this);
                 break;
 
         default:
@@ -2513,6 +2583,18 @@ out:
 }
 
 int
+client_check_event_threads (xlator_t *this, clnt_conf_t *conf, int32_t old,
+                            int32_t new)
+{
+        if (old == new)
+                return 0;
+
+        conf->event_threads = new;
+        return event_reconfigure_threads (this->ctx->event_pool,
+                                          conf->event_threads);
+}
+
+int
 reconfigure (xlator_t *this, dict_t *options)
 {
 	clnt_conf_t *conf              = NULL;
@@ -2522,6 +2604,7 @@ reconfigure (xlator_t *this, dict_t *options)
         char        *new_remote_subvol = NULL;
         char        *old_remote_host   = NULL;
         char        *new_remote_host   = NULL;
+        int32_t      new_nthread       = 0;
 
 	conf = this->private;
 
@@ -2530,6 +2613,13 @@ reconfigure (xlator_t *this, dict_t *options)
 
         GF_OPTION_RECONF ("ping-timeout", conf->opt.ping_timeout,
                           options, int32, out);
+
+        GF_OPTION_RECONF ("event-threads", new_nthread, options,
+                          int32, out);
+        ret = client_check_event_threads (this, conf, conf->event_threads,
+                                          new_nthread);
+        if (ret)
+                goto out;
 
         ret = client_check_remote_host (this, options);
         if (ret)
@@ -2609,6 +2699,13 @@ init (xlator_t *this)
         conf->grace_timer        = NULL;
         conf->grace_timer_needed = _gf_true;
 
+        /* Set event threads to the configured default */
+        GF_OPTION_INIT("event-threads", conf->event_threads, int32, out);
+        ret = client_check_event_threads (this, conf, STARTING_EVENT_THREADS,
+                                          conf->event_threads);
+        if (ret)
+                goto out;
+
         ret = client_init_grace_timer (this, this->options, conf);
         if (ret)
                 goto out;
@@ -2656,23 +2753,19 @@ fini (xlator_t *this)
         clnt_conf_t *conf = NULL;
 
         conf = this->private;
-        this->private = NULL;
+        if (!conf)
+                return;
 
-        if (conf) {
-                if (conf->rpc) {
-                        /* cleanup the saved-frames before last unref */
-                        rpc_clnt_connection_cleanup (&conf->rpc->conn);
-
-                        rpc_clnt_unref (conf->rpc);
-                }
-
-                /* Saved Fds */
-                /* TODO: */
-
-                pthread_mutex_destroy (&conf->lock);
-
-                GF_FREE (conf);
+        conf->destroy = 1;
+        if (conf->rpc) {
+                /* cleanup the saved-frames before last unref */
+                rpc_clnt_connection_cleanup (&conf->rpc->conn);
+                rpc_clnt_unref (conf->rpc);
         }
+
+        /* Saved Fds */
+        /* TODO: */
+
         return;
 }
 
@@ -2935,6 +3028,16 @@ struct volume_options options[] = {
         { .key   = {"send-gids"},
           .type  = GF_OPTION_TYPE_BOOL,
           .default_value = "on",
+        },
+        { .key   = {"event-threads"},
+          .type  = GF_OPTION_TYPE_INT,
+          .min   = 1,
+          .max   = 32,
+          .default_value = "2",
+          .description = "Specifies the number of event threads to execute in"
+                         "in parallel. Larger values would help process"
+                         " responses faster, depending on available processing"
+                         " power. Range 1-32 threads."
         },
         { .key   = {NULL} },
 };

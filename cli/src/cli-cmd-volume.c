@@ -1080,6 +1080,8 @@ cli_cmd_quota_handle_list_all (const char **words, dict_t *options)
         unsigned char            buf[16]   = {0};
         int                      fd        = -1;
         char                     quota_conf_file[PATH_MAX] = {0};
+        gf_boolean_t             xml_err_flag   = _gf_false;
+        char                     err_str[NAME_MAX] = {0,};
 
         xdata = dict_new ();
         if (!xdata) {
@@ -1104,7 +1106,13 @@ cli_cmd_quota_handle_list_all (const char **words, dict_t *options)
          * quota enabled as cli_get_soft_limit() handles that
          */
         if (!_limits_set_on_volume (volname)) {
-                cli_out ("quota: No quota configured on volume %s", volname);
+                snprintf (err_str, sizeof (err_str), "No quota configured on "
+                          "volume %s", volname);
+                if (global_state->mode & GLUSTER_MODE_XML) {
+                        xml_err_flag = _gf_true;
+                } else {
+                        cli_out ("quota: %s", err_str);
+                }
                 ret = 0;
                 goto out;
         }
@@ -1155,7 +1163,18 @@ cli_cmd_quota_handle_list_all (const char **words, dict_t *options)
         CLI_LOCAL_INIT (local, words, frame, xdata);
         proc = &cli_quotad_clnt.proctable[GF_AGGREGATOR_GETLIMIT];
 
-        print_quota_list_header ();
+        if (!(global_state->mode & GLUSTER_MODE_XML)) {
+                print_quota_list_header ();
+        } else {
+                ret = cli_xml_output_vol_quota_limit_list_begin
+                        (local, 0, 0, NULL);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "Error in printing "
+                                "xml output");
+                        goto out;
+                }
+        }
+
         gfid_str = GF_CALLOC (1, gf_common_mt_char, 64);
         if (!gfid_str) {
                 ret = -1;
@@ -1191,12 +1210,31 @@ cli_cmd_quota_handle_list_all (const char **words, dict_t *options)
                 all_failed = all_failed && ret;
         }
 
+        if (global_state->mode & GLUSTER_MODE_XML) {
+                ret = cli_xml_output_vol_quota_limit_list_end (local);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "Error in printing "
+                                "xml output");
+                        goto out;
+                }
+        }
+
         if (count > 0) {
                 ret = all_failed? -1: 0;
         } else {
                 ret = 0;
         }
+
+
 out:
+        if (xml_err_flag) {
+                ret = cli_xml_output_str ("volQuota", NULL, -1, 0, err_str);
+                if (ret) {
+                        gf_log ("cli", GF_LOG_ERROR, "Error outputting in "
+                                "xml format");
+                }
+        }
+
         if (fd != -1) {
                 close (fd);
         }
@@ -1778,10 +1816,15 @@ void
 cli_print_detailed_status (cli_volume_status_t *status)
 {
         cli_out ("%-20s : %-20s", "Brick", status->brick);
-        if (status->online)
-                cli_out ("%-20s : %-20d", "Port", status->port);
-        else
-                cli_out ("%-20s : %-20s", "Port", "N/A");
+
+        if (status->online) {
+                cli_out ("%-20s : %-20d", "TCP Port", status->port);
+                cli_out ("%-20s : %-20d", "RDMA Port", status->rdma_port);
+        } else {
+                cli_out ("%-20s : %-20s", "TCP Port", "N/A");
+                cli_out ("%-20s : %-20s", "RDMA Port", "N/A");
+        }
+
         cli_out ("%-20s : %-20c", "Online", (status->online) ? 'Y' : 'N');
         cli_out ("%-20s : %-20s", "Pid", status->pid_str);
 
@@ -1842,7 +1885,7 @@ cli_print_brick_status (cli_volume_status_t *status)
         int  fieldlen = CLI_VOL_STATUS_BRICK_LEN;
         int  bricklen = 0;
         char *p = NULL;
-        int  num_tabs = 0;
+        int  num_spaces = 0;
 
         p = status->brick;
         bricklen = strlen (p);
@@ -1852,25 +1895,27 @@ cli_print_brick_status (cli_volume_status_t *status)
                         p += fieldlen;
                         bricklen -= fieldlen;
                 } else {
-                        num_tabs = (fieldlen - bricklen) / CLI_TAB_LENGTH + 1;
+                        num_spaces = (fieldlen - bricklen) + 1;
                         printf ("%s", p);
-                        while (num_tabs-- != 0)
-                                printf ("\t");
-                        if (status->port) {
+                        while (num_spaces-- != 0)
+                                printf (" ");
+                        if (status->port || status->rdma_port) {
                                 if (status->online)
-                                        cli_out ("%d\t%c\t%s",
+                                        cli_out ("%-10d%-11d%-8c%-5s",
                                                  status->port,
+                                                 status->rdma_port,
                                                  status->online?'Y':'N',
                                                  status->pid_str);
                                 else
-                                        cli_out ("%s\t%c\t%s",
+                                        cli_out ("%-10s%-11s%-8c%-5s",
+                                                 "N/A",
                                                  "N/A",
                                                  status->online?'Y':'N',
                                                  status->pid_str);
                         }
                         else
-                                cli_out ("%s\t%c\t%s",
-                                         "N/A", status->online?'Y':'N',
+                                cli_out ("%-10s%-11s%-8c%-5s",
+                                         "N/A", "N/A", status->online?'Y':'N',
                                          status->pid_str);
                         bricklen = 0;
                 }
@@ -1881,7 +1926,8 @@ cli_print_brick_status (cli_volume_status_t *status)
 
 #define NEEDS_GLFS_HEAL(op) ((op == GF_AFR_OP_SBRAIN_HEAL_FROM_BIGGER_FILE) || \
                              (op == GF_AFR_OP_SBRAIN_HEAL_FROM_BRICK) ||      \
-                             (op == GF_AFR_OP_INDEX_SUMMARY))
+                             (op == GF_AFR_OP_INDEX_SUMMARY) ||               \
+                             (op == GF_AFR_OP_SPLIT_BRAIN_FILES))
 
 int
 cli_launch_glfs_heal (int heal_op, dict_t *options)
@@ -1907,7 +1953,7 @@ cli_launch_glfs_heal (int heal_op, dict_t *options)
                 ret = dict_get_str (options, "file", &filename);
                 runner_add_args (&runner, "bigger-file", filename, NULL);
                 break;
-        case  GF_AFR_OP_SBRAIN_HEAL_FROM_BRICK:
+        case GF_AFR_OP_SBRAIN_HEAL_FROM_BRICK:
                 ret = dict_get_str (options, "heal-source-hostname",
                                     &hostname);
                 ret = dict_get_str (options, "heal-source-brickpath",
@@ -1916,6 +1962,9 @@ cli_launch_glfs_heal (int heal_op, dict_t *options)
                 runner_argprintf (&runner, "%s:%s", hostname, path);
                 if (dict_get_str (options, "file", &filename) == 0)
                         runner_argprintf (&runner, filename);
+                break;
+        case GF_AFR_OP_SPLIT_BRAIN_FILES:
+                runner_add_args (&runner, "split-brain-info", NULL);
                 break;
         default:
                 ret = -1;
@@ -2256,7 +2305,7 @@ struct cli_cmd volume_cmds[] = {
           "list information of all volumes"},
 
         { "volume create <NEW-VOLNAME> [stripe <COUNT>] [replica <COUNT>] "
-          "[disperse [<COUNT>]] [redundancy <COUNT>] "
+          "[disperse [<COUNT>]] [disperse-data <COUNT>] [redundancy <COUNT>] "
           "[transport <tcp|rdma|tcp,rdma>] <NEW-BRICK>"
 #ifdef HAVE_BD_XLATOR
           "?<vg_name>"

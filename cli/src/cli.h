@@ -33,7 +33,7 @@
 #define CLI_DEFAULT_CMD_TIMEOUT              120
 #define CLI_TEN_MINUTES_TIMEOUT              600 //Longer timeout for volume top
 #define DEFAULT_CLI_LOG_FILE_DIRECTORY     DATADIR "/log/glusterfs"
-#define CLI_VOL_STATUS_BRICK_LEN              55
+#define CLI_VOL_STATUS_BRICK_LEN              43
 #define CLI_TAB_LENGTH                         8
 #define CLI_BRICK_STATUS_LINE_LEN             78
 
@@ -150,6 +150,7 @@ struct cli_local {
 
 struct cli_volume_status {
         int            port;
+        int            rdma_port;
         int            online;
         uint64_t       block_size;
         uint64_t       total_inodes;
@@ -356,9 +357,19 @@ int
 cli_xml_output_vol_info (cli_local_t *local, dict_t *dict);
 
 int
-cli_xml_output_vol_quota_limit_list (char *volname, char *limit_list,
-                                      int op_ret, int op_errno,
-                                      char *op_errstr);
+cli_xml_output_vol_quota_limit_list_begin (cli_local_t *local, int op_ret,
+                                           int op_errno, char *op_errstr);
+int
+cli_xml_output_vol_quota_limit_list_end (cli_local_t *local);
+
+int
+cli_quota_list_xml_error (cli_local_t *local, char *path,
+                          char *errstr);
+
+int
+cli_quota_xml_output (cli_local_t *local, char *path, char *hl_str,
+                      char *sl_final, void *used, void *avail,
+                      char *sl, char *hl);
 
 int
 cli_xml_output_peer_status (dict_t *dict, int op_ret, int op_errno,

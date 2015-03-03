@@ -231,6 +231,7 @@ def main_i():
     op.add_option('--ignore-deletes', default=False, action='store_true')
     op.add_option('--isolated-slave', default=False, action='store_true')
     op.add_option('--use-rsync-xattrs', default=False, action='store_true')
+    op.add_option('--sync-xattrs', default=True, action='store_true')
     op.add_option('--pause-on-start', default=False, action='store_true')
     op.add_option('-L', '--log-level', metavar='LVL')
     op.add_option('-r', '--remote-gsyncd', metavar='CMD',
@@ -252,6 +253,8 @@ def main_i():
     op.add_option('--sync-jobs', metavar='N', type=int, default=3)
     op.add_option('--replica-failover-interval', metavar='N',
                   type=int, default=1)
+    op.add_option('--changelog-archive-format', metavar='N',
+                  type=str, default="%Y%m")
     op.add_option(
         '--turns', metavar='N', type=int, default=0, help=SUPPRESS_HELP)
     op.add_option('--allow-network', metavar='IPS', default='')

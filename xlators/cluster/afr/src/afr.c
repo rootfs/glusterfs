@@ -81,18 +81,26 @@ xlator_subvolume_index (xlator_t *this, xlator_t *subvol)
         return index;
 }
 
-void
-fix_quorum_options (xlator_t *this, afr_private_t *priv, char *qtype)
+static void
+fix_quorum_options (xlator_t *this, afr_private_t *priv, char *qtype,
+                    dict_t *options)
 {
-        if (priv->quorum_count && strcmp(qtype,"fixed")) {
+        if (dict_get (options, "quorum-type") == NULL) {
+                /* If user doesn't configure anything enable auto-quorum if the
+                 * replica has odd number of subvolumes */
+                if (priv->child_count % 2)
+                        qtype = "auto";
+        }
+
+        if (priv->quorum_count && strcmp (qtype, "fixed")) {
                 gf_msg (this->name,GF_LOG_WARNING, 0, AFR_MSG_QUORUM_OVERRIDE,
                        "quorum-type %s overriding quorum-count %u",
                        qtype, priv->quorum_count);
         }
-        if (!strcmp(qtype,"none")) {
+
+        if (!strcmp (qtype, "none")) {
                 priv->quorum_count = 0;
-        }
-        else if (!strcmp(qtype,"auto")) {
+        } else if (!strcmp (qtype, "auto")) {
                 priv->quorum_count = AFR_QUORUM_AUTO;
         }
 }
@@ -179,7 +187,7 @@ reconfigure (xlator_t *this, dict_t *options)
         GF_OPTION_RECONF ("quorum-type", qtype, options, str, out);
         GF_OPTION_RECONF ("quorum-count", priv->quorum_count, options,
                           uint32, out);
-        fix_quorum_options(this,priv,qtype);
+        fix_quorum_options (this, priv, qtype, options);
         if (priv->quorum_count && !afr_has_quorum (priv->child_up, this))
                 gf_msg (this->name, GF_LOG_WARNING, 0, AFR_MSG_QUORUM_FAIL,
                         "Client-quorum is not met");
@@ -199,6 +207,9 @@ reconfigure (xlator_t *this, dict_t *options)
 
 	GF_OPTION_RECONF ("iam-self-heal-daemon", priv->shd.iamshd, options,
 			  bool, out);
+
+        GF_OPTION_RECONF ("heal-timeout", priv->shd.timeout, options,
+                          int32, out);
 
         priv->did_discovery = _gf_false;
 
@@ -337,7 +348,7 @@ init (xlator_t *this)
         GF_OPTION_INIT ("quorum-count", priv->quorum_count, uint32, out);
         GF_OPTION_INIT (AFR_SH_READDIR_SIZE_KEY, priv->sh_readdir_size, size_uint64,
                         out);
-        fix_quorum_options(this,priv,qtype);
+        fix_quorum_options (this, priv, qtype, this->options);
 
 	GF_OPTION_INIT ("post-op-delay-secs", priv->post_op_delay_secs, uint32, out);
         GF_OPTION_INIT ("ensure-durability", priv->ensure_durability, bool,
@@ -346,6 +357,7 @@ init (xlator_t *this)
 	GF_OPTION_INIT ("self-heal-daemon", priv->shd.enabled, bool, out);
 
 	GF_OPTION_INIT ("iam-self-heal-daemon", priv->shd.iamshd, bool, out);
+        GF_OPTION_INIT ("heal-timeout", priv->shd.timeout, int32, out);
 
         priv->wait_count = 1;
 
@@ -749,5 +761,13 @@ struct volume_options options[] = {
 	  .type = GF_OPTION_TYPE_BOOL,
 	  .default_value = "off",
 	},
+        { .key  = {"heal-timeout"},
+          .type = GF_OPTION_TYPE_INT,
+          .min  = 60,
+          .max  = INT_MAX,
+          .default_value = "600",
+          .description = "time interval for checking the need to self-heal "
+                         "in self-heal-daemon"
+        },
         { .key  = {NULL} },
 };
